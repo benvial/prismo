@@ -1,4 +1,8 @@
-# Tesseract Photonic Waveguide
+
+
+# PRISMO
+
+## **P**hotonic **R**econfigurable **I**ntegrated **S**emiconductor **M**ultiphysics **O**ptimization
 
 Differentiable PN-junction photonic phase shifter: DEVSIM + gyptis composed as Tesseracts
 
