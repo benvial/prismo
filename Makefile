@@ -1,4 +1,4 @@
-.PHONY: help new build test gen-tests data run
+.PHONY: help new build test gen-tests data run clean
 
 help:
 	@echo "Available targets:"
@@ -8,6 +8,7 @@ help:
 	@echo "  gen-tests NAME FILE=case.json - Capture a test case by running an input payload (make gen-tests mytess FILE=in.json)"
 	@echo "  data                          - Pull example data"
 	@echo "  run                           - Run app end-to-end"
+	@echo "  clean                         - Remove build artifacts, caches, and temp files"
 
 new:
 	@set -e; \
@@ -140,6 +141,18 @@ data:
 run:
 	@echo "Running app..."
 	@tesseract_photonic_waveguide $(filter-out $@,$(MAKECMDGOALS))
+
+clean:
+	@echo "Cleaning build artifacts, caches, and temp files..."
+	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+	find . -type f -name '*.pyc' -delete
+	find . -type f -name '*.pyo' -delete
+	find . -type d -name '*.egg-info' -exec rm -rf {} + 2>/dev/null || true
+	find . -type d -name '.pytest_cache' -exec rm -rf {} + 2>/dev/null || true
+	find . -type d -name '.ruff_cache' -exec rm -rf {} + 2>/dev/null || true
+	find . -type d -name '.mypy_cache' -exec rm -rf {} + 2>/dev/null || true
+	rm -rf build/ dist/ htmlcov/ .coverage .coverage.* .scratch/ 2>/dev/null || true
+	rm -rf run_*/
 
 # Allow make to accept tesseract names as targets without errors
 %:
