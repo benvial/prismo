@@ -1,0 +1,2 @@
+# Dependencies to execute app
+tesseract-core==1.11.0

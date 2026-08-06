@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tesseract_photonic_waveguide"
+dynamic = ["version"]
+description = "Differentiable PN-junction photonic phase shifter: DEVSIM + gyptis composed as Tesseracts"
+authors = [{ name = "tesseract-hackathon" }]
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "tesseract-core==1.11.0",
+    "typer>=0.9.0",
+    # Add more dependencies here
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    # For running app/chain.ipynb
+    "jupyter",
+    "matplotlib",
+    "numpy",
+]
+
+[project.scripts]
+"tesseract_photonic_waveguide" = "tesseract_photonic_waveguide.main:entrypoint"
+
+# Version is derived from git tags via hatch-vcs. Tag a release (e.g. `git tag
+# v0.1.0`) to set the version; between tags it is inferred from the latest tag
+# plus commit distance. `raw-options.root` points at the repository root one
+# level up, since this package lives in the `app/` subdirectory of the monorepo.
+# `fallback-version` keeps builds working when git metadata is unavailable
+# (e.g. building from an sdist or outside a checkout).
+[tool.hatch.version]
+source = "vcs"
+fallback-version = "0.0.0+unknown"
+raw-options = { root = ".." }
+
+[tool.hatch.build.hooks.vcs]
+version-file = "tesseract_photonic_waveguide/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tesseract_photonic_waveguide"]

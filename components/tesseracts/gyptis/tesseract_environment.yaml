@@ -1,0 +1,13 @@
+# Conda environment for the gyptis Tesseract.
+# gyptis + legacy FEniCS (dolfin ~2019.1) come from conda-forge — FEniCS is
+# not pip-installable. Python version pinned here (conda provider forbids
+# build_config.python_version in tesseract_config.yaml).
+name: tesseract
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - gyptis
+  - pip
+  - pip:
+      - ../../shared_code

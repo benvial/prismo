@@ -1,0 +1,29 @@
+{
+    "endpoint": "apply",
+    "payload": {
+        "inputs": {
+            "doping": [
+                1e+22,
+                -5e+21,
+                2e+21
+            ]
+        }
+    },
+    "expected_outputs": {
+        "charge": {
+            "object_type": "array",
+            "shape": [
+                3
+            ],
+            "dtype": "float64",
+            "data": {
+                "buffer": [
+                    1e+22,
+                    -5e+21,
+                    2e+21
+                ],
+                "encoding": "json"
+            }
+        }
+    }
+}

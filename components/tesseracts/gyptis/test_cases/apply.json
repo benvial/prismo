@@ -1,0 +1,24 @@
+{
+    "endpoint": "apply",
+    "payload": {
+        "inputs": {
+            "epsilon": [
+                12.0,
+                11.0,
+                1.0,
+                1.0
+            ]
+        }
+    },
+    "expected_outputs": {
+        "neff_sq": {
+            "object_type": "array",
+            "shape": [],
+            "dtype": "float64",
+            "data": {
+                "buffer": 6.25,
+                "encoding": "json"
+            }
+        }
+    }
+}

@@ -1,0 +1,41 @@
+
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    # Builds all components and runs `make test`, which covers both the
+    # component regression tests and the app test suite (pytest app).
+    # Runs on Linux only: `tesseract build`/`run` need a Docker daemon that can
+    # run Linux containers, which GitHub-hosted macOS/Windows runners lack.
+    # Docker is preinstalled on GitHub-hosted ubuntu runners.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r app/requirements.txt
+          pip install -e "app[dev]"
+
+      - name: Build components
+        run: make build
+
+      - name: Run tests
+        run: make test
+

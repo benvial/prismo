@@ -1,0 +1,5 @@
+# Tesseract requirements file
+# DEVSIM drift-diffusion solver (pip wheels, Python >= 3.9; container uses 3.12)
+devsim
+
+../../shared_code
