@@ -49,7 +49,7 @@ end
 
 function generate_1d_mesh_adjoint(n_nodes)
     L = 1e-4
-    coord = reshape(collect(range(0.0, L, n_nodes)), 1, :)
+    coord = collect(range(0.0, L, n_nodes))
     grid = simplexgrid(coord)
     cellmask!(grid, 0.0, L, 1)
     bfacemask!(grid, 0.0, 0.0, 1)
@@ -134,6 +134,13 @@ function main()
     data = Data(grid, 2)
     data.modelType = Stationary
 
+    data.bulkRecombination = set_bulk_recombination(
+        iphin = 1, iphip = 2,
+        bulk_recomb_Auger = false,
+        bulk_recomb_radiative = false,
+        bulk_recomb_SRH = false,
+    )
+
     n_bregions = grid[NumBFaceRegions]
     if anode_breg <= n_bregions
         data.boundaryType[anode_breg] = OhmicContact
@@ -142,24 +149,27 @@ function main()
         data.boundaryType[cathode_breg] = OhmicContact
     end
 
+    constants = ChargeTransport.constants
     n_regions = grid[NumCellRegions]
     params = Params(n_regions, n_bregions, 2)
 
-    eps_si = 11.7
+    T = 300.0
+    eps_si = 11.7 * constants.ε_0
     Nc = 2.8e19
     Nv = 1.04e19
-    Eg = 1.12
+    Eg = 1.12 * constants.q
     mu_n = 1350.0
     mu_p = 450.0
 
+    params.temperature = T
     params.chargeNumbers[SPEC_E] = -1
     params.chargeNumbers[SPEC_H] = 1
     for ireg in 1:n_regions
         params.dielectricConstant[ireg] = eps_si
         params.densityOfStates[1, ireg] = Nc
         params.densityOfStates[2, ireg] = Nv
-        params.bandEdgeEnergy[1, ireg] = 0.0
-        params.bandEdgeEnergy[2, ireg] = -Eg
+        params.bandEdgeEnergy[1, ireg] = Eg
+        params.bandEdgeEnergy[2, ireg] = 0.0
         params.mobility[1, ireg] = mu_n
         params.mobility[2, ireg] = mu_p
     end
@@ -178,6 +188,7 @@ function main()
     control.abstol = 1e-10
     control.reltol = 1e-10
     control.maxiters = 50
+    control.max_round = 5
     control.verbose = false
 
     u0 = equilibrium_solve!(ctsys, control = control)

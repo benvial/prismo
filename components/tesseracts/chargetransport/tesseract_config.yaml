@@ -3,7 +3,7 @@
 # Subprocess pattern: Python tesseract_api.py calls julia script.jl with NPY args
 # Ref: tickets 02 (container + I/O), 06 (container build)
 
-name: "prismo_chargetransport"
+name: "tesseract_photonic_waveguide_chargetransport"
 version: "0.1.0"
 description: "ChargeTransport.jl drift-diffusion solver with discrete adjoint VJP via subprocess"
 
@@ -11,39 +11,56 @@ build_config:
   # Python version installed via uv
   python_version: "3.12"
 
+  # Base on the official Julia 1.10 image (Debian bookworm — satisfies
+  # Tesseract's Debian/Ubuntu base requirement) so Julia is pre-installed and
+  # no juliaup `curl | sh` download/install is needed at build time.
+  base_image: "julia:1.10-bookworm"
+
   # Platform to build the container for
   target_platform: "native"
 
-  # No system BLAS/LAPACK — Julia bundles its own via LinearAlgebra stdlib
-  # extra_packages:
+  # git is required by Julia's Pkg for the General registry. extra_packages is
+  # installed in BOTH the build stage and the runtime stage, so the Pkg steps
+  # in custom_build_steps (runtime stage) can resolve packages.
+  # No system BLAS/LAPACK — Julia bundles its own via LinearAlgebra stdlib.
+  extra_packages:
+    - git
 
-  # Copy Julia scripts into the container for the subprocess calls
+  # Copy Julia scripts and the pinned (reproducible) package environment into
+  # the container. JULIA_PROJECT (set below) makes `julia script.jl` resolve
+  # against julia_env/, and `Pkg.instantiate()` reproduces the exact Manifest.
   package_data:
     - ["scripts", "scripts"]
+    - ["julia_env", "julia_env"]
 
-  # Install Julia via juliaup (non-interactive), pre-install Julia packages,
-  # and precompile them to avoid startup penalty at runtime.
-  # Ref: ticket 02 — curl | sh for juliaup, NPZ.jl for binary I/O.
+  # Install Julia packages into a BuildKit cache-mounted depot and precompile
+  # them. The cache mount persists the downloaded packages AND their
+  # precompiled .ji caches across `tesseract build` runs, so unrelated layer
+  # changes (e.g. editing tesseract_api.py or scripts/) do NOT force a full
+  # re-download/re-precompile of the Julia dependency graph.
+  # Ref: ticket 02 — Julia 1.10 LTS (ChargeTransport.jl + VoronoiFVM.jl
+  # segfault on Julia 1.12), NPZ.jl for binary I/O.
   custom_build_steps:
     - |
-      # --- Install Julia via juliaup (non-interactive, LTS channel) ---
-      # Install to /opt/juliaup (not $HOME) so the non-root Tesseract runtime
-      # user (9999) can access it — /root is drwx------ at runtime.
-      RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
-          rm -rf /var/lib/apt/lists/*
-      RUN curl -fsSL https://install.julialang.org | sh -s -- --yes --default-channel lts \
-          --path /opt/juliaup --startup-selfupdate 0 --background-selfupdate 0
-      ENV PATH="/opt/juliaup/bin:${PATH}" \
-          JULIA_DEPOT_PATH="/opt/julia_depot" \
-          JULIAUP_DEPOT_PATH="/opt/juliaup_depot"
-      RUN mkdir -p /opt/julia_depot /opt/juliaup_depot
+      # --- Julia environment + depot ---
+      # Install to /opt/julia_depot (not $HOME) so the non-root Tesseract
+      # runtime user (9999) can access it — /root is drwx------ at runtime.
+      ENV JULIA_DEPOT_PATH="/opt/julia_depot" \
+          JULIA_PROJECT="/tesseract/julia_env"
+      RUN mkdir -p /opt/julia_depot
     - |
-      # --- Pre-install Julia packages ---
-      RUN julia -e 'using Pkg; Pkg.add(["ChargeTransport", "VoronoiFVM", "ExtendableGrids", "NPZ", "JSON", "Gmsh"])'
+      # --- Install pinned Julia packages (depot is a BuildKit cache mount) ---
+      # Pkg.instantiate() installs exactly the versions in the committed
+      # Manifest.toml, so re-resolve is skipped when the depot is already warm.
+      RUN --mount=type=cache,target=/opt/julia_depot \
+          julia --startup-file=no --project=/tesseract/julia_env \
+          -e 'using Pkg; Pkg.instantiate(); println("Julia packages installed.")'
     - |
-      # --- Precompile packages (no-op caching for faster first solve) ---
-      RUN julia -e 'using ChargeTransport, VoronoiFVM, ExtendableGrids, NPZ, JSON, Gmsh; println("Packages precompiled.")'
+      # --- Precompile packages (depot is a BuildKit cache mount) ---
+      # Warm-up so the first container solve() is fast; cache survives rebuilds.
+      RUN --mount=type=cache,target=/opt/julia_depot \
+          julia --startup-file=no --project=/tesseract/julia_env \
+          -e 'using ChargeTransport, VoronoiFVM, ExtendableGrids, NPZ, JSON, Gmsh; println("Julia packages precompiled.")'
     - |
-      # --- Make juliaup + depot readable/writable by the non-root runtime user.
-      # Run LAST: julia invocations above rewrite juliaupself.json with 0600. ---
-      RUN chmod -R a+rwX /opt/juliaup /opt/juliaup_depot /opt/julia_depot
+      # --- Make the depot readable/writable by the non-root runtime user. ---
+      RUN chmod -R a+rwX /opt/julia_depot
