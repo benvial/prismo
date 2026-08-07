@@ -23,13 +23,23 @@ build_config:
   custom_build_steps:
     - |
       # --- Install Julia via juliaup (non-interactive, LTS channel) ---
+      # Install to /opt/juliaup (not $HOME) so the non-root Tesseract runtime
+      # user (9999) can access it — /root is drwx------ at runtime.
       RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
           rm -rf /var/lib/apt/lists/*
-      RUN curl -fsSL https://install.julialang.org | sh -s -- --yes --default-channel lts
-      ENV PATH="/root/.juliaup/bin:${PATH}"
+      RUN curl -fsSL https://install.julialang.org | sh -s -- --yes --default-channel lts \
+          --path /opt/juliaup --startup-selfupdate 0 --background-selfupdate 0
+      ENV PATH="/opt/juliaup/bin:${PATH}" \
+          JULIA_DEPOT_PATH="/opt/julia_depot" \
+          JULIAUP_DEPOT_PATH="/opt/juliaup_depot"
+      RUN mkdir -p /opt/julia_depot /opt/juliaup_depot
     - |
       # --- Pre-install Julia packages ---
       RUN julia -e 'using Pkg; Pkg.add(["ChargeTransport", "VoronoiFVM", "ExtendableGrids", "NPZ", "JSON", "Gmsh"])'
     - |
       # --- Precompile packages (no-op caching for faster first solve) ---
       RUN julia -e 'using ChargeTransport, VoronoiFVM, ExtendableGrids, NPZ, JSON, Gmsh; println("Packages precompiled.")'
+    - |
+      # --- Make juliaup + depot readable/writable by the non-root runtime user.
+      # Run LAST: julia invocations above rewrite juliaupself.json with 0600. ---
+      RUN chmod -R a+rwX /opt/juliaup /opt/juliaup_depot /opt/julia_depot

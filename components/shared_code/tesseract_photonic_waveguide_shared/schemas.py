@@ -1,8 +1,8 @@
 """Shared Pydantic schemas for the photonic waveguide pipeline.
 
-Types here cross the DEVSIM <-> gyptis container boundary: the shared Gmsh
-mesh description, the Soref-Bennett carrier-to-permittivity coupling arrays,
-and mesh-transfer metadata (ticket 07).
+Types here cross the charge-transport-solver <-> gyptis container boundary:
+the shared Gmsh mesh description, the Soref-Bennett carrier-to-permittivity
+coupling arrays, and mesh-transfer metadata.
 """
 
 
@@ -14,10 +14,12 @@ class MeshRef(BaseModel):
 
     Attributes:
         path: Filesystem path to the Gmsh .msh file.
-        n_nodes: Number of mesh nodes (DEVSIM FV nodes).
-        n_elements: Number of mesh elements (gyptis FEM elements).
-        node_ordering: Convention label for node ordering (e.g.
-            ``"gmsh"``, ``"x_then_y"``).
+        n_nodes: Number of mesh nodes.
+        n_elements: Number of mesh elements.
+        node_ordering: Convention label for node indexing.
+            ``"gmsh"`` — native Gmsh tag order (DEVSIM convention).
+            ``"gmsh_invperm"`` — ``invperm(Gmsh node tags)`` (ChargeTransport.jl
+            via ExtendableGrids).
     """
 
     path: str
@@ -59,8 +61,8 @@ class SorefBennettCoefficients(BaseModel):
 class SorefBennettResult(BaseModel):
     """Output of the Soref-Bennett coupling layer.
 
-    Maps carrier density perturbations from DEVSIM into permittivity
-    perturbations for gyptis.
+    Maps carrier density perturbations from the charge-transport solver into
+    permittivity perturbations for gyptis.
 
     Attributes:
         delta_permittivity: Permittivity change per element/subdomain
@@ -74,14 +76,14 @@ class SorefBennettResult(BaseModel):
 
 
 class CarrierDensityField(BaseModel):
-    """Carrier density distribution from the DEVSIM drift-diffusion solve.
+    """Carrier density distribution from a charge-transport solver.
 
     Attributes:
-        electrons: Electron concentration per mesh node [m^{-3}].
-        holes: Hole concentration per mesh node [m^{-3}].
+        electrons: Electron concentration per mesh node [cm^{-3}].
+        holes: Hole concentration per mesh node [cm^{-3}].
         equilibrium_electrons: Equilibrium (zero-bias) electron concentration
-            per node [m^{-3}], for computing Delta_N.
-        equilibrium_holes: Equilibrium hole concentration per node [m^{-3}].
+            per node [cm^{-3}], for computing Delta_N.
+        equilibrium_holes: Equilibrium hole concentration per node [cm^{-3}].
     """
 
     electrons: list[float]

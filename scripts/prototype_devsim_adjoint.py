@@ -96,9 +96,10 @@ def _extract_jacobian(device: str, region: str) -> "scipy.sparse.csc_matrix":
 
     r = devsim.get_matrix_and_rhs(device=device, region=region, format="csc")
     static = r["static"]
+    n_eqs = len(static["rhs"])
     return scipy.sparse.csc_matrix(
         (static["av"], static["ai"], static["ap"]),
-        shape=(3 * len(static["rhs"]) // 3, 3 * len(static["rhs"]) // 3),
+        shape=(n_eqs, n_eqs),
     )
 
 

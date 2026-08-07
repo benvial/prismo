@@ -5,8 +5,6 @@ using ExtendableGrids
 using NPZ
 using JSON
 
-include(joinpath(@__DIR__, "contacts.jl"))
-
 function parse_args()
     doping_path = ""
     bias_path = ""
@@ -42,6 +40,37 @@ function generate_1d_mesh(n_nodes)
     return grid
 end
 
+function get_breking_contacts(mesh_path::String)
+    contacts = Dict{Symbol,Int}()
+    isfile(mesh_path) || return contacts
+    try
+        import Gmsh
+        gmsh.initialize()
+        gmsh.open(mesh_path)
+        dimTags = gmsh.model.getPhysicalGroups()
+        i = 1
+        while i <= length(dimTags)
+            dim = dimTags[i]
+            tag = dimTags[i + 1]
+            name = gmsh.model.getPhysicalName(dim, tag)
+            if name == "contact_anode"
+                contacts[:anode] = tag
+            elseif name == "contact_cathode"
+                contacts[:cathode] = tag
+            end
+            i += 2
+        end
+        gmsh.clear()
+        gmsh.finalize()
+    catch
+        try
+            gmsh.finalize()
+        catch
+        end
+    end
+    return contacts
+end
+
 function main()
     doping_path, bias_path, output_path, mesh_path = parse_args()
 
@@ -59,7 +88,6 @@ function main()
     cathode_breg = 2
 
     if mesh_path != "" && isfile(mesh_path)
-        import Gmsh
         grid = simplexgrid(mesh_path)
         contacts = get_breking_contacts(mesh_path)
         if haskey(contacts, :anode)

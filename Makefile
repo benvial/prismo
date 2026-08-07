@@ -151,7 +151,7 @@ clean:
 	find . -type d -name '.pytest_cache' -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name '.ruff_cache' -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name '.mypy_cache' -exec rm -rf {} + 2>/dev/null || true
-	rm -rf build/ dist/ htmlcov/ .coverage .coverage.* .scratch/ 2>/dev/null || true
+	rm -rf build/ dist/ htmlcov/ .coverage .coverage.* 2>/dev/null || true
 	rm -rf run_*/
 
 # Allow make to accept tesseract names as targets without errors

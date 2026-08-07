@@ -8,6 +8,7 @@ matches finite-difference approximation), and subprocess dispatch.
 """
 
 import importlib.util
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -265,3 +266,74 @@ def test_apply_with_julia_subprocess() -> None:
     assert isinstance(outputs, OutputSchema)
     assert np.all(np.isfinite(outputs.electrons))
     assert np.all(np.isfinite(outputs.holes))
+
+
+def _make_minimal_triangle_msh(path: str) -> None:
+    """Write a minimal Gmsh v2.2 mesh with physical-group contacts.
+
+    Three nodes form a right triangle. The three boundary edges carry the
+    ``contact_anode`` (tag 1) and ``contact_cathode`` (tag 2) physical groups,
+    so ExtendableGrids assigns exactly two boundary regions (bregion 1 = anode,
+    bregion 2 = cathode) matching the mapping returned by the Julia
+    ``get_breking_contacts`` helper.
+    """
+    content = (
+        "$MeshFormat\n2.2 0 8\n$EndMeshFormat\n"
+        "$PhysicalNames\n2\n"
+        '1 1 "contact_anode"\n'
+        '1 2 "contact_cathode"\n'
+        "$EndPhysicalNames\n"
+        "$Nodes\n3\n"
+        "1 0.0 0.0 0.0\n"
+        "2 1e-7 0.0 0.0\n"
+        "3 0.0 1e-7 0.0\n"
+        "$EndNodes\n"
+        "$Elements\n4\n"
+        "1 1 2 1 1 1 2\n"  # edge 1-2: contact_anode (bregion 1)
+        "2 1 2 2 2 2 3\n"  # edge 2-3: contact_cathode (bregion 2)
+        "3 1 2 1 3 3 1\n"  # edge 3-1: contact_anode (bregion 1)
+        "4 2 2 1 4 1 2 3\n"  # triangle: cell region
+        "$EndElements\n"
+    )
+    Path(path).write_text(content)
+
+
+@pytest.mark.skipif(not _julia_available(), reason="Julia not installed")
+def test_apply_with_mesh_ref_and_physical_groups() -> None:
+    """Forward solve on a 2D mesh with physical-group contacts.
+
+    The mesh maps ``contact_anode``/``contact_cathode`` to bregions 1 and 2;
+    the Julia forward path must set OhmicContact only on those regions and
+    return finite carrier densities per mesh node.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
+        _make_minimal_triangle_msh(f.name)
+        mesh_path = f.name
+    try:
+        doping = np.full(3, 1e22, dtype=float)
+        ref = _make_mesh_ref(mesh_path, n_nodes=3)
+        outputs = apply(InputSchema(doping=doping, mesh_ref=ref))
+        assert isinstance(outputs, OutputSchema)
+        assert np.asarray(outputs.electrons).shape == (3,)
+        assert np.asarray(outputs.holes).shape == (3,)
+        assert np.all(np.isfinite(outputs.electrons))
+        assert np.all(np.isfinite(outputs.holes))
+    finally:
+        Path(mesh_path).unlink(missing_ok=True)
+
+
+@pytest.mark.skipif(_julia_available(), reason="Julia installed; stub path not active")
+def test_apply_mesh_ref_stub_path_works() -> None:
+    """Without Julia, apply with a mesh_ref must still pass doping through."""
+    with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
+        _make_minimal_triangle_msh(f.name)
+        mesh_path = f.name
+    try:
+        doping = np.array([1e22, -5e21, 2e21], dtype=float)
+        ref = _make_mesh_ref(mesh_path, n_nodes=3)
+        outputs = apply(InputSchema(doping=doping, mesh_ref=ref))
+        assert isinstance(outputs, OutputSchema)
+        np.testing.assert_allclose(outputs.electrons, doping)
+        np.testing.assert_allclose(outputs.holes, doping)
+    finally:
+        Path(mesh_path).unlink(missing_ok=True)

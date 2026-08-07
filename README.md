@@ -4,9 +4,9 @@
 
 ## **P**hotonic **R**econfigurable **I**ntegrated **S**emiconductor **M**ultiphysics **O**ptimization
 
-Differentiable PN-junction photonic phase shifter: DEVSIM + gyptis composed as Tesseracts
+Differentiable PN-junction photonic phase shifter: DEVSIM, gyptis, and ChargeTransport.jl composed as Tesseracts.
 
-This is a **multi-Tesseract project**: a monorepo that combines several [Tesseracts](https://github.com/pasteurlabs/tesseract-core) into a pipeline application, with shared code, tests, and CI. Individual components live in `components/tesseracts/`, shared utilities in `components/shared_code/`, and the pipeline that chains them in `app/`.
+This is a **multi-Tesseract project**: a monorepo that combines several [Tesseracts](https://github.com/pasteurlabs/tesseract-core) into a differentiable pipeline for topology optimization of a reverse-biased PN-junction phase shifter. Each solver is a standalone Tesseract with its own automatic differentiation strategy — implicit adjoint (DEVSIM), eigen-adjoint (gyptis), and discrete adjoint (ChargeTransport.jl). Shared Pydantic schemas in `components/shared_code/` define the exchange format across solver boundaries, and the pipeline composition lives in `app/`.
 
 New to Tesseract? Start with the [Tesseract Core docs](https://docs.pasteurlabs.ai/projects/tesseract-core/latest/).
 
@@ -16,44 +16,83 @@ New to Tesseract? Start with the [Tesseract Core docs](https://docs.pasteurlabs.
 .
 # 🚀 CI / CD
 ├── .github
-│   └── workflows                    # CI/CD workflows
-│       ├── pre_commit.yml           # Pre-commit hook checks
-│       └── test.yaml                # Build components + run all tests (components & app)
+│   └── workflows
+│       ├── pre_commit.yml
+│       └── test.yaml
 # ✅ Code checks
-├── .pre-commit-config.yaml          # Pre-commit configuration
-├── ruff.toml                        # Ruff linter configuration
+├── .pre-commit-config.yaml
+├── ruff.toml
 # 🔧 Pipeline code
 ├── app
-│   ├── chain.ipynb                  # Notebook for running tesseracts and plotting outputs
-│   ├── pyproject.toml               # App package configuration
-│   ├── requirements.txt             # App runtime dependencies
-│   ├── <myproject>                  # Main Python package
-│   │   ├── __init__.py              # Package initialization
-│   │   └── main.py                  # CLI entrypoint with typer
-│   └── tests                        # App test suite
-│       └── test_main.py             # Example test file
+│   ├── chain.ipynb                  # Pipeline notebook (Tesseract composition, stubs)
+│   ├── pyproject.toml
+│   ├── requirements.txt             # tesseract-core
+│   ├── tesseract_photonic_waveguide
+│   │   ├── __init__.py
+│   │   ├── main.py                  # CLI entrypoint (typer)
+│   │   ├── density_filter.py        # Andreassen density filter (sparse H matrix)
+│   │   ├── soref_bennett.py         # Carrier → permittivity coupling layer
+│   │   ├── waveguide_mesh.py        # SOI rib waveguide Gmsh mesh builder
+│   │   └── _version.py
+│   └── tests
+│       ├── test_main.py
+│       ├── test_density_filter.py
+│       ├── test_soref_bennett.py
+│       └── test_waveguide_mesh.py
 # 🧩 Component code
-├── components                       # Tesseract components
-│   ├── shared_code                  # Shared utilities across Tesseracts
-│   │   ├── pyproject.toml           # Shared code package configuration
-│   │   └── <myproject>_shared       # Shared code package
-│   └── tesseracts                   # Individual tesseract implementations
-│       └── <mytess>                 # Tesseract component, created via `make new`
-│           ├── tesseract_api.py     # Tesseract API implementation
-│           ├── tesseract_config.yaml # Tesseract configuration
-│           ├── tesseract_requirements.txt # Tesseract dependencies
-│           └── test_cases           # Regression test cases (*.json) for tesseract
-# 📊 Data assets
-├── data                             # Data assets directory
-│   └── get_data.sh                  # Script to download/fetch data
+├── components
+│   ├── shared_code
+│   │   ├── pyproject.toml
+│   │   └── tesseract_photonic_waveguide_shared
+│   │       └── schemas.py           # Pydantic schemas (mesh, carrier/permittivity fields)
+│   └── tesseracts
+│       ├── .template                # Scaffold for `make new`
+│       ├── devsim                   # Python 3.12 — DEVSIM drift-diffusion (implicit adjoint)
+│       │   ├── tesseract_api.py
+│       │   ├── tesseract_config.yaml
+│       │   ├── tesseract_requirements.txt
+│       │   ├── tests/
+│       │   └── test_cases/
+│       ├── gyptis                   # conda — gyptis/FEniCS EM eigenmode (eigen-adjoint)
+│       │   ├── tesseract_api.py
+│       │   ├── tesseract_config.yaml
+│       │   ├── tesseract_environment.yaml
+│       │   ├── tests/
+│       │   └── test_cases/
+│       └── chargetransport          # Python 3.12 + Julia — ChargeTransport.jl (discrete adjoint)
+│           ├── tesseract_api.py
+│           ├── tesseract_config.yaml
+│           ├── tesseract_requirements.txt
+│           ├── scripts/             # forward.jl, contacts.jl
+│           ├── tests/
+│           └── test_cases/
 # 🛠️ Scripts
-├── scripts                          # Helper scripts
-│   └── gen_test_case.py             # Capture a test case from a payload (used by `make gen-tests`)
+├── scripts
+│   ├── gen_test_case.py             # Capture test case from payload (`make gen-tests`)
+│   ├── prototype_devsim_adjoint.py
+│   └── prototype_gyptis_eigen_adjoint.py
 # 📁 Auxiliary files
-├── LICENSE                          # Project license
-├── Makefile                         # Build automation (new, build, test, gen-tests, data, run)
-└── README.md                        # Project documentation
+├── LICENSE
+├── Makefile
+├── README.md
+├── CONTEXT.md                       # Domain glossary
+├── RULES.md                         # Hackathon brief
+└── docs/
+    ├── agents/                      # Agent workflow reference
+    └── research/                    # Research memos
 ```
+
+## Solver components
+
+Three Tesseracts implement the same PN-junction phase-shifter problem with different physics engines and autodiff strategies:
+
+| Tesseract | Engine | Language | Adjoint strategy |
+|---|---|---|---|
+| `devsim` | DEVSIM | Python 3.12 | Implicit (Newton Jacobian) |
+| `gyptis` | gyptis / FEniCS | conda | Eigen-adjoint (Hellmann-Feynman) |
+| `chargetransport` | ChargeTransport.jl | Python + Julia | Discrete adjoint |
+
+Shared Pydantic schemas (`components/shared_code/`) define the mesh and carrier/permittivity field exchange format so any solver can be swapped into the pipeline.
 
 ## Usage
 
@@ -72,19 +111,22 @@ $ make new mytess RECIPE=jax
 $ make build
 
 # Build a single Tesseract
-$ make build mytess
+$ make build devsim
 
 # Test all components + app
 $ make test
 
 # Test a single component
-$ make test mytess
+$ make test devsim
 
 # Test app only
 $ make test app
 
-# Run app end-to-end
+# Run app end-to-end (stub)
 $ make run
+
+# Clean build artifacts and caches
+$ make clean
 ```
 
 ## Adding regression test cases
@@ -104,8 +146,3 @@ payload + captured `expected_outputs`) to `components/tesseracts/mytess/test_cas
 Review the result before committing — numeric tolerances (`atol`/`rtol`) and any
 non-deterministic outputs may need hand-editing. Pass `ENDPOINT=` and `OUT=` to
 target a different endpoint or output filename.
-
-```bash
-# Pull example data
-$ make data
-```

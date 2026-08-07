@@ -24,6 +24,7 @@ import importlib.util
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -63,23 +64,15 @@ def _run_eigenmode(epsilon: np.ndarray, wavelength: float = 1.55e-6) -> float:
     return neff * neff
 
 
-# ---------------------------------------------------------------------------
-# Hellmann-Feynman gradient
-# ---------------------------------------------------------------------------
+def _solve_and_extract_eigen(
+    epsilon: np.ndarray, wavelength: float = 1.55e-6
+) -> dict[str, Any]:
+    """Solve eigenproblem and return simulation + eigen data for HF gradient.
 
-
-def _hf_gradient(epsilon: np.ndarray, wavelength: float = 1.55e-6) -> np.ndarray:
-    """Compute dneff_sq/dε per subdomain via Hellmann-Feynman theorem.
-
-    Must be called after `_run_eigenmode` or equivalent to have a valid
-    simulation state.
+    Returns a dict usable by _hf_assemble().
     """
-    import dolfin  # type: ignore[import-untyped]
-
-    n_domains = len(epsilon)
     k0 = 2.0 * np.pi / wavelength
-
-    simu, _geom, _nd, __ = _build_waveguide(epsilon.copy(), wavelength)
+    simu, _geom, _n_domains, _k0 = _build_waveguide(epsilon.copy(), wavelength)
     _ = simu.eigensolve(n_eig=4, target=k0)
 
     ev_re, ev_im, rx, cx = simu.eigensolver.get_eigenpair(0)
@@ -87,10 +80,46 @@ def _hf_gradient(epsilon: np.ndarray, wavelength: float = 1.55e-6) -> np.ndarray
     kz = np.sqrt(lam)
     neff = kz / k0
 
-    # --- Re-assemble A and B ---
+    return {
+        "simu": simu,
+        "k0": k0,
+        "kz": kz,
+        "neff": neff,
+        "lam": lam,
+        "rx": rx,
+        "cx": cx,
+        "n_domains": _n_domains,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Hellmann-Feynman gradient
+# ---------------------------------------------------------------------------
+
+
+def _hf_assemble(eigen_data: dict[str, Any]) -> np.ndarray:
+    """Compute dneff_sq/dε per subdomain from a pre-solved eigenstate.
+
+    Args:
+        eigen_data: Dict from _solve_and_extract_eigen with simu, k0, kz,
+            neff, lam, rx, cx, n_domains.
+
+    Returns:
+        Gradient of neff_sq w.r.t. per-subdomain permittivity.
+    """
+    import dolfin  # type: ignore[import-untyped]
+
+    simu = eigen_data["simu"]
+    k0 = eigen_data["k0"]
+    kz = eigen_data["kz"]
+    neff = eigen_data["neff"]
+    lam = eigen_data["lam"]
+    rx = eigen_data["rx"]
+    cx = eigen_data["cx"]
+    n_domains = eigen_data["n_domains"]
+
     wf = simu.formulation.weak
     dv = dolfin.PETScVector()
-
     V = simu.formulation.space
     trial = dolfin.TrialFunction(V)
     dv.init(dolfin.as_backend_type(trial.vector()).vec())
@@ -104,7 +133,6 @@ def _hf_gradient(epsilon: np.ndarray, wavelength: float = 1.55e-6) -> np.ndarray
     dolfin.assemble_system(wf[1], dv, bcs, A_tensor=B_mat, b_tensor=b)
     Bmat_mat = B_mat.mat()
 
-    # --- Per-subdomain derivative matrices ---
     u = simu.formulation.trial
     v = simu.formulation.test
     et = dolfin.as_vector([u[0], u[1], 0.0])
@@ -119,7 +147,6 @@ def _hf_gradient(epsilon: np.ndarray, wavelength: float = 1.55e-6) -> np.ndarray
         domain_name = str(d_idx + 1)
         dx_d = simu.dx(domain_name)
 
-        # dA/dε_d: M_tt = -k0² ∫ e_t · v_t dx
         form_tt = -dolfin.Constant(k0 * k0) * dolfin.inner(et, vt) * dx_d
         F_tt = form_tt.real + form_tt.imag
         Mtt = dolfin.PETScMatrix()
@@ -128,7 +155,6 @@ def _hf_gradient(epsilon: np.ndarray, wavelength: float = 1.55e-6) -> np.ndarray
             bc.apply(Mtt)
         Mtt_mat = Mtt.mat()
 
-        # dB/dε_d: M_zz = +k0² ∫ e_z · v_z dx
         form_zz = dolfin.Constant(k0 * k0) * dolfin.inner(ez * zhat, vz * zhat) * dx_d
         F_zz = form_zz.real + form_zz.imag
         Mzz = dolfin.PETScMatrix()
@@ -145,6 +171,12 @@ def _hf_gradient(epsilon: np.ndarray, wavelength: float = 1.55e-6) -> np.ndarray
         dneff_sq_deps[d_idx] = 2.0 * neff * dneff_deps
 
     return dneff_sq_deps
+
+
+def _hf_gradient(epsilon: np.ndarray, wavelength: float = 1.55e-6) -> np.ndarray:
+    """Convenience wrapper: solve + HF gradient in one call."""
+    eigen_data = _solve_and_extract_eigen(epsilon, wavelength)
+    return _hf_assemble(eigen_data)
 
 
 # ---------------------------------------------------------------------------
@@ -183,17 +215,17 @@ def main() -> None:
 
     # --- 2. Time forward solve ---
     t0 = time.perf_counter()
-    neff_sq = _run_eigenmode(epsilon)
+    eigen_data = _solve_and_extract_eigen(epsilon)
     t_forward = time.perf_counter() - t0
-    neff = np.sqrt(neff_sq)
+    neff = eigen_data["neff"]
     print(f"neff (fundamental):              {neff:.6f}")
     print(f"Forward solve time:              {t_forward:.4f} s")
 
-    # --- 3. Time HF gradient ---
+    # --- 3. Time HF assembly only (no re-solve) ---
     t0 = time.perf_counter()
-    dneff_sq_hf = _hf_gradient(epsilon)
-    t_hf = time.perf_counter() - t0
-    print(f"Hellmann-Feynman gradient time:  {t_hf:.4f} s\n")
+    dneff_sq_hf = _hf_assemble(eigen_data)
+    t_hf_assembly = time.perf_counter() - t0
+    print(f"HF assembly time (no re-solve):  {t_hf_assembly:.4f} s\n")
 
     # --- 4. Finite-difference validation per subdomain ---
     print("-" * 72)
@@ -233,9 +265,10 @@ def main() -> None:
     print(f"  = {2 * n_domains} extra eigen solves")
     print(f"  Eigen solve time:     {t_forward:.4f}s")
     print(f"  Estimated FD time:    {2 * n_domains * t_forward:.4f}s")
-    print(f"  HF gradient time:     {t_hf:.4f}s")
+    print(f"  HF assembly time:     {t_hf_assembly:.4f}s")
     print(
-        f"  Speedup:              {(2 * n_domains * t_forward) / max(t_hf, 1e-6):.0f}x"
+        f"  Speedup:              "
+        f"{(2 * n_domains * t_forward) / max(t_hf_assembly, 1e-6):.0f}x"
     )
 
     # --- 6. Additional check: gradient consistency with Soref-Bennett-like perturbation ---
@@ -253,9 +286,7 @@ def main() -> None:
     neff_sq_minus = neff_sq_fn(epsilon - h_test * pert)
     fd_dir = (neff_sq_plus - neff_sq_minus) / (2 * h_test)
 
-    # Recompute HF for this epsilon (may have changed after earlier runs)
-    dneff_sq_hf2 = _hf_gradient(epsilon)
-    hf_dir = float(np.dot(dneff_sq_hf2, pert))
+    hf_dir = float(np.dot(dneff_sq_hf, pert))
 
     print(f"\nEpsilon perturbation:             {pert.tolist()}")
     print(f"FD directional derivative:        {fd_dir:.8f}")
