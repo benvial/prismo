@@ -29,7 +29,7 @@ build_config:
       ENV PATH="/root/.juliaup/bin:${PATH}"
     - |
       # --- Pre-install Julia packages ---
-      RUN julia -e 'using Pkg; Pkg.add(["ChargeTransport", "VoronoiFVM", "ExtendableGrids", "NPZ"])'
+      RUN julia -e 'using Pkg; Pkg.add(["ChargeTransport", "VoronoiFVM", "ExtendableGrids", "NPZ", "JSON", "Gmsh"])'
     - |
       # --- Precompile packages (no-op caching for faster first solve) ---
-      RUN julia -e 'using ChargeTransport, VoronoiFVM, ExtendableGrids, NPZ; println("Packages precompiled.")'
+      RUN julia -e 'using ChargeTransport, VoronoiFVM, ExtendableGrids, NPZ, JSON, Gmsh; println("Packages precompiled.")'
