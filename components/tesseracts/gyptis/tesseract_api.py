@@ -75,46 +75,39 @@ def _ensure_gyptis() -> Any:
 def _build_waveguide(
     epsilon: np.ndarray, wavelength: float = 1.55e-6
 ) -> tuple[Any, Any, Any, float]:
-    """Build a 2D waveguide simulation with subdomains from epsilon.
+    """Build a 2D waveguide simulation with layered geometry.
 
-    Creates a rectangular cross-section split into vertical strips,
-    one subdomain per epsilon element. Uses gyptis Waveguide2D for
-    the eigenmode formulation.
+    Creates a rectangular cross-section with horizontal layers via
+    LayeredBoxPML2D, one layer per epsilon element. Uses gyptis
+    Waveguide2D for the eigenmode formulation.
 
     Args:
-        epsilon: Per-subdomain relative permittivity values.
+        epsilon: Per-layer relative permittivity values.
         wavelength: Free-space wavelength in meters (default 1.55 μm).
 
     Returns:
         Tuple of (simulation, geometry, n_domains, wavenumber_k0).
     """
-    dolfin = _ensure_dolfin()
     gyptis = _ensure_gyptis()
+    _ensure_dolfin()
 
     n_domains = len(epsilon)
     k0 = 2.0 * np.pi / wavelength
 
     width = 2e-6  # 2 μm cross-section width
     height = 1e-6  # 1 μm cross-section height
-    nx = max(4 * n_domains, 20)
-    ny = 10
+    layer_thickness = height / n_domains
+    thicknesses = [layer_thickness] * n_domains
 
-    mesh = dolfin.RectangleMesh(
-        dolfin.Point(0.0, 0.0), dolfin.Point(width, height), nx, ny
-    )
+    geom = gyptis.LayeredBoxPML2D(width, thicknesses, pml_width=(0, 0))
 
-    subdomains = dolfin.MeshFunction("size_t", mesh, mesh.topology().dim(), 0)
-    strip_width = width / n_domains
-    for cell in dolfin.cells(mesh):
-        x = cell.midpoint().x()
-        idx = min(int(x / strip_width), n_domains - 1)
-        subdomains[cell] = idx + 1
+    eps_dict: dict[str, float] = {}
+    for i, eps in enumerate(epsilon):
+        domain_name = str(i + 1)
+        eps_dict[domain_name] = float(eps)
+        geom.add_physical(float(eps), domain_name)
 
-    geom = gyptis.Geometry(mesh, subdomains, dim=2)
-
-    eps_dict = {str(i + 1): float(eps) for i, eps in enumerate(epsilon)}
-
-    simu = gyptis.Waveguide2D(geom, epsilon=eps_dict, wavelength=wavelength)
+    simu = gyptis.Waveguide2D(geom, epsilon=eps_dict, wavenumber=k0)
 
     return simu, geom, n_domains, k0
 
