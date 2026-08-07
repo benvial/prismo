@@ -81,15 +81,13 @@ function main()
     data.modelType = Stationary
 
     n_bregions = grid[NumBFaceRegions]
-    for ibreg in 1:n_bregions
-        data.boundaryType[ibreg] = InsulatingContact
-    end
     if anode_breg <= n_bregions
         data.boundaryType[anode_breg] = OhmicContact
     end
     if cathode_breg <= n_bregions
         data.boundaryType[cathode_breg] = OhmicContact
     end
+    # Remaining bregions keep their default (homogeneous Neumann / insulating).
 
     n_regions = grid[NumCellRegions]
     params = Params(n_regions, n_bregions, 2)
