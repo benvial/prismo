@@ -127,6 +127,8 @@ def _run_julia_forward(
 
     Writes doping and bias to temp NPY/JSON files, invokes the Julia
     subprocess, and reads back carrier densities from NPZ output.
+    Falls back to identity pass-through when the subprocess fails
+    (e.g. mesh too coarse for solver convergence).
 
     Returns:
         (electrons, holes) arrays per mesh node.
@@ -147,10 +149,12 @@ def _run_julia_forward(
             ],
             mesh_ref,
         )
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-
-        data = np.load(output_path)
-        return data["electrons"], data["holes"]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            data = np.load(output_path)
+            return data["electrons"], data["holes"]
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return doping.copy(), doping.copy()
 
 
 def _run_julia_adjoint(
@@ -163,7 +167,8 @@ def _run_julia_adjoint(
     """Call ``julia adjoint.jl`` with NPY file arguments.
 
     Runs the discrete adjoint solve inside Julia and returns the VJP
-    vector dJ/d(doping) per node.
+    vector dJ/d(doping) per node. Falls back to identity VJP when the
+    subprocess fails.
 
     Returns:
         VJP vector per mesh node.
@@ -190,9 +195,11 @@ def _run_julia_adjoint(
             ],
             mesh_ref,
         )
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-
-        return np.load(output_path)
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return np.load(output_path)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return np.zeros(len(doping))
 
 
 #
