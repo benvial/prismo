@@ -4,6 +4,7 @@ help:
 	@echo "Available targets:"
 	@echo "  new NAME [RECIPE=jax|pytorch] - Create a new Tesseract component (make new mytess RECIPE=jax)"
 	@echo "  build [NAME]                  - Build all components or a single tesseract (make build mytess)"
+	@echo "  julia-base NAME               - (Re)build the Julia base image for a component (only needed when its julia_env/*.toml change)"
 	@echo "  test [NAME]                   - Test all components + app, a single component, or app only"
 	@echo "  gen-tests NAME FILE=case.json - Capture a test case by running an input payload (make gen-tests mytess FILE=in.json)"
 	@echo "  data                          - Pull example data"
@@ -36,6 +37,29 @@ new:
 	cp -r components/tesseracts/.template/* "$$TESS_DIR/"; \
 	printf '\n../../shared_code\n' >> "$$TESS_DIR/tesseract_requirements.txt"; \
 	echo "Tesseract component created at $$TESS_DIR"
+
+julia-base:
+	@set -e; \
+	TESS_NAME="$(filter-out $@,$(MAKECMDGOALS))"; \
+	if [ -z "$$TESS_NAME" ]; then \
+		echo "Usage: make julia-base <mytess>"; \
+		exit 1; \
+	fi; \
+	TESS_DIR="components/tesseracts/$$TESS_NAME"; \
+	if [ ! -f "$$TESS_DIR/Dockerfile.julia-base" ]; then \
+		echo "Error: $$TESS_DIR/Dockerfile.julia-base not found (this component has no Julia base image)"; \
+		exit 1; \
+	fi; \
+	echo "Building Julia base image for $$TESS_NAME (prismo_$${TESS_NAME}_julia_base:latest)..."; \
+	docker build -f "$$TESS_DIR/Dockerfile.julia-base" -t "prismo_$${TESS_NAME}_julia_base:latest" "$$TESS_DIR"; \
+	echo "Done. Now rebuild the component with: make build $$TESS_NAME"
+
+# Tesseract builds with `docker buildx build`, which uses the default buildx
+# builder. If that builder is a docker-container driver it cannot see locally
+# built images (e.g. prismo_chargetransport_julia_base) and tries to pull them
+# from a registry. Force the docker-driver builder, which shares the daemon's
+# local image store. Override by exporting TESSERACT_DOCKER_BUILD_ARGS yourself.
+export TESSERACT_DOCKER_BUILD_ARGS ?= --builder default
 
 build:
 	@if [ -z "$(filter-out $@,$(MAKECMDGOALS))" ]; then \

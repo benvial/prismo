@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1
+# Pre-built Julia dependency layer for prismo_chargetransport.
+#
+# WHY THIS EXISTS
+# Tesseract's generated Dockerfile injects custom_build_steps AFTER the code
+# COPY layers (tesseract_api.py, package_data), so editing a script or the
+# Python wrapper invalidates every downstream layer. The Julia depot
+# (~1.6GB of packages + precompiled .ji caches) is by far the slowest thing
+# to build (~4-5 min). Hoisting it into this rarely-changing base image means
+# a `tesseract build` after a code change only re-layers the Python venv +
+# scripts — seconds instead of minutes.
+#
+# REBUILD THIS IMAGE only when julia_env/Project.toml or Manifest.toml change:
+#   make julia-base chargetransport
+# then rebuild the component:
+#   make build chargetransport
+#
+# Direct build (equivalent to the Makefile target):
+#   docker build -f Dockerfile.julia-base -t prismo_chargetransport_julia_base:latest .
+FROM julia:1.10-bookworm
+
+# git: needed by Julia's Pkg for the General registry (build time only).
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Depot lives at /opt/julia_depot (not $HOME — /root is mode 700 at runtime)
+# so Tesseract's non-root runtime user (uid 9999) can use it. JULIA_PROJECT
+# makes `julia script.jl` resolve the pinned environment that Tesseract copies
+# into the final image at /tesseract/julia_env (via package_data).
+ENV JULIA_DEPOT_PATH=/opt/julia_depot \
+    JULIA_PROJECT=/tesseract/julia_env
+
+# Pinned, reproducible environment. ONLY these two files gate the expensive
+# layers below, so code edits elsewhere never invalidate them.
+COPY julia_env/Project.toml julia_env/Manifest.toml /tmp/julia_env/
+
+# Install exactly the pinned versions, precompile them (so the first container
+# solve() doesn't pay a multi-minute compile penalty), and make the depot
+# usable by the non-root runtime user.
+# Ref: ticket 02 — Julia 1.10 LTS (ChargeTransport.jl + VoronoiFVM.jl
+# segfault on Julia 1.12).
+RUN mkdir -p /opt/julia_depot && \
+    julia --startup-file=no --project=/tmp/julia_env \
+      -e 'using Pkg; Pkg.instantiate()' && \
+    julia --startup-file=no --project=/tmp/julia_env \
+      -e 'using ChargeTransport, VoronoiFVM, ExtendableGrids, NPZ, JSON, Gmsh; println("Julia packages precompiled.")' && \
+    chmod -R a+rwX /opt/julia_depot && \
+    rm -rf /tmp/julia_env
