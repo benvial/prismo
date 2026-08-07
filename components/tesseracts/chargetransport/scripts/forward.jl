@@ -4,6 +4,7 @@ using ChargeTransport
 using ExtendableGrids
 using NPZ
 using JSON
+using Gmsh
 
 include(joinpath(@__DIR__, "contacts.jl"))
 
@@ -34,7 +35,7 @@ end
 
 function generate_1d_mesh(n_nodes)
     L = 1e-4
-    coord = collect(range(0.0, L, n_nodes))'
+    coord = reshape(collect(range(0.0, L, n_nodes)), 1, :)
     grid = simplexgrid(coord)
     cellmask!(grid, 0.0, L, 1)
     bfacemask!(grid, 0.0, 0.0, 1)
@@ -59,7 +60,6 @@ function main()
     cathode_breg = 2
 
     if mesh_path != "" && isfile(mesh_path)
-        import Gmsh
         grid = simplexgrid(mesh_path)
         contacts = get_breking_contacts(mesh_path)
         if haskey(contacts, :anode)

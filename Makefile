@@ -29,9 +29,9 @@ new:
 	echo "Creating new tesseract: $$TESS_SLUG"; \
 	if [ -n "$(RECIPE)" ]; then \
 		echo "Recipe: $(RECIPE)"; \
-		tesseract init --name "tesseract_photonic_waveguide_$$TESS_SLUG" --target-dir "$$TESS_DIR" --recipe "$(RECIPE)"; \
+		tesseract init --name "prismo_$$TESS_SLUG" --target-dir "$$TESS_DIR" --recipe "$(RECIPE)"; \
 	else \
-		tesseract init --name "tesseract_photonic_waveguide_$$TESS_SLUG" --target-dir "$$TESS_DIR"; \
+		tesseract init --name "prismo_$$TESS_SLUG" --target-dir "$$TESS_DIR"; \
 	fi; \
 	cp -r components/tesseracts/.template/* "$$TESS_DIR/"; \
 	printf '\n../../shared_code\n' >> "$$TESS_DIR/tesseract_requirements.txt"; \
@@ -67,7 +67,7 @@ test:
 			[ -f "$$test_file" ] || continue; \
 			found=1; \
 			echo "  Running $$(basename $$test_file)..."; \
-			result=$$(tesseract run tesseract_photonic_waveguide_$$tess_slug test @$$test_file); \
+			result=$$(tesseract run prismo_$$tess_slug test @$$test_file); \
 			echo "$$result"; \
 			echo "$$result" | python -c 'import json,sys; sys.exit(0 if json.loads(sys.stdin.read(), strict=False).get("status")=="passed" else 1)' \
 				|| { echo "  FAILED: $$(basename $$test_file)"; return 1; }; \
@@ -119,7 +119,7 @@ gen-tests:
 		echo "Error: Tesseract $$TESS_SLUG not found (create it first with 'make new $$TESS_SLUG')"; \
 		exit 1; \
 	fi; \
-	TESS_IMAGE="tesseract_photonic_waveguide_$$TESS_SLUG"; \
+	TESS_IMAGE="prismo_$$TESS_SLUG"; \
 	if ! COLUMNS=1000 tesseract list 2>/dev/null | grep -qw "$$TESS_IMAGE"; then \
 		echo "Error: Tesseract image $$TESS_IMAGE is not built (build it first with 'make build $$TESS_SLUG')"; \
 		exit 1; \
@@ -127,8 +127,8 @@ gen-tests:
 	ENDPOINT="$(ENDPOINT)"; [ -n "$$ENDPOINT" ] || ENDPOINT="apply"; \
 	OUT="$(OUT)"; [ -n "$$OUT" ] || OUT="$$ENDPOINT.json"; \
 	OUT_PATH="$$TESS_DIR/test_cases/$$OUT"; \
-	echo "Capturing test case for tesseract_photonic_waveguide_$$TESS_SLUG ($$ENDPOINT) -> $$OUT_PATH"; \
-	OUTPUTS=$$(tesseract run tesseract_photonic_waveguide_$$TESS_SLUG "$$ENDPOINT" @$(FILE)); \
+	echo "Capturing test case for prismo_$$TESS_SLUG ($$ENDPOINT) -> $$OUT_PATH"; \
+	OUTPUTS=$$(tesseract run prismo_$$TESS_SLUG "$$ENDPOINT" @$(FILE)); \
 	mkdir -p "$$TESS_DIR/test_cases"; \
 	ENDPOINT="$$ENDPOINT" PAYLOAD_FILE="$(FILE)" OUTPUTS="$$OUTPUTS" \
 		python scripts/gen_test_case.py > "$$OUT_PATH"; \
@@ -140,7 +140,7 @@ data:
 
 run:
 	@echo "Running app..."
-	@tesseract_photonic_waveguide $(filter-out $@,$(MAKECMDGOALS))
+	@prismo $(filter-out $@,$(MAKECMDGOALS))
 
 clean:
 	@echo "Cleaning build artifacts, caches, and temp files..."

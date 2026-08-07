@@ -1,7 +1,7 @@
 # Mapping from Gmsh physical group names to ChargeTransport.jl integer
 # boundary region (bregion) indices.
 #
-# The shared mesh generator (app/tesseract_photonic_waveguide/waveguide_mesh.py)
+# The shared mesh generator (app/prismo/waveguide_mesh.py)
 # creates named physical groups: ``silicon``, ``oxide``, ``contact_anode``,
 # ``contact_cathode``. ExtendableGrids.simplexgrid("file.msh") discards the
 # physical group *names*, so contacts must be wired by integer bregion index.

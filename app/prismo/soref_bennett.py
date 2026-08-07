@@ -1,12 +1,12 @@
 """Soref-Bennett free-carrier plasma dispersion coupling layer.
 
-Converts carrier-density perturbations from DEVSIM into optical permittivity
-and absorption perturbations for gyptis via the Soref-Bennett model (Soref &
-Bennett, IEEE JQE 23(1), 1987).
+Converts carrier-density perturbations from the charge-transport solver into
+optical permittivity and absorption perturbations for gyptis via the
+Soref-Bennett model (Soref & Bennett, IEEE JQE 23(1), 1987).
 
-DEVSIM reports carrier densities in m^-3 while the Soref-Bennett coefficients
-are calibrated for cm^-3, so densities are converted before the model is
-applied (1 m^-3 = 1e-6 cm^-3).
+The charge-transport solver reports carrier densities in m^-3 while the
+Soref-Bennett coefficients are calibrated for cm^-3, so densities are
+converted before the model is applied (1 m^-3 = 1e-6 cm^-3).
 
     Delta_n = -(A_e * Delta_N_e^B_e + A_h * Delta_N_h^B_h)
     Delta_alpha = C_e * Delta_N_e^D_e + C_h * Delta_N_h^D_h
@@ -17,7 +17,7 @@ NumPy arrays, or JAX arrays (converted via ``np.asarray``).
 """
 
 import numpy as np
-from tesseract_photonic_waveguide_shared.schemas import (
+from prismo_shared.schemas import (
     CarrierDensityField,
     SorefBennettCoefficients,
     SorefBennettResult,

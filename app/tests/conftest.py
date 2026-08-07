@@ -1,7 +1,7 @@
 """Pytest path setup for app tests.
 
 Makes the ``app`` package and the shared-code package
-``tesseract_photonic_waveguide_shared`` importable when running pytest from
+``prismo_shared`` importable when running pytest from
 the repository root without installing either package.
 """
 

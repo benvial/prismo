@@ -1,7 +1,7 @@
 """Shared waveguide mesh generation for the PRISMO pipeline.
 
 Generates a 2D SOI rib waveguide cross-section mesh as a Gmsh ``.msh`` file.
-Both the DEVSIM and gyptis Tesseracts consume the same mesh file at runtime via
+Both the ChargeTransport.jl and gyptis Tesseracts consume the same mesh file at runtime via
 ``MeshRef.path``.  Physical-group naming is defined here so both integrators
 agree on which subdomains are contacts, silicon, and oxide.
 
@@ -271,7 +271,7 @@ def read_mesh_node_coordinates(mesh_path: str | Path) -> np.ndarray:
     """Extract 2D node coordinates from a Gmsh ``.msh`` v4 file.
 
     Returns a ``(n_nodes, 2)`` float64 array of (x, y) positions, suitable
-    for feeding into :func:`tesseract_photonic_waveguide.density_filter.assemble_filter_matrix`.
+    for feeding into :func:`prismo.density_filter.assemble_filter_matrix`.
 
     Requires ``gmsh`` to be importable.
     """

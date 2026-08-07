@@ -4,9 +4,9 @@
 
 ## **P**hotonic **R**econfigurable **I**ntegrated **S**emiconductor **M**ultiphysics **O**ptimization
 
-Differentiable PN-junction photonic phase shifter: DEVSIM, gyptis, and ChargeTransport.jl composed as Tesseracts.
+Differentiable PN-junction photonic phase shifter: gyptis and ChargeTransport.jl composed as Tesseracts.
 
-This is a **multi-Tesseract project**: a monorepo that combines several [Tesseracts](https://github.com/pasteurlabs/tesseract-core) into a differentiable pipeline for topology optimization of a reverse-biased PN-junction phase shifter. Each solver is a standalone Tesseract with its own automatic differentiation strategy — implicit adjoint (DEVSIM), eigen-adjoint (gyptis), and discrete adjoint (ChargeTransport.jl). Shared Pydantic schemas in `components/shared_code/` define the exchange format across solver boundaries, and the pipeline composition lives in `app/`.
+This is a **multi-Tesseract project**: a monorepo that combines several [Tesseracts](https://github.com/pasteurlabs/tesseract-core) into a differentiable pipeline for topology optimization of a reverse-biased PN-junction phase shifter. Each solver is a standalone Tesseract with its own automatic differentiation strategy — eigen-adjoint (gyptis) and discrete adjoint (ChargeTransport.jl). Shared Pydantic schemas in `components/shared_code/` define the exchange format across solver boundaries, and the pipeline composition lives in `app/`.
 
 New to Tesseract? Start with the [Tesseract Core docs](https://docs.pasteurlabs.ai/projects/tesseract-core/latest/).
 
@@ -27,7 +27,7 @@ New to Tesseract? Start with the [Tesseract Core docs](https://docs.pasteurlabs.
 │   ├── chain.ipynb                  # Pipeline notebook (Tesseract composition, stubs)
 │   ├── pyproject.toml
 │   ├── requirements.txt             # tesseract-core
-│   ├── tesseract_photonic_waveguide
+│   ├── prismo
 │   │   ├── __init__.py
 │   │   ├── main.py                  # CLI entrypoint (typer)
 │   │   ├── density_filter.py        # Andreassen density filter (sparse H matrix)
@@ -43,16 +43,10 @@ New to Tesseract? Start with the [Tesseract Core docs](https://docs.pasteurlabs.
 ├── components
 │   ├── shared_code
 │   │   ├── pyproject.toml
-│   │   └── tesseract_photonic_waveguide_shared
+│   │   └── prismo_shared
 │   │       └── schemas.py           # Pydantic schemas (mesh, carrier/permittivity fields)
 │   └── tesseracts
 │       ├── .template                # Scaffold for `make new`
-│       ├── devsim                   # Python 3.12 — DEVSIM drift-diffusion (implicit adjoint)
-│       │   ├── tesseract_api.py
-│       │   ├── tesseract_config.yaml
-│       │   ├── tesseract_requirements.txt
-│       │   ├── tests/
-│       │   └── test_cases/
 │       ├── gyptis                   # conda — gyptis/FEniCS EM eigenmode (eigen-adjoint)
 │       │   ├── tesseract_api.py
 │       │   ├── tesseract_config.yaml
@@ -69,7 +63,6 @@ New to Tesseract? Start with the [Tesseract Core docs](https://docs.pasteurlabs.
 # 🛠️ Scripts
 ├── scripts
 │   ├── gen_test_case.py             # Capture test case from payload (`make gen-tests`)
-│   ├── prototype_devsim_adjoint.py
 │   └── prototype_gyptis_eigen_adjoint.py
 # 📁 Auxiliary files
 ├── LICENSE
@@ -88,7 +81,6 @@ Three Tesseracts implement the same PN-junction phase-shifter problem with diffe
 
 | Tesseract | Engine | Language | Adjoint strategy |
 |---|---|---|---|
-| `devsim` | DEVSIM | Python 3.12 | Implicit (Newton Jacobian) |
 | `gyptis` | gyptis / FEniCS | conda | Eigen-adjoint (Hellmann-Feynman) |
 | `chargetransport` | ChargeTransport.jl | Python + Julia | Discrete adjoint |
 
@@ -111,13 +103,13 @@ $ make new mytess RECIPE=jax
 $ make build
 
 # Build a single Tesseract
-$ make build devsim
+$ make build gyptis
 
 # Test all components + app
 $ make test
 
 # Test a single component
-$ make test devsim
+$ make test gyptis
 
 # Test app only
 $ make test app

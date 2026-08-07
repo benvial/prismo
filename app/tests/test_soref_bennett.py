@@ -2,8 +2,8 @@
 
 import numpy as np
 import pytest
-from tesseract_photonic_waveguide.soref_bennett import soref_bennett
-from tesseract_photonic_waveguide_shared.schemas import (
+from prismo.soref_bennett import soref_bennett
+from prismo_shared.schemas import (
     CarrierDensityField,
     SorefBennettCoefficients,
     SorefBennettResult,

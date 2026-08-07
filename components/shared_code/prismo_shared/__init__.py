@@ -1,4 +1,4 @@
-from tesseract_photonic_waveguide_shared.schemas import (
+from prismo_shared.schemas import (
     CarrierDensityField,
     MeshRef,
     PermittivityField,

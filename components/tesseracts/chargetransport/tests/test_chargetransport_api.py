@@ -44,7 +44,7 @@ def _julia_available() -> bool:
 
 
 def _make_mesh_ref(mesh_path: str, n_nodes: int = 0) -> object:
-    from tesseract_photonic_waveguide_shared.schemas import MeshRef
+    from prismo_shared.schemas import MeshRef
 
     return MeshRef(path=mesh_path, n_nodes=n_nodes)
 

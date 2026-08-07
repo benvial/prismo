@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from tesseract_photonic_waveguide.waveguide_mesh import (
+from prismo.waveguide_mesh import (
     PHYSICAL_GROUP_NAMES,
     RibWaveguideGeometry,
     build_rib_waveguide_mesh,
@@ -193,7 +193,7 @@ class TestMeshRefCompat:
         Path(path).unlink(missing_ok=True)
 
     def test_meshref_path_exists(self, output_path):
-        from tesseract_photonic_waveguide_shared.schemas import MeshRef
+        from prismo_shared.schemas import MeshRef
 
         mesh_path = build_rib_waveguide_mesh(output_path)
         ref = MeshRef(path=str(mesh_path))
@@ -201,7 +201,7 @@ class TestMeshRefCompat:
 
     @pytest.mark.skip(reason="gmsh required to parse .msh for node counts")
     def test_meshref_node_count_populated(self, output_path):
-        from tesseract_photonic_waveguide_shared.schemas import MeshRef
+        from prismo_shared.schemas import MeshRef
 
         mesh_path = build_rib_waveguide_mesh(output_path)
         ref = MeshRef(path=str(mesh_path))

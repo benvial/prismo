@@ -2,7 +2,7 @@
 
 import typer
 
-app = typer.Typer(name="tesseract_photonic_waveguide")
+app = typer.Typer(name="prismo")
 
 
 @app.command()
@@ -13,7 +13,7 @@ def run() -> None:
     #
     #     from tesseract_core import Tesseract
     #
-    #     with Tesseract.from_image("tesseract_photonic_waveguide_<mytess>") as tess:
+    #     with Tesseract.from_image("prismo_<mytess>") as tess:
     #         result = tess.apply({"example_input": ...})
     #     typer.echo(result)
     #

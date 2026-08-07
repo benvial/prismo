@@ -13,7 +13,7 @@ eigenmode solve in gyptis:
     7. Wall-time measurement vs FD baseline
 
 Run this in the gyptis container:
-    docker run --rm -v "$PWD":/mnt tesseract_photonic_waveguide_gyptis \
+    docker run --rm -v "$PWD":/mnt prismo_gyptis \
         python /mnt/scripts/prototype_gyptis_eigen_adjoint.py
 
 Or locally if gyptis/FEniCS are installed:
@@ -194,7 +194,7 @@ def main() -> None:
         print(
             "\ngyptis/FEniCS not installed — run in the gyptis container:\n"
             '  docker run --rm -v "$PWD":/mnt '
-            "tesseract_photonic_waveguide_gyptis \\\n"
+            "prismo_gyptis \\\n"
             "      python /mnt/scripts/prototype_gyptis_eigen_adjoint.py\n"
         )
         sys.exit(0)

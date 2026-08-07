@@ -1,7 +1,7 @@
 # Copyright 2025 Pasteur Labs. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Tesseract API module for tesseract_photonic_waveguide_chargetransport
+# Tesseract API module for prismo_chargetransport
 # ChargeTransport.jl semiconductor drift-diffusion component (Julia subprocess).
 #
 # Subprocess pattern: Python wrapper calls ``julia forward.jl`` (or
@@ -21,7 +21,7 @@ import numpy as np
 import numpy.typing as npt
 from pydantic import BaseModel, Field
 from tesseract_core.runtime import Array, Differentiable, Float64
-from tesseract_photonic_waveguide_shared.schemas import MeshRef
+from prismo_shared.schemas import MeshRef
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
 

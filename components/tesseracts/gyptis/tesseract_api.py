@@ -1,7 +1,7 @@
 # Copyright 2025 Pasteur Labs. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Tesseract API module for tesseract_photonic_waveguide_gyptis
+# Tesseract API module for prismo_gyptis
 # Electromagnetic eigenmode component (gyptis / FEniCS).
 #
 # Real implementation: 2D waveguide eigenmode solve + Hellmann-Feynman

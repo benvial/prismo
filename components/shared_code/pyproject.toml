@@ -3,10 +3,10 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tesseract_photonic_waveguide_shared"
+name = "prismo_shared"
 version = "0.1.0"
 description = "Shared code for Tesseract Photonic Waveguide tesseracts"
-authors = [{ name = "tesseract-hackathon" }]
+authors = [{ name = "prismo" }]
 requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2",
@@ -14,4 +14,4 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["tesseract_photonic_waveguide_shared", "tesseract_photonic_waveguide_shared.*"]
+include = ["prismo_shared", "prismo_shared.*"]

@@ -17,7 +17,7 @@ class MeshRef(BaseModel):
         n_nodes: Number of mesh nodes.
         n_elements: Number of mesh elements.
         node_ordering: Convention label for node indexing.
-            ``"gmsh"`` — native Gmsh tag order (DEVSIM convention).
+            ``"gmsh"`` — native Gmsh tag order.
             ``"gmsh_invperm"`` — ``invperm(Gmsh node tags)`` (ChargeTransport.jl
             via ExtendableGrids).
     """

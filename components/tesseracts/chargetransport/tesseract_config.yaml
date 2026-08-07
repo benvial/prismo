@@ -3,7 +3,7 @@
 # Subprocess pattern: Python tesseract_api.py calls julia script.jl with NPY args
 # Ref: tickets 02 (container + I/O), 06 (container build)
 
-name: "tesseract_photonic_waveguide_chargetransport"
+name: "prismo_chargetransport"
 version: "0.1.0"
 description: "ChargeTransport.jl drift-diffusion solver with discrete adjoint VJP via subprocess"
 
@@ -16,6 +16,10 @@ build_config:
 
   # No system BLAS/LAPACK — Julia bundles its own via LinearAlgebra stdlib
   # extra_packages:
+
+  # Copy Julia scripts into the container for the subprocess calls
+  package_data:
+    - ["scripts", "scripts"]
 
   # Install Julia via juliaup (non-interactive), pre-install Julia packages,
   # and precompile them to avoid startup penalty at runtime.

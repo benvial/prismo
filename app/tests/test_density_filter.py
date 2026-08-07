@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from scipy.sparse import issparse
-from tesseract_photonic_waveguide.density_filter import (
+from prismo.density_filter import (
     apply_filter,
     assemble_filter_matrix,
     vjp_filter,
@@ -141,7 +141,7 @@ class TestDensityFilterWithMesh:
     def mesh_coords(self):
         pytest.importorskip("gmsh")
         import gmsh  # type: ignore[import-untyped]
-        from tesseract_photonic_waveguide.waveguide_mesh import (
+        from prismo.waveguide_mesh import (
             RibWaveguideGeometry,
             build_rib_waveguide_mesh_via_gmsh,
             read_mesh_node_coordinates,
