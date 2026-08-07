@@ -420,3 +420,179 @@ def test_devsim_vjp_matches_finite_difference() -> None:
     vjp_dir = float(np.dot(vjp, perturbation))
     rel_err = abs(vjp_dir - fd_grad) / max(abs(fd_grad), 1.0)
     assert rel_err < 0.01, f"VJP-FD mismatch: {rel_err:.2e}"
+
+
+def _make_minimal_triangle_msh(
+    path: str,
+    *,
+    with_contacts: bool = False,
+    symmetric: bool = False,
+) -> None:
+    """Write a minimal Gmsh v4.1 mesh with 3 nodes forming one triangle.
+
+    When ``with_contacts`` is True, includes ``$PhysicalNames`` and
+    tags the triangle as ``contact_anode`` so the physical-group
+    contact-detection path is exercised.
+
+    When ``symmetric`` is True, places the third node at negative x so
+    both anode (x < 0) and cathode (x >= 0) sides have nodes.
+    """
+    x3 = -1e-7 if symmetric else 1e-7
+    phy_lines = (
+        "$PhysicalNames\n1\n2 1 \"contact_anode\"\n$EndPhysicalNames\n"
+        if with_contacts
+        else ""
+    )
+    elm_phys_tag = "1 " if with_contacts else ""
+    content = (
+        "$MeshFormat\n4.1 0 8\n$EndMeshFormat\n"
+        f"{phy_lines}"
+        "$Nodes\n1 3 1 3\n"
+        "1 0.0 0.0 0.0\n"
+        "2 1e-7 0.0 0.0\n"
+        f"3 {x3:.1e} 1e-7 0.0\n"
+        "$EndNodes\n"
+        "$Elements\n1 1 1 1\n"
+        f"2 1 2 1\n{elm_phys_tag}1 1 2 3\n"
+        "$EndElements\n"
+    )
+    Path(path).write_text(content)
+
+
+# ---------------------------------------------------------------------------
+# 2D contact detection — physical-group path (ticket 12)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _devsim_available(), reason="DEVSIM not installed")
+def test_setup_2d_contacts_with_physical_groups() -> None:
+    """Contact detection must use gmsh physical groups when mesh_path is given."""
+    devsim = _api._ensure_devsim()
+
+    with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
+        _make_minimal_triangle_msh(f.name, with_contacts=True)
+        mesh_path = f.name
+    try:
+        devsim.create_device(device="pgtest")
+        devsim.create_region(device="pgtest", region="silicon", material="Silicon")
+        devsim.create_gmsh_mesh(
+            device="pgtest", region="silicon", mesh="mesh", file=mesh_path
+        )
+        _api._setup_2d_contacts_from_mesh(
+            devsim, "pgtest", "silicon", "mesh", mesh_path=mesh_path
+        )
+        contacts = devsim.get_contact_list(device="pgtest")
+        assert isinstance(contacts, list)
+    finally:
+        _api._cleanup_device(devsim, "pgtest")
+        Path(mesh_path).unlink(missing_ok=True)
+
+
+@pytest.mark.skipif(not _devsim_available(), reason="DEVSIM not installed")
+def test_setup_2d_contacts_fallback_no_mesh_path() -> None:
+    """Fallback boundary-edge + x<0 split when mesh_path is absent."""
+    devsim = _api._ensure_devsim()
+
+    with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
+        _make_minimal_triangle_msh(f.name)
+        mesh_path = f.name
+    try:
+        devsim.create_device(device="fbtest")
+        devsim.create_region(device="fbtest", region="silicon", material="Silicon")
+        devsim.create_gmsh_mesh(
+            device="fbtest", region="silicon", mesh="mesh", file=mesh_path
+        )
+        _api._setup_2d_contacts_from_mesh(
+            devsim, "fbtest", "silicon", "mesh"
+        )
+        contacts = devsim.get_contact_list(device="fbtest")
+        assert isinstance(contacts, list)
+    finally:
+        _api._cleanup_device(devsim, "fbtest")
+        Path(mesh_path).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# 2D VJP smoke test — 3-node triangle (ticket 12)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _devsim_available(), reason="DEVSIM not installed")
+def test_2d_vjp_on_minimal_triangle_mesh() -> None:
+    """VJP on a 3-node 2D triangle must return finite grad of correct shape.
+
+    Uses ``symmetric=True`` so nodes span both sides of x=0,
+    allowing both anode and cathode contacts to be created.
+    """
+    devsim = _api._ensure_devsim()
+
+    _api._cleanup_device(devsim, "pn_junction")
+    with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
+        _make_minimal_triangle_msh(f.name, symmetric=True)
+        mesh_path = f.name
+    try:
+        doping = np.array([1e23, 1e23, 1e23], dtype=float)
+        ref = _make_mesh_ref(mesh_path, n_nodes=3)
+        inp = InputSchema(doping=doping, mesh_ref=ref)
+
+        out = apply(inp)
+        assert isinstance(out, OutputSchema)
+        assert out.charge.shape == (3,)
+        assert np.all(np.isfinite(out.charge))
+
+        cotangent = {"charge": np.ones(3)}
+        result = vector_jacobian_product(
+            inp, {"doping"}, {"charge"}, cotangent
+        )
+        vjp = np.asarray(result["doping"])
+        assert vjp.shape == (3,)
+        assert np.all(np.isfinite(vjp))
+    finally:
+        _api._cleanup_device(devsim, "pn_junction")
+        Path(mesh_path).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# 2D vs 1D uniform doping comparison (ticket 12)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _devsim_available(), reason="DEVSIM not installed")
+def test_2d_uniform_doping_matches_1d() -> None:
+    """Uniform doping on 2D strip must match 1D results within tolerance.
+
+    Uniform doping has no spatial variation, so both paths should
+    converge to the same equilibrium.  Uses ``symmetric=True`` so
+    both anode and cathode contacts exist.
+    """
+    devsim = _api._ensure_devsim()
+
+    n_nodes = 15
+    doping_1d = np.full(n_nodes, 1e22, dtype=float)
+
+    out_1d = apply(InputSchema(doping=doping_1d))
+    assert out_1d.charge.shape == (n_nodes,)
+
+    with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
+        _make_minimal_triangle_msh(f.name, symmetric=True)
+        mesh_path = f.name
+    try:
+        doping_2d = np.array([1e22, 1e22, 1e22], dtype=float)
+        ref = _make_mesh_ref(mesh_path, n_nodes=3)
+        inp_2d = InputSchema(doping=doping_2d, mesh_ref=ref)
+
+        _api._cleanup_device(devsim, "pn_junction")
+        out_2d = apply(inp_2d)
+        assert out_2d.charge.shape == (3,)
+
+        mean_1d = float(np.mean(out_1d.charge))
+        mean_2d = float(np.mean(out_2d.charge))
+        rel_diff = abs(mean_1d - mean_2d) / max(abs(mean_1d), 1.0)
+        assert rel_diff < 0.5, (
+            f"2D uniform doping deviates from 1D: "
+            f"mean 1D={mean_1d:.2e}, mean 2D={mean_2d:.2e}, "
+            f"rel_diff={rel_diff:.2e}"
+        )
+    finally:
+        _api._cleanup_device(devsim, "pn_junction")
+        Path(mesh_path).unlink(missing_ok=True)

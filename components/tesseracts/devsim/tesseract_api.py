@@ -167,14 +167,10 @@ def _build_2d_pn_junction(
     Mesh: imported from a ``.msh`` file via ``devsim.create_gmsh_mesh``.
     Physics: simple_physics drift-diffusion (Silicon).
     Doping: per-node NetDoping assigned on all mesh nodes.
-    Contacts: identified by boundary-edge detection on the mesh (edges
-        belonging to exactly one element are boundary edges; nodes on
-        those edges are candidate contact nodes). They are partitioned
-        into anode (x < median) and cathode (x ≥ median) — no hardcoded
-        geometry.
+    Contacts: identified from ``.msh`` physical groups (``contact_anode``,
+        ``contact_cathode``) via gmsh, with boundary-edge detection as
+        fallback when gmsh is unavailable.
     """
-    n = len(doping)
-
     _cleanup_device(devsim, device)
 
     devsim.create_device(device=device)
@@ -198,7 +194,7 @@ def _build_2d_pn_junction(
 
     CreateSiliconDriftDiffusion(device, region)
 
-    _setup_2d_contacts_from_mesh(devsim, device, region, mesh_name)
+    _setup_2d_contacts_from_mesh(devsim, device, region, mesh_name, mesh_path)
 
     for contact in devsim.get_contact_list(device=device):
         devsim.set_parameter(
@@ -210,15 +206,73 @@ def _build_2d_pn_junction(
         )
 
 
-def _setup_2d_contacts_from_mesh(
-    devsim: Any, device: str, region: str, mesh_name: str
-) -> None:
-    """Identify and create ohmic contacts via boundary-edge detection.
+def _read_mesh_physical_group_nodes(
+    mesh_path: str,
+) -> tuple[set[int] | None, set[int] | None]:
+    """Read ``.msh`` physical groups to find nodes in contact surfaces.
 
-    Detects boundary nodes by counting edge occurrences across elements:
-    edges appearing exactly once are boundary edges; their incident
-    nodes are candidate contact nodes. Boundary nodes are partitioned
-    into anode (x-coordinate below median) and cathode (above median).
+    Uses gmsh to read physical groups ``contact_anode`` and
+    ``contact_cathode``, returning all node indices belonging to
+    elements in those groups.  Gmsh node tags are 1-based; this
+    function converts to 0-based DEVSIM indices.
+
+    Returns:
+        ``(anode_node_set, cathode_node_set)`` on success, or
+        ``(None, None)`` when gmsh is unavailable.
+    """
+    try:
+        import gmsh  # type: ignore[import-untyped]
+    except ImportError:
+        return None, None
+
+    was_init = gmsh.isInitialized()
+    if not was_init:
+        gmsh.initialize()
+
+    try:
+        gmsh.open(mesh_path)
+
+        phys_groups = gmsh.model.getPhysicalGroups()
+        anode_set: set[int] = set()
+        cathode_set: set[int] = set()
+
+        for dim, tag in phys_groups:
+            name = gmsh.model.getPhysicalName(dim, tag)
+            if name not in ("contact_anode", "contact_cathode"):
+                continue
+            entities = gmsh.model.getEntitiesForPhysicalGroup(dim, tag)
+            for entity_tag in entities:
+                _, _, node_tags_list = gmsh.model.mesh.getElements(
+                    dim, entity_tag
+                )
+                for node_tags in node_tags_list:
+                    target = anode_set if name == "contact_anode" else cathode_set
+                    for n in node_tags:
+                        target.add(int(n) - 1)
+
+        gmsh.clear()
+        return anode_set if anode_set else None, cathode_set if cathode_set else None
+    finally:
+        if not was_init:
+            gmsh.finalize()
+
+
+def _setup_2d_contacts_from_mesh(
+    devsim: Any,
+    device: str,
+    region: str,
+    mesh_name: str,
+    mesh_path: str | None = None,
+) -> None:
+    """Identify and create ohmic contacts.
+
+    Primary path: reads ``.msh`` physical groups (``contact_anode``,
+    ``contact_cathode``) via gmsh.  Boundary nodes inside those surface
+    groups become the contact nodes — no hardcoded geometry.
+
+    Fallback (gmsh unavailable): boundary-edge detection on the entire
+    mesh.  Boundary nodes are partitioned into anode (x < 0) and
+    cathode (x >= 0), assuming a waveguide centred at x = 0.
     """
     x_coords = np.array(
         devsim.get_node_model_values(device=device, region=region, name="x"),
@@ -255,14 +309,18 @@ def _setup_2d_contacts_from_mesh(
                 boundary_node_set.add(node)
                 break
 
-    x_center = float(np.median(x_coords))
+    anode_nodes: list[int] = []
+    cathode_nodes: list[int] = []
 
-    anode_nodes = sorted(
-        [n for n in boundary_node_set if x_coords[n] < x_center]
-    )
-    cathode_nodes = sorted(
-        [n for n in boundary_node_set if x_coords[n] >= x_center]
-    )
+    if mesh_path is not None:
+        anode_pg, cathode_pg = _read_mesh_physical_group_nodes(mesh_path)
+        if anode_pg is not None and cathode_pg is not None:
+            anode_nodes = sorted(n for n in boundary_node_set if n in anode_pg)
+            cathode_nodes = sorted(n for n in boundary_node_set if n in cathode_pg)
+
+    if not anode_nodes and not cathode_nodes:
+        anode_nodes = sorted(n for n in boundary_node_set if x_coords[n] < 0.0)
+        cathode_nodes = sorted(n for n in boundary_node_set if x_coords[n] >= 0.0)
 
     if anode_nodes:
         devsim.add_2d_mesh_line(
@@ -395,7 +453,7 @@ def vector_jacobian_product(
     interface, ∂F/∂(doping) reduces to the NetDoping sensitivity of the
     Poisson equation rows (-q per node).
 
-    In 2D the Jacobian is 3N×3N (N = mesh nodes) with the same per-node
+    In 2D the Jacobian is 3Nx3N (N = mesh nodes) with the same per-node
     equation ordering as 1D: Potential, ElectronContinuity, HoleContinuity.
 
     Args:
