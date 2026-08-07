@@ -1,0 +1,35 @@
+# Tesseract configuration file
+# ChargeTransport.jl semiconductor drift-diffusion solver (Julia)
+# Subprocess pattern: Python tesseract_api.py calls julia script.jl with NPY args
+# Ref: tickets 02 (container + I/O), 06 (container build)
+
+name: "tesseract_photonic_waveguide_chargetransport"
+version: "0.1.0"
+description: "ChargeTransport.jl drift-diffusion solver with discrete adjoint VJP via subprocess"
+
+build_config:
+  # Python version installed via uv
+  python_version: "3.12"
+
+  # Platform to build the container for
+  target_platform: "native"
+
+  # No system BLAS/LAPACK — Julia bundles its own via LinearAlgebra stdlib
+  # extra_packages:
+
+  # Install Julia via juliaup (non-interactive), pre-install Julia packages,
+  # and precompile them to avoid startup penalty at runtime.
+  # Ref: ticket 02 — curl | sh for juliaup, NPZ.jl for binary I/O.
+  custom_build_steps:
+    - |
+      # --- Install Julia via juliaup (non-interactive, LTS channel) ---
+      RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+          rm -rf /var/lib/apt/lists/*
+      RUN curl -fsSL https://install.julialang.org | sh -s -- --yes --default-channel lts
+      ENV PATH="/root/.juliaup/bin:${PATH}"
+    - |
+      # --- Pre-install Julia packages ---
+      RUN julia -e 'using Pkg; Pkg.add(["ChargeTransport", "VoronoiFVM", "ExtendableGrids", "NPZ"])'
+    - |
+      # --- Precompile packages (no-op caching for faster first solve) ---
+      RUN julia -e 'using ChargeTransport, VoronoiFVM, ExtendableGrids, NPZ; println("Packages precompiled.")'

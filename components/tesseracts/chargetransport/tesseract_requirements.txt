@@ -1,0 +1,5 @@
+# ChargeTransport.jl Tesseract container — Python dependencies
+# numpy: NPY/NPZ I/O between Python wrapper and Julia subprocess (ticket 02)
+numpy
+
+../../shared_code
