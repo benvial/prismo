@@ -14,6 +14,7 @@ import numpy as np
 import numpy.typing as npt
 from pydantic import BaseModel
 from tesseract_core.runtime import Array, Differentiable, Float64
+from tesseract_photonic_waveguide_shared.schemas import MeshRef
 
 #
 # Schemas
@@ -26,9 +27,13 @@ class InputSchema(BaseModel):
     Attributes:
         doping: Net doping concentration at every mesh node [m⁻³].
             Positive = n-type, negative = p-type.
+        mesh_ref: Optional reference to a shared Gmsh 2D mesh file.
+            When present, the solve runs in 2D on the imported mesh.
+            When absent, falls back to a 1D PN junction (test path).
     """
 
     doping: Differentiable[Array[(None,), Float64]]
+    mesh_ref: MeshRef | None = None
 
 
 class OutputSchema(BaseModel):
@@ -48,7 +53,7 @@ class OutputSchema(BaseModel):
 #
 
 # Cached after apply() so vector_jacobian_product() can re-extract the Jacobian.
-# Keys: "device", "region", "n_nodes"
+# Keys: "device", "region", "n_nodes", "dim" (1 or 2)
 _solve_state: dict[str, Any] | None = None
 
 
@@ -149,6 +154,151 @@ def _build_1d_pn_junction(
         )
 
 
+def _build_2d_pn_junction(
+    devsim: Any,
+    device: str,
+    region: str,
+    doping: np.ndarray,
+    mesh_path: str,
+    mesh_name: str = "mesh",
+) -> None:
+    """Create a 2D PN junction device on an imported Gmsh mesh.
+
+    Mesh: imported from a ``.msh`` file via ``devsim.create_gmsh_mesh``.
+    Physics: simple_physics drift-diffusion (Silicon).
+    Doping: per-node NetDoping assigned on all mesh nodes.
+    Contacts: identified by boundary-edge detection on the mesh (edges
+        belonging to exactly one element are boundary edges; nodes on
+        those edges are candidate contact nodes). They are partitioned
+        into anode (x < median) and cathode (x ≥ median) — no hardcoded
+        geometry.
+    """
+    n = len(doping)
+
+    _cleanup_device(devsim, device)
+
+    devsim.create_device(device=device)
+    devsim.create_region(device=device, region=region, material="Silicon")
+
+    devsim.create_gmsh_mesh(
+        device=device, region=region, mesh=mesh_name, file=mesh_path
+    )
+
+    devsim.set_node_values(
+        device=device,
+        region=region,
+        name="NetDoping",
+        init_from="list",
+        values=doping.tolist(),
+    )
+
+    from devsim.python_packages.simple_physics import (  # type: ignore[import-untyped]
+        CreateSiliconDriftDiffusion,
+    )
+
+    CreateSiliconDriftDiffusion(device, region)
+
+    _setup_2d_contacts_from_mesh(devsim, device, region, mesh_name)
+
+    for contact in devsim.get_contact_list(device=device):
+        devsim.set_parameter(
+            device=device,
+            name=devsim.get_contact_parameter_name(
+                device=device, contact=contact, parameter="bias"
+            ),
+            value=0.0,
+        )
+
+
+def _setup_2d_contacts_from_mesh(
+    devsim: Any, device: str, region: str, mesh_name: str
+) -> None:
+    """Identify and create ohmic contacts via boundary-edge detection.
+
+    Detects boundary nodes by counting edge occurrences across elements:
+    edges appearing exactly once are boundary edges; their incident
+    nodes are candidate contact nodes. Boundary nodes are partitioned
+    into anode (x-coordinate below median) and cathode (above median).
+    """
+    x_coords = np.array(
+        devsim.get_node_model_values(device=device, region=region, name="x"),
+        dtype=float,
+    )
+
+    elem_nodes_list = devsim.get_element_node_numbers(device=device, region=region)
+
+    boundary_node_set: set[int] = set()
+    edge: tuple[int, int]
+    node_to_edges: dict[int, list[tuple[int, int]]] = {}
+
+    for elem_nodes in elem_nodes_list:
+        if len(elem_nodes) < 2:
+            continue
+        for i in range(len(elem_nodes)):
+            a_i = int(elem_nodes[i])
+            b_i = int(elem_nodes[(i + 1) % len(elem_nodes)])
+            if a_i < b_i:
+                edge = (a_i, b_i)
+            else:
+                edge = (b_i, a_i)
+            node_to_edges.setdefault(a_i, []).append(edge)
+            node_to_edges.setdefault(b_i, []).append(edge)
+
+    edge_count: dict[tuple[int, int], int] = {}
+    for edges in node_to_edges.values():
+        for edge in edges:
+            edge_count[edge] = edge_count.get(edge, 0) + 1
+
+    for node, edges in node_to_edges.items():
+        for edge in edges:
+            if edge_count[edge] == 1:
+                boundary_node_set.add(node)
+                break
+
+    x_center = float(np.median(x_coords))
+
+    anode_nodes = sorted(
+        [n for n in boundary_node_set if x_coords[n] < x_center]
+    )
+    cathode_nodes = sorted(
+        [n for n in boundary_node_set if x_coords[n] >= x_center]
+    )
+
+    if anode_nodes:
+        devsim.add_2d_mesh_line(
+            device=device,
+            region=region,
+            mesh=mesh_name,
+            tag="anode",
+            ns=len(anode_nodes) - 1,
+            ps=0,
+        )
+        devsim.add_2d_contact(
+            device=device,
+            region=region,
+            mesh=mesh_name,
+            name="anode",
+            material="metal",
+        )
+
+    if cathode_nodes:
+        devsim.add_2d_mesh_line(
+            device=device,
+            region=region,
+            mesh=mesh_name,
+            tag="cathode",
+            ns=len(cathode_nodes) - 1,
+            ps=0,
+        )
+        devsim.add_2d_contact(
+            device=device,
+            region=region,
+            mesh=mesh_name,
+            name="cathode",
+            material="metal",
+        )
+
+
 #
 # Required endpoint
 #
@@ -157,8 +307,13 @@ def _build_1d_pn_junction(
 def apply(inputs: InputSchema) -> OutputSchema:
     """Forward drift-diffusion solve.
 
+    Dispatch:
+        - ``mesh_ref`` absent → 1D PN junction (``_build_1d_pn_junction``).
+        - ``mesh_ref`` present → 2D drift-diffusion on imported Gmsh mesh
+          (``_build_2d_pn_junction``).
+
     Args:
-        inputs: Net doping at every mesh node [m⁻³].
+        inputs: Net doping at every mesh node [m⁻³] plus optional mesh reference.
 
     Returns:
         Total carrier concentration (electrons + holes) at every node [m⁻³].
@@ -172,8 +327,16 @@ def apply(inputs: InputSchema) -> OutputSchema:
 
     device = "pn_junction"
     region = "silicon"
+    mesh_name = "mesh"
 
-    _build_1d_pn_junction(devsim, device, region, doping)
+    if inputs.mesh_ref is not None:
+        _build_2d_pn_junction(
+            devsim, device, region, doping, str(inputs.mesh_ref.path)
+        )
+        dim = 2
+    else:
+        _build_1d_pn_junction(devsim, device, region, doping, mesh_name)
+        dim = 1
 
     devsim.solve(
         type="dc",
@@ -196,7 +359,12 @@ def apply(inputs: InputSchema) -> OutputSchema:
     charge = electrons + holes
 
     global _solve_state
-    _solve_state = {"device": device, "region": region, "n_nodes": len(doping)}
+    _solve_state = {
+        "device": device,
+        "region": region,
+        "n_nodes": len(doping),
+        "dim": dim,
+    }
 
     return OutputSchema(charge=charge)
 
@@ -214,6 +382,8 @@ def vector_jacobian_product(
 ) -> dict[str, npt.ArrayLike]:
     """Adjoint gradient pass via implicit differentiation.
 
+    Works for both 1D and 2D solves (dim tracked in ``_solve_state["dim"]``).
+
     Implements the implicit-function-theorem VJP:
 
         dJ/d(doping) = λᵀ · ∂F/∂(doping)
@@ -224,6 +394,9 @@ def vector_jacobian_product(
     For the ``charge = electrons + holes`` output and direct doping-input
     interface, ∂F/∂(doping) reduces to the NetDoping sensitivity of the
     Poisson equation rows (-q per node).
+
+    In 2D the Jacobian is 3N×3N (N = mesh nodes) with the same per-node
+    equation ordering as 1D: Potential, ElectronContinuity, HoleContinuity.
 
     Args:
         inputs: Same InputSchema as the preceding apply() call.
@@ -271,9 +444,16 @@ def vector_jacobian_product(
     # --- 1. Extract Newton Jacobian A = ∂F/∂x ---
     r = devsim.get_matrix_and_rhs(device=device, region=region, format="csc")
     static = r["static"]
+    n_eqs = len(static["rhs"])
     a_mat = scipy.sparse.csc_matrix(
-        (static["av"], static["ai"], static["ap"]), shape=(3 * n, 3 * n)
+        (static["av"], static["ai"], static["ap"]), shape=(n_eqs, n_eqs)
     )
+
+    if n_eqs != 3 * n:
+        raise RuntimeError(
+            f"Jacobian size mismatch: expected 3*{n}={3*n} equations, "
+            f"got {n_eqs}. The solve may have additional degrees of freedom."
+        )
 
     # --- 2. Build objective RHS u = ∂J/∂x ---
     # charge_i = Electrons_i + Holes_i, so ∂(charge_i)/∂x has ones at the
