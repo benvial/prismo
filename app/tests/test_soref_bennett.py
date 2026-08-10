@@ -65,6 +65,55 @@ def test_equilibrium_subtraction():
     np.testing.assert_allclose(result.delta_absorption, [exp_dalpha], rtol=1e-9)
 
 
+def test_depletion_increases_permittivity():
+    """Carrier DEPLETION (dn < 0, reverse bias) raises the refractive index.
+
+    Hand-computed for depletion of Delta_N = 1e18 cm^-3 (schema densities
+    are m^-3): antisymmetric extension of Soref-Bennett gives
+    dn_index = +(A_e * dN^B_e + A_h * dN^B_h) with dN = 1e18.
+    Ref: ticket 17.
+    """
+    coeffs = SorefBennettCoefficients()
+    dN = 1e18  # cm^-3
+
+    carriers = CarrierDensityField(
+        electrons=[0.0],
+        holes=[0.0],
+        equilibrium_electrons=[1e24],
+        equilibrium_holes=[1e24],
+    )
+    result = soref_bennett(carriers)
+
+    exp_dn = coeffs.A_e * dN**coeffs.B_e + coeffs.A_h * dN**coeffs.B_h
+    exp_depsilon = 2.0 * coeffs.background_index * exp_dn
+    np.testing.assert_allclose(result.delta_permittivity, [exp_depsilon], rtol=1e-9)
+    assert result.delta_permittivity[0] > 0
+
+    exp_dalpha = -(coeffs.C_e * dN**coeffs.D_e + coeffs.C_h * dN**coeffs.D_h)
+    np.testing.assert_allclose(result.delta_absorption, [exp_dalpha], rtol=1e-9)
+
+
+def test_antisymmetric_in_density_change():
+    """sb(-dn) == -sb(+dn): depletion and injection are opposite."""
+    up = CarrierDensityField(
+        electrons=[1.5e24], holes=[1.5e24],
+        equilibrium_electrons=[1e24], equilibrium_holes=[1e24],
+    )
+    down = CarrierDensityField(
+        electrons=[0.5e24], holes=[0.5e24],
+        equilibrium_electrons=[1e24], equilibrium_holes=[1e24],
+    )
+    r_up = soref_bennett(up)
+    r_down = soref_bennett(down)
+
+    np.testing.assert_allclose(
+        r_down.delta_permittivity, [-x for x in r_up.delta_permittivity], rtol=1e-9,
+    )
+    np.testing.assert_allclose(
+        r_down.delta_absorption, [-x for x in r_up.delta_absorption], rtol=1e-9,
+    )
+
+
 def test_missing_equilibrium_raises():
     """Missing equilibrium densities raise ValueError."""
     carriers = CarrierDensityField(electrons=[1e24], holes=[1e24])

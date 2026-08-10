@@ -256,6 +256,47 @@ def test_vjp_matches_finite_difference() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subprocess timeout behavior (mocked Julia path)
+# ---------------------------------------------------------------------------
+
+
+def _force_julia_path_with_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pretend Julia is installed but every invocation hangs past timeout."""
+    import subprocess as sp
+
+    monkeypatch.setattr(_api, "_julia_available", lambda: True)
+
+    def _hang(*args: object, **kwargs: object) -> None:
+        raise sp.TimeoutExpired(cmd="julia", timeout=1)
+
+    monkeypatch.setattr(_api.subprocess, "run", _hang)
+
+
+def test_apply_returns_identity_when_julia_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    doping = np.array([1e22, -5e21, 0.0, 5e21, -1e22], dtype=float)
+    _force_julia_path_with_timeout(monkeypatch)
+    outputs = apply(InputSchema(doping=doping, bias_voltage=-5.0))
+    np.testing.assert_allclose(outputs.electrons, doping)
+    np.testing.assert_allclose(outputs.holes, doping)
+
+
+def test_vjp_returns_zeros_when_julia_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = make_inputs()
+    _force_julia_path_with_timeout(monkeypatch)
+    result = vector_jacobian_product(
+        inputs,
+        {"doping"},
+        {"electrons", "holes"},
+        {"electrons": np.ones(N_NODES), "holes": np.ones(N_NODES)},
+    )
+    np.testing.assert_allclose(result["doping"], np.zeros(N_NODES))
+
+
+# ---------------------------------------------------------------------------
 # Subprocess integration test (Julia available)
 # ---------------------------------------------------------------------------
 

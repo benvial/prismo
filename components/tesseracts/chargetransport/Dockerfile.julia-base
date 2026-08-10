@@ -10,7 +10,9 @@
 # a `tesseract build` after a code change only re-layers the Python venv +
 # scripts — seconds instead of minutes.
 #
-# REBUILD THIS IMAGE only when julia_env/Project.toml or Manifest.toml change:
+# REBUILD THIS IMAGE when julia_env/Project.toml or Manifest.toml change, and
+# when scripts/ change in ways that affect the warmup workload (the sysimage
+# layer below COPYs scripts/):
 #   make julia-base chargetransport
 # then rebuild the component:
 #   make build chargetransport
@@ -20,7 +22,8 @@
 FROM julia:1.10-bookworm
 
 # git: needed by Julia's Pkg for the General registry (build time only).
-RUN apt-get update && apt-get install -y --no-install-recommends git \
+# build-essential: C compiler required by PackageCompiler's sysimage bundling.
+RUN apt-get update && apt-get install -y --no-install-recommends git build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Depot lives at /opt/julia_depot (not $HOME — /root is mode 700 at runtime)
@@ -31,8 +34,10 @@ ENV JULIA_DEPOT_PATH=/opt/julia_depot \
     JULIA_PROJECT=/tesseract/julia_env
 
 # Pinned, reproducible environment. ONLY these two files gate the expensive
-# layers below, so code edits elsewhere never invalidate them.
-COPY julia_env/Project.toml julia_env/Manifest.toml /tmp/julia_env/
+# depot layers below, so code edits elsewhere never invalidate them.
+# Kept at /opt/julia_env (not deleted) so the sysimage build can resolve the
+# same pinned environment.
+COPY julia_env/Project.toml julia_env/Manifest.toml /opt/julia_env/
 
 # Install exactly the pinned versions, precompile them (so the first container
 # solve() doesn't pay a multi-minute compile penalty), and make the depot
@@ -40,9 +45,35 @@ COPY julia_env/Project.toml julia_env/Manifest.toml /tmp/julia_env/
 # Ref: ticket 02 — Julia 1.10 LTS (ChargeTransport.jl + VoronoiFVM.jl
 # segfault on Julia 1.12).
 RUN mkdir -p /opt/julia_depot && \
-    julia --startup-file=no --project=/tmp/julia_env \
+    julia --startup-file=no --project=/opt/julia_env \
       -e 'using Pkg; Pkg.instantiate()' && \
-    julia --startup-file=no --project=/tmp/julia_env \
+    julia --startup-file=no --project=/opt/julia_env \
       -e 'using ChargeTransport, VoronoiFVM, ExtendableGrids, NPZ, JSON, Gmsh; println("Julia packages precompiled.")' && \
-    chmod -R a+rwX /opt/julia_depot && \
-    rm -rf /tmp/julia_env
+    chmod -R a+rwX /opt/julia_depot
+
+# PackageCompiler lives OUTSIDE the pinned project so julia_env/Manifest.toml
+# stays untouched.
+RUN julia --startup-file=no --project=@packagecompiler \
+      -e 'using Pkg; Pkg.add(name="PackageCompiler", version="2")' && \
+    chmod -R a+rwX /opt/julia_depot
+
+# Precompile-warmed sysimage (ticket 17). Package precompilation alone does
+# NOT cache the method instances compiled while running a script, so the
+# first drift-diffusion solve used to pay ~22 s of JIT at runtime. Running
+# scripts/warmup.jl under create_sysimage snapshots those specializations
+# (1D + 2D grid paths, equilibrium + bias ramp, adjoint machinery) into
+# /opt/julia_sysimage/prismo_ct.so; the wrapper passes it via
+# `julia --sysimage`. Rebuild when scripts/ change.
+COPY scripts/ /tmp/ct_scripts/
+# Active project stays the pinned /opt/julia_env (so the sysimage embeds the
+# pinned dependency graph and warmup.jl runs against it); PackageCompiler is
+# loaded from its own shared env via JULIA_LOAD_PATH. JULIA_PROJECT must be
+# overridden for this step: the ENV default points at /tesseract/julia_env,
+# which only exists in the final tesseract image.
+RUN mkdir -p /opt/julia_sysimage && \
+    JULIA_PROJECT=/opt/julia_env \
+    JULIA_LOAD_PATH="@:@packagecompiler:@stdlib" \
+    julia --startup-file=no \
+      -e 'using PackageCompiler; create_sysimage(["ChargeTransport", "ExtendableGrids", "VoronoiFVM", "NPZ", "JSON", "Gmsh"]; project = "/opt/julia_env", sysimage_path = "/opt/julia_sysimage/prismo_ct.so", precompile_execution_file = "/tmp/ct_scripts/warmup.jl")' && \
+    chmod -R a+rX /opt/julia_sysimage && \
+    rm -rf /tmp/ct_scripts

@@ -30,6 +30,9 @@ def run(
         str(_DEFAULT_OUTPUT_DIR), help="Directory for output plots",
     ),
     no_jit: bool = typer.Option(False, help="Disable JIT compilation"),
+    use_containers: bool = typer.Option(
+        False, "--use-containers", help="Run tesseract components via Docker containers",
+    ),
 ) -> None:
     """Run the PRISMO differentiable pipeline end-to-end.
 
@@ -39,6 +42,38 @@ def run(
     3. Run NLopt MMA optimization (maximize delta_n_eff)
     4. Generate paper-ready plots
     """
+    from prismo.pipeline import (
+        init_tesseract_containers,
+        teardown_containers,
+    )
+
+    if use_containers:
+        typer.echo("Starting tesseract Docker containers...")
+        init_tesseract_containers()
+
+    try:
+        _run_pipeline(
+            r_min=r_min,
+            max_iter=max_iter,
+            ftol_rel=ftol_rel,
+            mesh_path=mesh_path,
+            output_dir=output_dir,
+            no_jit=no_jit,
+        )
+    finally:
+        if use_containers:
+            typer.echo("Stopping tesseract containers...")
+            teardown_containers()
+
+
+def _run_pipeline(
+    r_min: float,
+    max_iter: int,
+    ftol_rel: float,
+    mesh_path: str,
+    output_dir: str,
+    no_jit: bool,
+) -> None:
     from prismo.density_filter import assemble_filter_matrix
     from prismo.optimizer import OptimizationCancelled, optimize_doping
     from prismo.outputs import generate_outputs

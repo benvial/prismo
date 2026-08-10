@@ -119,6 +119,40 @@ class TestMeshGenerationGmsh:
         assert "contact_anode" in group_names
         assert "contact_cathode" in group_names
 
+    def test_contact_groups_are_boundary_curves(self, gmsh, output_path):
+        """ChargeTransport needs contacts as dim-1 boundary curves.
+
+        ExtendableGrids only reads dim-(d-1) elements as boundary faces;
+        contact physical groups must therefore be curves (dim 1), not
+        surfaces (ticket 17).
+        """
+        mesh_file = build_rib_waveguide_mesh_via_gmsh(
+            output_path, RibWaveguideGeometry()
+        )
+
+        gmsh.open(str(mesh_file))
+        groups = gmsh.model.getPhysicalGroups()
+        contact_dims = {
+            gmsh.model.getPhysicalName(dim, tag): dim for dim, tag in groups
+        }
+        gmsh.clear()
+
+        assert contact_dims["contact_anode"] == 1
+        assert contact_dims["contact_cathode"] == 1
+
+    def test_contact_curves_have_1d_elements(self, gmsh, output_path):
+        """The .msh must contain 1D elements on the contact curves."""
+        mesh_file = build_rib_waveguide_mesh_via_gmsh(
+            output_path, RibWaveguideGeometry()
+        )
+
+        gmsh.open(str(mesh_file))
+        elem_types, elem_tags, _ = gmsh.model.mesh.getElements(1, -1)
+        gmsh.clear()
+
+        assert len(elem_types) > 0
+        assert sum(len(tags) for tags in elem_tags) > 0
+
     def test_build_mesh_node_count(self, gmsh, output_path):
         build_rib_waveguide_mesh_via_gmsh(
             output_path, RibWaveguideGeometry()

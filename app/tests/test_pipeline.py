@@ -76,6 +76,53 @@ class TestSorefBennettJax:
         assert grad.shape == electrons.shape
         assert jnp.all(jnp.isfinite(grad))
 
+    def test_depletion_increases_permittivity(self):
+        """Reverse bias DEPLETES carriers (dn < 0); the index must rise.
+
+        Hand-computed for depletion of Delta_N = 1e18 cm^-3 (input densities
+        in m^-3): the Soref-Bennett model extended antisymmetrically gives
+        dn_index = +(A_e * dN^B_e + A_h * dN^B_h) with dN = 1e18.
+        Ref: ticket 17 — clamping dn at zero made Delta_eps identically zero
+        under reverse bias.
+        """
+        from prismo.pipeline import _DEFAULT_COEFFS
+
+        coeffs = _DEFAULT_COEFFS
+        dN = 1e18  # cm^-3 depletion magnitude
+
+        # Fully depleted: carriers drop from 1e24 m^-3 (= 1e18 cm^-3) to 0.
+        depletion = jnp.zeros(self.N_NODES)
+        eq = jnp.full(self.N_NODES, 1e24)
+
+        depsilon, dalpha = _sb_jax(depletion, depletion, eq, eq)
+
+        exp_dn = coeffs.A_e * dN**coeffs.B_e + coeffs.A_h * dN**coeffs.B_h
+        exp_depsilon = 2.0 * coeffs.background_index * exp_dn
+        np.testing.assert_allclose(
+            depsilon, jnp.full(self.N_NODES, exp_depsilon), rtol=1e-6,
+        )
+        assert jnp.all(depsilon > 0)
+        # Depletion removes absorption: dalpha < 0.
+        exp_dalpha = -(coeffs.C_e * dN**coeffs.D_e + coeffs.C_h * dN**coeffs.D_h)
+        np.testing.assert_allclose(
+            dalpha, jnp.full(self.N_NODES, exp_dalpha), rtol=1e-6,
+        )
+
+    def test_antisymmetric_in_density_change(self):
+        """sb(-dn) == -sb(+dn): injection and depletion are opposite."""
+        eq_e = jnp.full(self.N_NODES, 1e24)
+        eq_h = jnp.full(self.N_NODES, 1e24)
+        up_e = eq_e * 1.5
+        up_h = eq_h * 1.5
+        down_e = eq_e * 0.5
+        down_h = eq_h * 0.5
+
+        dep_up, da_up = _sb_jax(up_e, up_h, eq_e, eq_h)
+        dep_down, da_down = _sb_jax(down_e, down_h, eq_e, eq_h)
+
+        np.testing.assert_allclose(dep_down, -dep_up, rtol=1e-6)
+        np.testing.assert_allclose(da_down, -da_up, rtol=1e-6)
+
 
 class TestPipelineStub:
     """Pipeline with no containers available (stubs)."""
@@ -90,6 +137,40 @@ class TestPipelineStub:
         result = pipeline(rho)
         assert result.ndim == 0
         assert jnp.isfinite(result)
+
+    def test_ct_units_converted_for_soref(self, rho, monkeypatch):
+        """CT reports carriers in cm^-3; Soref-Bennett expects m^-3.
+
+        Stub the external solver boundary: 0 V returns 1e18 cm^-3 carriers,
+        -5 V returns full depletion. The expected Delta n_eff is
+        hand-computed from the Soref-Bennett model with dN = 1e18 cm^-3 —
+        if the cm^-3 -> m^-3 conversion were missing, the result would be
+        1e6x too small (ticket 17).
+        """
+        import prismo.pipeline as pl
+
+        n_nodes = self.N_NODES
+        hi = jnp.full((n_nodes,), 1e18)  # cm^-3, from CT
+        lo = jnp.zeros((n_nodes,))
+
+        def fake_ct(doping, bias_voltage, mesh_ref=None):
+            if bias_voltage == 0.0:
+                return hi, hi
+            return lo, lo
+
+        monkeypatch.setattr(pl, "_ct_call_jax", fake_ct)
+
+        result = pipeline(rho)
+
+        coeffs = pl._DEFAULT_COEFFS
+        dN = 1e18  # cm^-3 depletion
+        exp_dn = coeffs.A_e * dN**coeffs.B_e + coeffs.A_h * dN**coeffs.B_h
+        exp_deps = 2.0 * coeffs.background_index * exp_dn
+        bg = pl._DEFAULT_BACKGROUND_EPSILON
+        # gyptis stub returns mean(epsilon); neff = sqrt(mean(eps)).
+        exp_result = float(np.sqrt(bg) - np.sqrt(bg + exp_deps))
+        np.testing.assert_allclose(float(result), exp_result, rtol=1e-6)
+        assert float(result) != 0.0
 
     def test_forward_returns_zero_pre_container(self, rho):
         result = pipeline(rho)

@@ -164,7 +164,11 @@ data:
 
 run:
 	@echo "Running app..."
-	@prismo run $(filter-out $@,$(MAKECMDGOALS))
+	@prismo run $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
+
+run-containers:
+	@echo "Running app with Docker containers..."
+	@prismo run --use-containers $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
 
 clean:
 	@echo "Cleaning build artifacts, caches, and temp files..."

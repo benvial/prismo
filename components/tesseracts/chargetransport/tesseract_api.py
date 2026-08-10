@@ -12,7 +12,9 @@
 #      06 (container build).
 
 import json
+import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,19 @@ from tesseract_core.runtime import Array, Differentiable, Float64
 from prismo_shared.schemas import MeshRef
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
+
+# Wall-clock budget for one Julia subprocess call. The tesseract apply()
+# endpoint must return within ~30s (ticket 17); the Julia solve itself takes
+# ~12s after the precompile-warmed image build, so 25s leaves headroom while
+# guaranteeing no hang. Override via env for slower hosts.
+_JULIA_TIMEOUT_S = float(os.environ.get("PRISMO_CT_JULIA_TIMEOUT_S", "25"))
+
+# Precompile-warmed PackageCompiler sysimage baked into the Julia base image
+# (ticket 17). Without it the first solve pays ~22s of JIT compilation.
+# Absent locally (plain ``julia script.jl`` still works, just slower).
+_JULIA_SYSIMAGE = Path(
+    os.environ.get("PRISMO_CT_JULIA_SYSIMAGE", "/opt/julia_sysimage/prismo_ct.so")
+)
 
 #
 # Schemas
@@ -110,7 +125,10 @@ def _build_julia_cmd(
     Returns:
         Command list ready for ``subprocess.run``.
     """
-    cmd = ["julia", str(script)]
+    cmd = ["julia"]
+    if _JULIA_SYSIMAGE.is_file():
+        cmd.extend(["--sysimage", str(_JULIA_SYSIMAGE)])
+    cmd.append(str(script))
     for flag, file_path in file_args:
         cmd.extend([flag, str(file_path)])
     if mesh_ref is not None:
@@ -150,10 +168,22 @@ def _run_julia_forward(
             mesh_ref,
         )
         try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(
+                cmd, check=True, capture_output=True, text=True,
+                timeout=_JULIA_TIMEOUT_S,
+            )
             data = np.load(output_path)
             return data["electrons"], data["holes"]
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            FileNotFoundError,
+        ) as exc:
+            print(
+                f"WARNING: julia forward solve failed ({exc}); "
+                "falling back to identity pass-through",
+                file=sys.stderr,
+            )
             return doping.copy(), doping.copy()
 
 
@@ -196,9 +226,21 @@ def _run_julia_adjoint(
             mesh_ref,
         )
         try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(
+                cmd, check=True, capture_output=True, text=True,
+                timeout=_JULIA_TIMEOUT_S,
+            )
             return np.load(output_path)
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            FileNotFoundError,
+        ) as exc:
+            print(
+                f"WARNING: julia adjoint solve failed ({exc}); "
+                "falling back to zero VJP",
+                file=sys.stderr,
+            )
             return np.zeros(len(doping))
 
 

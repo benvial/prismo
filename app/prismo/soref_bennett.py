@@ -66,8 +66,21 @@ def soref_bennett(
     dn_e = (n_e - n_e_eq) * _M3_TO_CM3
     dn_h = (n_h - n_h_eq) * _M3_TO_CM3
 
-    dn = -(coeffs.A_e * dn_e**coeffs.B_e + coeffs.A_h * dn_h**coeffs.B_h)
-    dalpha = coeffs.C_e * dn_e**coeffs.D_e + coeffs.C_h * dn_h**coeffs.D_h
+    # Antisymmetric extension of the (injection-calibrated) model:
+    # sign(dN) * |dN|^B. Reverse bias depletes carriers (dN < 0), where a
+    # bare fractional power is undefined; with the odd extension, depletion
+    # raises the refractive index and lowers absorption (ticket 17).
+    def _signed_pow(x: np.ndarray, p: float) -> np.ndarray:
+        return np.sign(x) * np.abs(x) ** p
+
+    dn = -(
+        coeffs.A_e * _signed_pow(dn_e, coeffs.B_e)
+        + coeffs.A_h * _signed_pow(dn_h, coeffs.B_h)
+    )
+    dalpha = (
+        coeffs.C_e * _signed_pow(dn_e, coeffs.D_e)
+        + coeffs.C_h * _signed_pow(dn_h, coeffs.D_h)
+    )
     depsilon = 2.0 * coeffs.background_index * dn
 
     return SorefBennettResult(

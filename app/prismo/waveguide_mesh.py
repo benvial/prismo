@@ -211,6 +211,7 @@ def _build_mesh_rectangles(
     ct_r_end = rib_r + ct_off + ct_w
 
     _tc = [0]
+    _top_curves: dict[int, int] = {}
 
     def _rect(x1: float, y1: float, x2: float, y2: float, lc: float) -> int:
         _tc[0] += 1
@@ -223,7 +224,9 @@ def _build_mesh_rectangles(
         l3 = gmsh.model.geo.addLine(p3, p4)
         l4 = gmsh.model.geo.addLine(p4, p1)
         cl = gmsh.model.geo.addCurveLoop([l1, l2, l3, l4])
-        return gmsh.model.geo.addPlaneSurface([cl])
+        surf = gmsh.model.geo.addPlaneSurface([cl])
+        _top_curves[surf] = l3
+        return surf
 
     core_sz = geometry.mesh_res_core
     bulk_sz = geometry.mesh_res_bulk
@@ -253,10 +256,18 @@ def _build_mesh_rectangles(
 
     gmsh.model.geo.synchronize()
 
+    # Contacts are dim-1 physical groups on the top edge of the contact
+    # patches: ChargeTransport.jl applies voltages to boundary REGIONS
+    # (curves in 2D), and ExtendableGrids only reads dim-1 elements as
+    # boundary faces (ticket 17). The metal patches themselves stay part of
+    # the silicon domain for the electrical solve.
+    silicon_surfs.extend(anode_surfs)
+    silicon_surfs.extend(cathode_surfs)
+
     _add_physical_group(gmsh, 2, silicon_surfs, "silicon")
     _add_physical_group(gmsh, 2, oxide_surfs, "oxide")
-    _add_physical_group(gmsh, 2, anode_surfs, "contact_anode")
-    _add_physical_group(gmsh, 2, cathode_surfs, "contact_cathode")
+    _add_physical_group(gmsh, 1, [_top_curves[s] for s in anode_surfs], "contact_anode")
+    _add_physical_group(gmsh, 1, [_top_curves[s] for s in cathode_surfs], "contact_cathode")
 
     gmsh.model.mesh.generate(2)
 

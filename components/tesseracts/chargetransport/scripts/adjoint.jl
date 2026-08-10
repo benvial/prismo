@@ -1,16 +1,12 @@
 #!/usr/bin/env julia
 
-using ChargeTransport
-using ExtendableGrids
-using VoronoiFVM
 using NPZ
 using JSON
 using LinearAlgebra
 using SparseArrays
-using ExtendableSparseArrays
-using Gmsh
 
-include(joinpath(@__DIR__, "contacts.jl"))
+# VoronoiFVM access (qualified) comes from ct_common.jl.
+include(joinpath(@__DIR__, "ct_common.jl"))
 
 const SPEC_E = 1
 const SPEC_H = 2
@@ -45,16 +41,6 @@ function parse_adjoint_args()
     end
 
     return doping_path, cot_n_path, cot_p_path, bias_path, output_path, mesh_path
-end
-
-function generate_1d_mesh_adjoint(n_nodes)
-    L = 1e-4
-    coord = collect(range(0.0, L, n_nodes))
-    grid = simplexgrid(coord)
-    cellmask!(grid, 0.0, L, 1)
-    bfacemask!(grid, 0.0, 0.0, 1)
-    bfacemask!(grid, L, L, 2)
-    return grid
 end
 
 function dof_index(nspec, node, spec)
@@ -110,100 +96,17 @@ function main()
     bias = JSON.parsefile(bias_path)
     bias_voltage = Float64(bias["bias_voltage"])
 
-    anode_breg = 1
-    cathode_breg = 2
+    ctsys, data, cathode_breg, n_bregions = build_ct_system(doping, mesh_path)
 
-    if mesh_path != "" && isfile(mesh_path)
-        grid = simplexgrid(mesh_path)
-        contacts = get_breking_contacts(mesh_path)
-        if haskey(contacts, :anode)
-            anode_breg = contacts[:anode]
-        end
-        if haskey(contacts, :cathode)
-            cathode_breg = contacts[:cathode]
-        end
-    else
-        grid = generate_1d_mesh_adjoint(n_nodes)
-    end
+    control = make_solver_control()
 
-    grid_nnodes = size(grid[Coordinates], 2)
-    if grid_nnodes != n_nodes
-        error("doping array length ($n_nodes) does not match mesh node count ($grid_nnodes)")
-    end
-
-    data = Data(grid, 2)
-    data.modelType = Stationary
-
-    data.bulkRecombination = set_bulk_recombination(
-        iphin = 1, iphip = 2,
-        bulk_recomb_Auger = false,
-        bulk_recomb_radiative = false,
-        bulk_recomb_SRH = false,
-    )
-
-    n_bregions = grid[NumBFaceRegions]
-    if anode_breg <= n_bregions
-        data.boundaryType[anode_breg] = OhmicContact
-    end
-    if cathode_breg <= n_bregions
-        data.boundaryType[cathode_breg] = OhmicContact
-    end
-
-    constants = ChargeTransport.constants
-    n_regions = grid[NumCellRegions]
-    params = Params(n_regions, n_bregions, 2)
-
-    T = 300.0
-    eps_si = 11.7 * constants.ε_0
-    Nc = 2.8e19
-    Nv = 1.04e19
-    Eg = 1.12 * constants.q
-    mu_n = 1350.0
-    mu_p = 450.0
-
-    params.temperature = T
-    params.chargeNumbers[SPEC_E] = -1
-    params.chargeNumbers[SPEC_H] = 1
-    for ireg in 1:n_regions
-        params.dielectricConstant[ireg] = eps_si
-        params.densityOfStates[1, ireg] = Nc
-        params.densityOfStates[2, ireg] = Nv
-        params.bandEdgeEnergy[1, ireg] = Eg
-        params.bandEdgeEnergy[2, ireg] = 0.0
-        params.mobility[1, ireg] = mu_n
-        params.mobility[2, ireg] = mu_p
-    end
-
-    data.params = params
-
-    paramsnodal = ParamsNodal(grid, 2)
-    for i in 1:grid_nnodes
-        paramsnodal.doping[i] = doping[i]
-    end
-    data.paramsnodal = paramsnodal
-
-    ctsys = System(grid, data, unknown_storage = :dense)
-
-    control = SolverControl()
-    control.abstol = 1e-10
-    control.reltol = 1e-10
-    control.maxiters = 50
-    control.max_round = 5
-    control.verbose = false
-
-    u0 = equilibrium_solve!(ctsys, control = control)
-
-    if abs(bias_voltage) > 0.0 && cathode_breg <= n_bregions
-        set_contact!(ctsys, cathode_breg, Δu = bias_voltage)
-        sol = solve(ctsys; inival = u0, control = control)
-    else
-        sol = u0
-    end
+    u0 = solve_equilibrium(ctsys, data, doping, control)
+    sol = solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregions)
 
     residual, J_ext = VoronoiFVM.evaluate_residual_and_jacobian(ctsys.fvmsys, sol.u)
-    J_csc = SparseMatrixCSC(flush!(J_ext))
+    J_csc = SparseMatrixCSC(ExtendableSparse.flush!(J_ext))
 
-    nspec = num_species(ctsys)
+    nspec = VoronoiFVM.num_species(ctsys.fvmsys)
     ndof = nspec * n_nodes
     dJ_dx = zeros(Float64, ndof)
     epsilon = 1e-8
