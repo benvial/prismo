@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 from pydantic import BaseModel
+from collections import OrderedDict
 from tesseract_core.runtime import Array, Differentiable, Float64
 
 #
@@ -73,13 +74,13 @@ def _ensure_gyptis() -> Any:
 
 
 def _build_waveguide(
-    epsilon: np.ndarray, wavelength: float = 1.55e-6
+    epsilon: np.ndarray, wavelength: float = 1.55
 ) -> tuple[Any, Any, Any, float]:
     """Build a 2D waveguide simulation with layered geometry.
 
     Creates a rectangular cross-section with horizontal layers via
-    LayeredBoxPML2D, one layer per epsilon element. Uses gyptis
-    Waveguide2D for the eigenmode formulation.
+    LayeredBoxPML, one layer per epsilon element. Uses gyptis
+    Waveguide for the eigenmode formulation.
 
     Args:
         epsilon: Per-layer relative permittivity values.
@@ -94,20 +95,21 @@ def _build_waveguide(
     n_domains = len(epsilon)
     k0 = 2.0 * np.pi / wavelength
 
-    width = 2e-6  # 2 μm cross-section width
-    height = 1e-6  # 1 μm cross-section height
+    width = 2  # 2 μm cross-section width
+    height = 1  # 1 μm cross-section height
     layer_thickness = height / n_domains
-    thicknesses = [layer_thickness] * n_domains
+    thicknesses = OrderedDict({"domain_" + str(i + 1): layer_thickness for i in range(n_domains)})
 
-    geom = gyptis.LayeredBoxPML2D(width, thicknesses, pml_width=(0, 0))
+    geom = gyptis.geometry.LayeredBoxPML2D(
+        width, thicknesses=thicknesses, pml_width=(0.5, 0.5)
+    )
+    geom.build()
 
     eps_dict: dict[str, float] = {}
     for i, eps in enumerate(epsilon):
-        domain_name = str(i + 1)
-        eps_dict[domain_name] = float(eps)
-        geom.add_physical(float(eps), domain_name)
+        eps_dict["domain_" + str(i + 1)] = float(eps)
 
-    simu = gyptis.Waveguide2D(geom, epsilon=eps_dict, wavenumber=k0)
+    simu = gyptis.Waveguide(geom, epsilon=eps_dict, wavenumber=k0)
 
     return simu, geom, n_domains, k0
 
@@ -142,7 +144,7 @@ def apply(inputs: InputSchema) -> OutputSchema:
     ev_re, ev_im, _rx, _cx = simu.eigensolver.get_eigenpair(j_fundamental)
     lam = ev_re + 1j * ev_im
     kz = np.sqrt(lam)
-    neff = float(kz / k0)
+    neff = float(np.real(kz / k0))
 
     global _solve_state
     _solve_state = {

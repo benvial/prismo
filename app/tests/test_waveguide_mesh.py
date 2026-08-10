@@ -186,6 +186,15 @@ class TestMeshRefCompat:
     """Tests that the generated mesh is compatible with MeshRef schema."""
 
     @pytest.fixture
+    def gmsh(self):
+        pytest.importorskip("gmsh")
+        import gmsh  # type: ignore[import-untyped]
+
+        gmsh.initialize()
+        yield gmsh
+        gmsh.finalize()
+        
+    @pytest.fixture
     def output_path(self):
         with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
             path = f.name
@@ -199,7 +208,7 @@ class TestMeshRefCompat:
         ref = MeshRef(path=str(mesh_path))
         assert Path(ref.path).exists()
 
-    @pytest.mark.skip(reason="gmsh required to parse .msh for node counts")
+    # @pytest.mark.skip(reason="gmsh required to parse .msh for node counts")
     def test_meshref_node_count_populated(self, output_path):
         from prismo_shared.schemas import MeshRef
 

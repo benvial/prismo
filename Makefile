@@ -109,10 +109,10 @@ test:
 			fi; \
 		done; \
 		echo "Testing app..."; \
-		pytest app; \
+		python -m pytest app; \
 	elif [ "$(filter-out $@,$(MAKECMDGOALS))" = "app" ]; then \
 		echo "Testing app only..."; \
-		pytest app; \
+		python -m pytest app; \
 	else \
 		echo "Testing tesseract: $(filter-out $@,$(MAKECMDGOALS))"; \
 		TESS_DIR="components/tesseracts/$(filter-out $@,$(MAKECMDGOALS))"; \
