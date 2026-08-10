@@ -205,3 +205,124 @@ class TestPipelineDopingMapping:
         grad = jax.grad(pipeline)(rho)
         assert grad.shape == rho.shape
         assert jnp.all(jnp.isfinite(grad))
+
+
+class TestPipelineGradientValidation:
+    """Finite-difference validation of the full-pipeline gradient.
+
+    Compares jax.grad(pipeline) against central finite differences for
+    random perturbation directions at random rho vectors.
+    """
+
+    N_NODES = 10
+    N_DIRECTIONS = 3
+
+    @pytest.fixture
+    def rho_vectors(self) -> list[jax.Array]:
+        return [
+            jnp.asarray(RNG.random(self.N_NODES), dtype=jnp.float64)
+            for _ in range(self.N_DIRECTIONS)
+        ]
+
+    @pytest.fixture
+    def directions(self) -> list[jax.Array]:
+        dirs = []
+        for _ in range(self.N_DIRECTIONS):
+            d = jnp.asarray(RNG.standard_normal(self.N_NODES), dtype=jnp.float64)
+            d = d / jnp.linalg.norm(d)
+            dirs.append(d)
+        return dirs
+
+    def test_gradient_vs_fd_central(self, rho_vectors, directions):
+        step_sizes = [1e-3, 1e-4, 1e-5, 1e-6]
+        grad_fn = jax.grad(pipeline)
+
+        for rho in rho_vectors:
+            grad_exact = grad_fn(rho)
+            for direction in directions:
+                for h in step_sizes:
+                    f_plus = pipeline(rho + h * direction)
+                    f_minus = pipeline(rho - h * direction)
+                    fd_grad_dir = (f_plus - f_minus) / (2.0 * h)
+                    exact_grad_dir = jnp.dot(grad_exact, direction)
+
+                    rel_error = float(
+                        abs(fd_grad_dir - exact_grad_dir)
+                        / max(abs(exact_grad_dir), 1e-30)
+                    )
+                    assert jnp.isfinite(rel_error)
+
+                    if h <= 1e-4:
+                        assert rel_error < 1.0, (
+                            f"FD error too large at h={h}: "
+                            f"rel_error={rel_error:.2e}"
+                        )
+
+    def test_gradient_vs_fd_multiple_rho(self):
+        grad_fn = jax.grad(pipeline)
+        for seed in [42, 99, 137]:
+            rng = np.random.default_rng(seed)
+            rho = jnp.asarray(rng.random(self.N_NODES), dtype=jnp.float64)
+            direction = jnp.asarray(
+                rng.standard_normal(self.N_NODES), dtype=jnp.float64
+            )
+            direction = direction / jnp.linalg.norm(direction)
+
+            grad_exact = grad_fn(rho)
+            exact_dir = float(jnp.dot(grad_exact, direction))
+
+            h = 1e-5
+            f_plus = pipeline(rho + h * direction)
+            f_minus = pipeline(rho - h * direction)
+            fd_dir = float((f_plus - f_minus) / (2.0 * h))
+
+            assert abs(fd_dir - exact_dir) < 1e-8, (
+                f"seed={seed}: exact={exact_dir:.4e}, fd={fd_dir:.4e}"
+            )
+
+
+class TestPipelineShapeValidation:
+    """Intermediate shapes through the pipeline are consistent."""
+
+    N_NODES = 16
+
+    @pytest.fixture
+    def rho(self) -> jax.Array:
+        return jnp.asarray(RNG.random(self.N_NODES), dtype=jnp.float64)
+
+    def test_doping_range(self, rho):
+
+        doping = jnp.power(
+            jnp.asarray(10.0, dtype=rho.dtype),
+            jnp.asarray(14.0, dtype=rho.dtype)
+            + jnp.asarray(7.0, dtype=rho.dtype) * rho,
+        )
+        assert doping.shape == rho.shape
+        assert jnp.all(doping >= 1e14)
+        assert jnp.all(doping <= 1e21)
+
+    def test_sb_output_shapes(self, rho):
+        from prismo.pipeline import _sb_jax
+
+        n = jnp.ones_like(rho) * 1e24
+        p = jnp.ones_like(rho) * 1e24
+        n_eq = jnp.ones_like(rho) * 1e21
+        p_eq = jnp.ones_like(rho) * 1e21
+
+        depsilon, dalpha = _sb_jax(n, p, n_eq, p_eq)
+        assert depsilon.shape == rho.shape
+        assert dalpha.shape == rho.shape
+
+    def test_gyptis_scalar_output(self, rho):
+        from prismo.pipeline import _gyptis_call_jax
+
+        result = _gyptis_call_jax(rho)
+        assert result.ndim == 0
+        assert jnp.isfinite(result)
+
+    def test_ct_call_output_shapes(self, rho):
+        from prismo.pipeline import _ct_call_jax
+
+        n_out, p_out = _ct_call_jax(rho, 0.0)
+        assert n_out.shape == rho.shape
+        assert p_out.shape == rho.shape

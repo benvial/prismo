@@ -164,7 +164,7 @@ data:
 
 run:
 	@echo "Running app..."
-	@prismo $(filter-out $@,$(MAKECMDGOALS))
+	@prismo run $(filter-out $@,$(MAKECMDGOALS))
 
 clean:
 	@echo "Cleaning build artifacts, caches, and temp files..."

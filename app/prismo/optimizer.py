@@ -8,6 +8,7 @@ Ref: ticket 15.
 
 from __future__ import annotations
 
+import json
 import signal
 import time
 from pathlib import Path
@@ -170,8 +171,27 @@ def optimize_doping(
         signal.signal(signal.SIGINT, prev_handler)
 
     if cancelled[0]:
+        saved = prev_rho if prev_rho is not None else initial_rho
+        _save_checkpoint(saved, history)
         raise OptimizationCancelled(
             f"Optimization interrupted by user at iteration {len(history)}."
+            f" Progress saved to outputs/checkpoint.json."
         )
 
     return rho_opt, history
+
+
+def _save_checkpoint(
+    rho: np.ndarray, history: list[_HistoryEntry],
+) -> None:
+    """Save optimization progress to ``outputs/checkpoint.json``."""
+    out_dir = Path("outputs")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint = {
+        "rho_opt": rho.tolist(),
+        "history": [
+            {k: v for k, v in entry.items()}
+            for entry in history
+        ],
+    }
+    (out_dir / "checkpoint.json").write_text(json.dumps(checkpoint, indent=2))

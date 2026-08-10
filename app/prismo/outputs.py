@@ -1,0 +1,347 @@
+"""Paper-ready visualization outputs for the PRISMO pipeline.
+
+Ref: ticket 16 — produce convergence plots, doping-field visualizations,
+delta_n_eff breakdown, and gradient-validation plots for the hackathon
+submission.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from pathlib import Path
+
+import jax
+import jax.numpy as jnp
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+
+matplotlib.use("Agg")
+plt.rcParams.update({
+    "font.size": 12,
+    "axes.titlesize": 14,
+    "axes.labelsize": 12,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
+    "figure.dpi": 150,
+    "savefig.bbox": "tight",
+    "savefig.pad_inches": 0.1,
+})
+
+_OUTPUT_DIR = Path("outputs")
+
+
+def _ensure_output_dir(output_dir: str | Path | None = None) -> Path:
+    d = Path(output_dir) if output_dir is not None else _OUTPUT_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def plot_convergence(
+    history: list[dict],
+    output_dir: str | Path | None = None,
+    ftol_rel: float | None = None,
+) -> Path:
+    """Convergence plot: delta_n_eff vs iteration.
+
+    Args:
+        history: Per-iteration records from ``optimize_doping``.
+        output_dir: Directory to write ``convergence.pdf``.
+        ftol_rel: MMA relative tolerance for the marker annotation.
+
+    Returns:
+        Path to the saved figure.
+    """
+    out = _ensure_output_dir(output_dir)
+    fig, ax = plt.subplots(figsize=(6, 4))
+
+    if not history:
+        ax.text(
+            0.5, 0.5, "No data", ha="center", va="center",
+            transform=ax.transAxes, fontsize=14,
+        )
+    else:
+        iters = [h["iteration"] for h in history]
+        values = [h["delta_n_eff"] for h in history]
+
+        ax.plot(
+            iters, values, "o-", markersize=3, color="#2c7bb6",
+            label=r"$\Delta n_{\mathrm{eff}}$",
+        )
+        ax.axhline(
+            y=values[-1], color="#d7191c", linestyle="--", alpha=0.6,
+            label="final value",
+        )
+
+        if ftol_rel is not None and len(values) >= 2:
+            threshold = abs(values[-1]) * ftol_rel
+            idx = None
+            for i in range(1, len(values)):
+                if abs(values[i] - values[i - 1]) < threshold:
+                    idx = i
+                    break
+            if idx is not None:
+                ax.axvline(
+                    x=iters[idx], color="#fdae61", linestyle=":", alpha=0.8,
+                    label=f"ftol_rel={ftol_rel:.0e}",
+                )
+
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel(r"$\Delta n_{\mathrm{eff}}$")
+    ax.set_title("MMA Convergence")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    path = out / "convergence.pdf"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def plot_doping_field(
+    rho_initial: np.ndarray,
+    rho_opt: np.ndarray,
+    mesh_coords: np.ndarray,
+    geometry: object | None = None,
+    output_dir: str | Path | None = None,
+) -> Path:
+    """Side-by-side doping field: initial vs optimized.
+
+    Args:
+        rho_initial: Initial design vector ``(n_nodes,)``.
+        rho_opt: Optimized design vector ``(n_nodes,)``.
+        mesh_coords: Node coordinates ``(n_nodes, 2)`` in meters.
+        geometry: ``RibWaveguideGeometry`` for overlay (optional).
+        output_dir: Directory to write ``doping_field.pdf``.
+
+    Returns:
+        Path to the saved figure.
+    """
+    out = _ensure_output_dir(output_dir)
+    x, y = mesh_coords[:, 0] * 1e6, mesh_coords[:, 1] * 1e6
+
+    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(10, 4))
+
+    vmin, vmax = 0.0, 1.0
+    scatter_kw: dict = dict(s=1, marker="s", edgecolors="none", vmin=vmin, vmax=vmax)
+
+    ax0.scatter(x, y, c=rho_initial, cmap="viridis", **scatter_kw)
+    ax0.set_title(r"Initial $\rho$ (uniform)")
+    ax0.set_xlabel("x [µm]")
+    ax0.set_ylabel("y [µm]")
+    ax0.set_aspect("equal")
+
+    sc1 = ax1.scatter(x, y, c=rho_opt, cmap="viridis", **scatter_kw)
+    ax1.set_title(r"Optimized $\rho$")
+    ax1.set_xlabel("x [µm]")
+    ax1.set_ylabel("y [µm]")
+    ax1.set_aspect("equal")
+
+    if geometry is not None:
+        _overlay_geometry(ax0, geometry)
+        _overlay_geometry(ax1, geometry)
+
+    cbar = fig.colorbar(sc1, ax=[ax0, ax1], shrink=0.7, label=r"$\rho$")
+    cbar.set_ticks([0.0, 0.25, 0.5, 0.75, 1.0])
+
+    fig.tight_layout()
+    path = out / "doping_field.pdf"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def _overlay_geometry(ax: plt.Axes, geometry: object) -> None:
+    """Draw waveguide geometry overlay on an axis.
+
+    Coordinates are converted from meters to µm.
+    """
+    rib_l = geometry.rib_left * 1e6
+    rib_r = geometry.rib_right * 1e6
+    slab_top = geometry.slab_top * 1e6
+    rib_top = geometry.rib_top * 1e6
+    sub_top = geometry.substrate_thickness * 1e6
+    hw = geometry.half_width * 1e6
+    ct_off = geometry.contact_offset * 1e6
+    ct_w = geometry.contact_width * 1e6
+
+    ax.plot([rib_l, rib_r], [slab_top, slab_top], "w--", linewidth=0.8, alpha=0.7)
+    ax.plot([rib_l, rib_r], [rib_top, rib_top], "w--", linewidth=0.8, alpha=0.7)
+    ax.plot([rib_l, rib_l], [slab_top, rib_top], "w--", linewidth=0.8, alpha=0.7)
+    ax.plot([rib_r, rib_r], [slab_top, rib_top], "w--", linewidth=0.8, alpha=0.7)
+
+    ct_l_start = rib_l - ct_off - ct_w
+    ct_l_end = rib_l - ct_off
+    ct_r_start = rib_r + ct_off
+    ct_r_end = rib_r + ct_off + ct_w
+
+    for cs, ce in [(ct_l_start, ct_l_end), (ct_r_start, ct_r_end)]:
+        ax.fill_between(
+            [cs, ce], sub_top, slab_top, color="gray", alpha=0.3, edgecolor="none",
+        )
+
+    ax.fill_between([-hw, rib_l], slab_top, rib_top, color="gray", alpha=0.1, edgecolor="none")
+    ax.fill_between([rib_r, hw], slab_top, rib_top, color="gray", alpha=0.1, edgecolor="none")
+
+    props = dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7, edgecolor="gray")
+    ax.text(
+        0.05, 0.95, "Si core", transform=ax.transAxes, fontsize=9,
+        verticalalignment="top", bbox=props,
+    )
+
+
+def plot_delta_neff_breakdown(
+    delta_n: float,
+    delta_alpha: float,
+    output_dir: str | Path | None = None,
+) -> Path:
+    """Stacked bar chart: delta_n_eff from delta_n vs delta_alpha.
+
+    Args:
+        delta_n: Effective-index change from real-index perturbation.
+        delta_alpha: Effective-index change from absorption perturbation.
+        output_dir: Directory to write ``breakdown.pdf``.
+
+    Returns:
+        Path to the saved figure.
+    """
+    out = _ensure_output_dir(output_dir)
+    fig, ax = plt.subplots(figsize=(4, 4))
+
+    categories = [r"$\Delta n$", r"$\Delta\alpha$"]
+    values = [abs(delta_n), abs(delta_alpha)]
+    colors = ["#2c7bb6", "#d7191c"]
+
+    bars = ax.bar(categories, values, color=colors, width=0.5)
+    ax.set_ylabel(r"$|\Delta n_{\mathrm{eff}}|$ contribution")
+    ax.set_title(r"$\Delta n_{\mathrm{eff}}$ Breakdown")
+
+    for bar, val in zip(bars, values, strict=True):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + max(values) * 0.02,
+            f"{val:.2e}", ha="center", va="bottom", fontsize=10,
+        )
+
+    ax.grid(True, alpha=0.3, axis="y")
+    fig.tight_layout()
+
+    path = out / "breakdown.pdf"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def plot_gradient_validation(
+    pipeline_fn: Callable[..., jax.Array],
+    rho: jax.Array,
+    directions: list[jax.Array] | None = None,
+    n_directions: int = 3,
+    output_dir: str | Path | None = None,
+) -> Path:
+    """Gradient validation: relative error vs FD step size.
+
+    Args:
+        pipeline_fn: Callable ``(rho) -> scalar`` differentiable by JAX.
+        rho: Reference design vector.
+        directions: Random unit perturbation directions. Generated if
+            ``None``.
+        n_directions: Number of random directions (ignored if
+            ``directions`` given).
+        output_dir: Directory to write ``gradient_validation.pdf``.
+
+    Returns:
+        Path to the saved figure.
+    """
+    out = _ensure_output_dir(output_dir)
+    rho = jnp.asarray(rho)
+    grad_exact = jax.grad(pipeline_fn)(rho)
+
+    if directions is None:
+        rng = np.random.default_rng(0)
+        directions = []
+        for _ in range(n_directions):
+            d = jnp.asarray(rng.standard_normal(rho.shape), dtype=rho.dtype)
+            d = d / jnp.linalg.norm(d)
+            directions.append(d)
+        n_directions = len(directions)
+
+    step_sizes = np.logspace(-6, -1, 20)
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+
+    for i, direction in enumerate(directions):
+        errors = []
+        for h in step_sizes:
+            f_plus = pipeline_fn(rho + h * direction)
+            f_minus = pipeline_fn(rho - h * direction)
+            fd_val = (f_plus - f_minus) / (2.0 * h)
+            exact_val = jnp.dot(grad_exact, direction)
+            denom = max(float(abs(exact_val)), 1e-30)
+            errors.append(float(abs(fd_val - exact_val)) / denom)
+        label = f"direction {i+1}" if n_directions > 1 else "FD"
+        ax.loglog(step_sizes, errors, "o-", markersize=3, label=label)
+
+    ax.plot(step_sizes, step_sizes, "k--", alpha=0.4, label=r"$O(h)$")
+    ax.set_xlabel("Step size h")
+    ax.set_ylabel("Relative error")
+    ax.set_title("Gradient Validation (central FD)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    path = out / "gradient_validation.pdf"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def generate_outputs(
+    rho_initial: np.ndarray,
+    rho_opt: np.ndarray,
+    history: list[dict],
+    mesh_coords: np.ndarray,
+    geometry: object | None = None,
+    pipeline_fn: Callable[..., jax.Array] | None = None,
+    ftol_rel: float | None = None,
+    output_dir: str | Path | None = None,
+) -> list[Path]:
+    """Generate all paper-ready output plots.
+
+    Args:
+        rho_initial: Initial design vector.
+        rho_opt: Optimized design vector.
+        history: Optimization history from ``optimize_doping``.
+        mesh_coords: Node coordinates ``(n_nodes, 2)``.
+        geometry: ``RibWaveguideGeometry`` instance.
+        pipeline_fn: Differentiable pipeline function for gradient
+            validation. Skipped if ``None``.
+        ftol_rel: MMA relative tolerance for the convergence marker.
+        output_dir: Output directory (default: ``outputs/``).
+
+    Returns:
+        List of paths to the generated plot files.
+    """
+    out = _ensure_output_dir(output_dir)
+    paths: list[Path] = []
+
+    conv = plot_convergence(history, output_dir=out, ftol_rel=ftol_rel)
+    paths.append(conv)
+
+    doping = plot_doping_field(
+        rho_initial, rho_opt, mesh_coords, geometry, output_dir=out,
+    )
+    paths.append(doping)
+
+    if pipeline_fn is not None:
+        import jax.numpy as jnp
+
+        rho_jax = jnp.asarray(rho_opt)
+        gv = plot_gradient_validation(
+            pipeline_fn, rho_jax, n_directions=3, output_dir=out,
+        )
+        paths.append(gv)
+
+    return paths

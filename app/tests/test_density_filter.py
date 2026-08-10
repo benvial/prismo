@@ -5,12 +5,12 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from scipy.sparse import issparse
 from prismo.density_filter import (
     apply_filter,
     assemble_filter_matrix,
     vjp_filter,
 )
+from scipy.sparse import issparse
 
 N = 32
 RNG = np.random.default_rng(0)
