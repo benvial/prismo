@@ -138,13 +138,6 @@ def test_apply_deterministic() -> None:
     np.testing.assert_allclose(out1.holes, out2.holes)
 
 
-def test_apply_stub_passes_doping_through() -> None:
-    doping = np.array([1e22, -5e21, 0.0, 5e21, -1e22], dtype=float)
-    outputs = apply(make_inputs(doping))
-    np.testing.assert_allclose(outputs.electrons, doping)
-    np.testing.assert_allclose(outputs.holes, doping)
-
-
 def test_apply_output_ordering_matches_input() -> None:
     doping = np.arange(N_NODES, dtype=float) * 1e21
     outputs = apply(make_inputs(doping))
@@ -272,14 +265,13 @@ def _force_julia_path_with_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_api.subprocess, "run", _hang)
 
 
-def test_apply_returns_identity_when_julia_times_out(
+def test_apply_propagates_julia_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     doping = np.array([1e22, -5e21, 0.0, 5e21, -1e22], dtype=float)
     _force_julia_path_with_timeout(monkeypatch)
-    outputs = apply(InputSchema(doping=doping, bias_voltage=-5.0))
-    np.testing.assert_allclose(outputs.electrons, doping)
-    np.testing.assert_allclose(outputs.holes, doping)
+    with pytest.raises(RuntimeError, match="Julia forward solve failed"):
+        apply(InputSchema(doping=doping, bias_voltage=-5.0))
 
 
 def test_vjp_returns_zeros_when_julia_times_out(
@@ -307,6 +299,22 @@ def test_apply_with_julia_subprocess() -> None:
     assert isinstance(outputs, OutputSchema)
     assert np.all(np.isfinite(outputs.electrons))
     assert np.all(np.isfinite(outputs.holes))
+
+
+@pytest.mark.parametrize("bias_voltage", [0.0, -5.0])
+@pytest.mark.skipif(not _julia_available(), reason="Julia not installed")
+def test_apply_solves_smooth_mixed_sign_pn_profile(bias_voltage: float) -> None:
+    """Public apply returns physical fields for smooth PN profiles."""
+    magnitude = np.geomspace(1e14, 1e20, 62)
+    doping = np.where(np.arange(62) < 31, -magnitude[::-1], magnitude)
+    outputs = apply(InputSchema(doping=doping, bias_voltage=bias_voltage))
+
+    electrons = np.asarray(outputs.electrons)
+    holes = np.asarray(outputs.holes)
+    assert np.all(np.isfinite(electrons))
+    assert np.all(np.isfinite(holes))
+    assert not np.allclose(electrons, doping)
+    assert not np.allclose(holes, doping)
 
 
 def _make_minimal_triangle_msh(path: str) -> None:

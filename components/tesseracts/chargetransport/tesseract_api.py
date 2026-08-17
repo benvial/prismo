@@ -145,8 +145,8 @@ def _run_julia_forward(
 
     Writes doping and bias to temp NPY/JSON files, invokes the Julia
     subprocess, and reads back carrier densities from NPZ output.
-    Falls back to identity pass-through when the subprocess fails
-    (e.g. mesh too coarse for solver convergence).
+    A failed or malformed solve raises so callers cannot mistake an identity
+    carrier field for a physical result.
 
     Returns:
         (electrons, holes) arrays per mesh node.
@@ -172,19 +172,25 @@ def _run_julia_forward(
                 cmd, check=True, capture_output=True, text=True,
                 timeout=_JULIA_TIMEOUT_S,
             )
-            data = np.load(output_path)
-            return data["electrons"], data["holes"]
+            with np.load(output_path) as data:
+                electrons = np.asarray(data["electrons"], dtype=float)
+                holes = np.asarray(data["holes"], dtype=float)
+            if electrons.shape != doping.shape or holes.shape != doping.shape:
+                raise RuntimeError(
+                    "Julia forward solve returned carrier fields with shapes "
+                    f"{electrons.shape} and {holes.shape}; expected {doping.shape}."
+                )
+            if not np.all(np.isfinite(electrons)) or not np.all(np.isfinite(holes)):
+                raise RuntimeError("Julia forward solve returned non-finite carrier fields.")
+            return electrons, holes
         except (
             subprocess.CalledProcessError,
             subprocess.TimeoutExpired,
             FileNotFoundError,
+            KeyError,
+            ValueError,
         ) as exc:
-            print(
-                f"WARNING: julia forward solve failed ({exc}); "
-                "falling back to identity pass-through",
-                file=sys.stderr,
-            )
-            return doping.copy(), doping.copy()
+            raise RuntimeError(f"Julia forward solve failed: {exc}") from exc
 
 
 def _run_julia_adjoint(
@@ -254,7 +260,8 @@ def apply(inputs: InputSchema) -> OutputSchema:
 
     When Julia is available, invokes ``julia forward.jl`` with the doping
     array, mesh reference, and bias voltage written to temp NPY/JSON files.
-    Falls back to identity pass-through when Julia is not present.
+    Local development without Julia retains a deterministic identity stub;
+    failures from an available Julia solver propagate to the caller.
 
     Args:
         inputs: Net doping [cm⁻³], optional mesh reference, bias voltage.
