@@ -106,6 +106,24 @@ class TestOptimizeDopingAnalytical:
 
         np.testing.assert_allclose(rho_opt, np.asarray(target), rtol=0.05)
 
+    def test_evaluates_pipeline_once_per_optimizer_callback(self, rho_initial):
+        """One NLopt callback obtains value and gradient from one pipeline run."""
+        target = jnp.full(self.N_NODES, 0.8, dtype=jnp.float64)
+
+        def mock_pipeline(rho, **kwargs):
+            return -jnp.sum((rho - target) ** 2)
+
+        with mock.patch(
+            "prismo.optimizer.pipeline", side_effect=mock_pipeline,
+        ) as mock_pipe:
+            _, history = optimize_doping(
+                initial_rho=rho_initial,
+                max_iter=3,
+                use_jit=False,
+            )
+
+        assert mock_pipe.call_count == len(history)
+
 
 class TestOptimizeDopingWithFilter:
     """Optimizer integrated with the density filter."""

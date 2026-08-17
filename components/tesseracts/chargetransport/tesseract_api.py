@@ -16,13 +16,12 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+from prismo_shared.schemas import MeshRef
 from pydantic import BaseModel, Field
 from tesseract_core.runtime import Array, Differentiable, Float64
-from prismo_shared.schemas import MeshRef
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
 
@@ -75,7 +74,8 @@ class OutputSchema(BaseModel):
 # Module-level state
 #
 
-_solve_state: dict[str, Any] | None = None
+_solve_states: set[tuple[tuple[object, ...], float]] = set()
+_active_profile: tuple[object, ...] | None = None
 
 
 #
@@ -107,6 +107,17 @@ def _write_bias_json(tmpdir: Path, bias_voltage: float) -> Path:
     bias_path = tmpdir / "bias.json"
     bias_path.write_text(json.dumps(bias_config))
     return bias_path
+
+
+def _forward_state_key(
+    doping: np.ndarray,
+    mesh_ref: MeshRef | None,
+    bias_voltage: float,
+) -> tuple[tuple[object, ...], float]:
+    """Return an exact identity for a forward solve available to its VJP."""
+    mesh_identity = None if mesh_ref is None else mesh_ref.model_dump_json()
+    profile = (doping.shape, doping.dtype.str, doping.tobytes(), mesh_identity)
+    return profile, float(bias_voltage)
 
 
 def _build_julia_cmd(
@@ -273,7 +284,6 @@ def apply(inputs: InputSchema) -> OutputSchema:
         Electron and hole concentrations per mesh node [cm⁻³].
     """
     doping = np.asarray(inputs.doping, dtype=float)
-    n_nodes = len(doping)
 
     if _julia_available() and (_SCRIPTS_DIR / "forward.jl").exists():
         electrons, holes = _run_julia_forward(
@@ -283,12 +293,13 @@ def apply(inputs: InputSchema) -> OutputSchema:
         electrons = doping.copy()
         holes = doping.copy()
 
-    global _solve_state
-    _solve_state = {
-        "n_nodes": n_nodes,
-        "mesh_ref": inputs.mesh_ref,
-        "bias_voltage": inputs.bias_voltage,
-    }
+    global _active_profile
+    state_key = _forward_state_key(doping, inputs.mesh_ref, inputs.bias_voltage)
+    profile, _ = state_key
+    if _active_profile != profile:
+        _solve_states.clear()
+        _active_profile = profile
+    _solve_states.add(state_key)
 
     return OutputSchema(electrons=electrons, holes=holes)
 
@@ -341,15 +352,15 @@ def vector_jacobian_product(
     if holes_cot.ndim == 0:
         holes_cot = np.full(n, float(holes_cot))
 
-    global _solve_state
-    if _solve_state is not None and _solve_state["n_nodes"] != n:
+    doping = np.asarray(inputs.doping, dtype=float)
+    state_key = _forward_state_key(doping, inputs.mesh_ref, inputs.bias_voltage)
+    if state_key not in _solve_states:
         raise RuntimeError(
-            f"Input dimension mismatch: VJP expects n_nodes={_solve_state['n_nodes']}, "
-            f"got {n}. Re-run apply() with matching doping array."
+            "ChargeTransport VJP requires a preceding apply() with identical "
+            "doping, mesh reference, and bias voltage."
         )
 
     if _julia_available() and (_SCRIPTS_DIR / "adjoint.jl").exists():
-        doping = np.asarray(inputs.doping, dtype=float)
         result = _run_julia_adjoint(
             doping,
             inputs.mesh_ref,

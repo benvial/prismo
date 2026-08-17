@@ -65,7 +65,7 @@ def optimize_doping(
         ftol_rel: Relative tolerance on the objective for early stopping.
         min_mma_evaluations: Minimum objective evaluations completed by MMA
             before falling back to CCSAQ after a roundoff-limited solve.
-        use_jit: JIT-compile the gradient computation.
+        use_jit: JIT-compile combined objective and gradient computation.
 
     Returns:
         ``(rho_opt, history)`` where ``rho_opt`` is the optimized design
@@ -98,10 +98,9 @@ def optimize_doping(
     def _pipe(rho: jax.Array) -> jax.Array:
         return pipeline(rho, H=H, H_sum=H_sum, polarity=polarity)
 
-    _pipe_jit = jax.jit(_pipe) if use_jit else _pipe
-    grad_fn = jax.grad(_pipe_jit)
+    value_and_grad_fn = jax.value_and_grad(_pipe)
     if use_jit:
-        grad_fn = jax.jit(grad_fn)
+        value_and_grad_fn = jax.jit(value_and_grad_fn)
 
     history: list[_HistoryEntry] = []
     prev_rho: np.ndarray | None = None
@@ -124,8 +123,7 @@ def optimize_doping(
                 return 0.0
 
             rho = jnp.asarray(rho_np)
-            value = _pipe_jit(rho)
-            grad = grad_fn(rho)
+            value, grad = value_and_grad_fn(rho)
 
             f_val = float(value)
             grad_out[:] = np.asarray(grad)

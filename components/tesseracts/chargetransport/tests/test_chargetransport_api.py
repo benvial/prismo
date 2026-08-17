@@ -157,6 +157,7 @@ def test_apply_output_ordering_matches_input() -> None:
 
 def test_vjp_returns_cotangent_for_requested_input() -> None:
     inputs = make_inputs()
+    apply(inputs)
     cotangent = {"electrons": np.ones(N_NODES), "holes": np.ones(N_NODES)}
     result = vector_jacobian_product(
         inputs, {"doping"}, {"electrons", "holes"}, cotangent
@@ -167,6 +168,7 @@ def test_vjp_returns_cotangent_for_requested_input() -> None:
 
 def test_vjp_returns_finite_values() -> None:
     inputs = make_inputs()
+    apply(inputs)
     cotangent = {"electrons": np.ones(N_NODES), "holes": np.ones(N_NODES)}
     result = vector_jacobian_product(
         inputs, {"doping"}, {"electrons", "holes"}, cotangent
@@ -184,6 +186,7 @@ def test_vjp_empty_when_input_not_requested() -> None:
 
 def test_vjp_linear_in_cotangent() -> None:
     inputs = make_inputs()
+    apply(inputs)
     cot1 = {"electrons": np.ones(N_NODES), "holes": np.ones(N_NODES)}
     cot2 = {"electrons": np.full(N_NODES, 3.0), "holes": np.full(N_NODES, 3.0)}
 
@@ -196,6 +199,7 @@ def test_vjp_linear_in_cotangent() -> None:
 
 def test_vjp_stub_sums_cotangents() -> None:
     inputs = make_inputs()
+    apply(inputs)
     cot_e = np.full(N_NODES, 2.0)
     cot_h = np.full(N_NODES, 3.0)
     result = vector_jacobian_product(
@@ -209,6 +213,7 @@ def test_vjp_stub_sums_cotangents() -> None:
 
 def test_vjp_handles_scalar_cotangents() -> None:
     inputs = make_inputs()
+    apply(inputs)
     result = vector_jacobian_product(
         inputs,
         {"doping"},
@@ -253,6 +258,54 @@ def test_vjp_matches_finite_difference() -> None:
     np.testing.assert_allclose(vjp_dir, fd_grad_dir, rtol=1e-5)
 
 
+def test_vjp_rejects_inputs_without_matching_forward() -> None:
+    _api._solve_states.clear()
+    _api._active_profile = None
+
+    with pytest.raises(RuntimeError, match="preceding apply"):
+        vector_jacobian_product(
+            make_inputs(),
+            {"doping"},
+            {"electrons"},
+            {"electrons": np.ones(N_NODES)},
+        )
+
+
+@pytest.mark.parametrize(
+    "forward_inputs,vjp_inputs",
+    [
+        (make_inputs(), make_inputs(np.full(N_NODES, 2e15))),
+        (
+            InputSchema(doping=np.full(N_NODES, 1e15), bias_voltage=0.0),
+            InputSchema(doping=np.full(N_NODES, 1e15), bias_voltage=-5.0),
+        ),
+        (
+            InputSchema(
+                doping=np.full(N_NODES, 1e15),
+                mesh_ref=_make_mesh_ref("/tmp/shared.msh", n_nodes=N_NODES),
+            ),
+            InputSchema(
+                doping=np.full(N_NODES, 1e15),
+                mesh_ref=_make_mesh_ref("/tmp/shared.msh", n_nodes=N_NODES + 1),
+            ),
+        ),
+    ],
+)
+def test_vjp_rejects_changed_forward_inputs(
+    forward_inputs: InputSchema,
+    vjp_inputs: InputSchema,
+) -> None:
+    apply(forward_inputs)
+
+    with pytest.raises(RuntimeError, match="identical doping, mesh reference, and bias"):
+        vector_jacobian_product(
+            vjp_inputs,
+            {"doping"},
+            {"electrons"},
+            {"electrons": np.ones(N_NODES)},
+        )
+
+
 # ---------------------------------------------------------------------------
 # Subprocess timeout behavior (mocked Julia path)
 # ---------------------------------------------------------------------------
@@ -283,6 +336,7 @@ def test_vjp_propagates_julia_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     inputs = make_inputs()
+    apply(inputs)
     _force_julia_path_with_timeout(monkeypatch)
     with pytest.raises(RuntimeError, match="Julia adjoint solve failed"):
         vector_jacobian_product(
@@ -327,6 +381,7 @@ def test_vjp_is_finite_for_smooth_mixed_sign_pn_profile(bias_voltage: float) -> 
     """Public VJP returns responsive per-node gradients for supported PN profiles."""
     doping = _smooth_mixed_sign_pn_profile()
     inputs = InputSchema(doping=doping, bias_voltage=bias_voltage)
+    apply(inputs)
     result = vector_jacobian_product(
         inputs,
         {"doping"},
@@ -347,6 +402,7 @@ def test_vjp_matches_pn_forward_directional_difference(bias_voltage: float) -> N
     doping = _smooth_mixed_sign_pn_profile()
     direction = np.sin(np.arange(len(doping)) * 0.37)
     inputs = InputSchema(doping=doping, bias_voltage=bias_voltage)
+    apply(inputs)
     cotangent = {"electrons": np.ones_like(doping), "holes": np.ones_like(doping)}
     vjp = np.asarray(
         vector_jacobian_product(
