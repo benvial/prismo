@@ -3,7 +3,7 @@
 
 .. container:: title-bar
 
-   .. image:: _assets/prismo-name.svg
+   .. image:: _static/prismo-name.svg
       :alt: prismo
       :width: 400px
 

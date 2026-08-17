@@ -34,6 +34,7 @@ def optimize_doping(
     n_nodes: int | None = None,
     H: jax.Array | None = None,
     H_sum: jax.Array | None = None,
+    polarity: jax.Array | None = None,
     mesh_coords: np.ndarray | None = None,
     mesh_path: str | Path | None = None,
     r_min: float = 50e-9,
@@ -54,6 +55,7 @@ def optimize_doping(
         H: Dense filter matrix ``(n_nodes, n_nodes)``. Built from
             ``mesh_coords`` or ``mesh_path`` if omitted.
         H_sum: Pre-computed row sums of ``H``.
+        polarity: Fixed per-node P/N polarity applied to doping magnitudes.
         mesh_coords: ``(n_nodes, 2)`` node coordinates for building the
             filter matrix.
         mesh_path: Path to a ``.msh`` file for building the filter matrix
@@ -94,7 +96,7 @@ def optimize_doping(
         H_sum = jnp.sum(H, axis=1)
 
     def _pipe(rho: jax.Array) -> jax.Array:
-        return pipeline(rho, H=H, H_sum=H_sum)
+        return pipeline(rho, H=H, H_sum=H_sum, polarity=polarity)
 
     _pipe_jit = jax.jit(_pipe) if use_jit else _pipe
     grad_fn = jax.grad(_pipe_jit)

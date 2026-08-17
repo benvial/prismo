@@ -7,6 +7,7 @@ paper-ready plots.
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -121,6 +122,11 @@ def _run_pipeline(
     H_sparse = assemble_filter_matrix(coords, r_min=r_min)
     H_dense = jnp.asarray(H_sparse.toarray())
     H_sum = jnp.sum(H_dense, axis=1)
+    polarity = None
+    if use_containers:
+        # Preserve a P/N junction while MMA optimizes only the dopant magnitude.
+        midpoint = np.median(coords[:, 0])
+        polarity = jnp.where(coords[:, 0] <= midpoint, -1.0, 1.0)
     typer.echo(f"      Filter radius: {r_min * 1e9:.0f} nm")
 
     typer.echo("[3/4] Running NLopt MMA optimization...")
@@ -131,6 +137,7 @@ def _run_pipeline(
             n_nodes=n_nodes,
             H=H_dense,
             H_sum=H_sum,
+            polarity=polarity,
             max_iter=optimization_max_iter,
             ftol_rel=optimization_ftol_rel,
             min_mma_evaluations=5 if use_containers else 0,
@@ -168,7 +175,7 @@ def _run_pipeline(
         history=history,
         mesh_coords=coords,
         geometry=geometry,
-        pipeline_fn=pipeline_fn,
+        pipeline_fn=partial(pipeline_fn, polarity=polarity),
         ftol_rel=optimization_ftol_rel,
         output_dir=output_dir,
     )

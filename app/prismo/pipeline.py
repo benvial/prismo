@@ -461,6 +461,7 @@ def pipeline(
     rho: jax.Array,
     H: jax.Array | None = None,
     H_sum: jax.Array | None = None,
+    polarity: jax.Array | None = None,
     mesh_ref: MeshRef | None = None,
     background_epsilon: float | None = None,
     domain_count: int = _DEFAULT_DOMAIN_COUNT,
@@ -473,6 +474,8 @@ def pipeline(
         H: Dense filter matrix, shape ``(n_nodes, n_nodes)``. Skip filter if
             ``None``.
         H_sum: Pre-computed row sums of ``H``.
+        polarity: Fixed per-node P/N polarity applied to the positive doping
+            magnitude. ``-1`` denotes p-type and ``1`` denotes n-type.
         mesh_ref: ``MeshRef`` forwarded to ChargeTransport calls.
         background_epsilon: Background Si relative permittivity
             (default: ``n_si^2 = 3.4757^2``).
@@ -501,6 +504,8 @@ def pipeline(
         jnp.asarray(10.0, dtype=dtype),
         jnp.asarray(14.0, dtype=dtype) + jnp.asarray(7.0, dtype=dtype) * rho_tilde,
     )
+    if polarity is not None:
+        doping = doping * jnp.asarray(polarity, dtype=dtype)
 
     # 3. ChargeTransport at equilibrium (0 V)
     n0, p0 = _ct_call_jax(doping, 0.0, mesh_ref)
@@ -534,4 +539,4 @@ def pipeline(
     neff_0 = jnp.sqrt(jnp.maximum(neff_sq_0, 0.0))
     neff_1 = jnp.sqrt(jnp.maximum(neff_sq_1, 0.0))
 
-    return neff_0 - neff_1
+    return neff_1 - neff_0

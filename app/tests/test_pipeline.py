@@ -178,9 +178,34 @@ class TestPipelineStub:
         exp_deps = 2.0 * coeffs.background_index * exp_dn
         bg = pl._DEFAULT_BACKGROUND_EPSILON
         # Default domain mapping perturbs one of three equal domains.
-        exp_result = float(np.sqrt(bg) - np.sqrt(bg + exp_deps / 3.0))
+        exp_result = float(np.sqrt(bg + exp_deps / 3.0) - np.sqrt(bg))
         np.testing.assert_allclose(float(result), exp_result, rtol=1e-6)
-        assert float(result) != 0.0
+        assert float(result) > 0.0
+
+    def test_polarity_forms_mixed_sign_pn_doping(self, monkeypatch):
+        """Container pipeline supplies a fixed P/N polarity per mesh node."""
+        import prismo.pipeline as pl
+
+        received: list[np.ndarray] = []
+
+        def fake_ct(doping, bias_voltage, mesh_ref=None):
+            received.append(np.asarray(doping))
+            carriers = jnp.where(
+                bias_voltage == 0.0,
+                jnp.full_like(doping, 1e24),
+                jnp.zeros_like(doping),
+            )
+            return carriers, carriers
+
+        monkeypatch.setattr(pl, "_ct_call_jax", fake_ct)
+
+        result = pl.pipeline(
+            jnp.asarray([0.0, 1.0]), polarity=jnp.asarray([-1.0, 1.0]),
+        )
+
+        np.testing.assert_allclose(received[0], [-1e14, 1e21])
+        np.testing.assert_allclose(received[1], [-1e14, 1e21])
+        assert float(result) > 0.0
 
     def test_domain_epsilon_keeps_inactive_domains_at_background(self):
         delta = jnp.asarray([1.0, 3.0, 5.0])
