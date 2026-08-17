@@ -125,12 +125,14 @@ def _run_pipeline(
 
     typer.echo("[3/4] Running NLopt MMA optimization...")
     try:
+        optimization_max_iter = max(max_iter, 5) if use_containers else max_iter
+        optimization_ftol_rel = 0.0 if use_containers else ftol_rel
         rho_opt, history = optimize_doping(
             n_nodes=n_nodes,
             H=H_dense,
             H_sum=H_sum,
-            max_iter=max_iter,
-            ftol_rel=ftol_rel,
+            max_iter=optimization_max_iter,
+            ftol_rel=optimization_ftol_rel,
             use_jit=not no_jit,
         )
         typer.echo(f"      Optimization complete: {len(history)} iterations")
