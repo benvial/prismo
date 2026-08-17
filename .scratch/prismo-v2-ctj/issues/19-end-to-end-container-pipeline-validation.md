@@ -4,7 +4,7 @@
 
 **Blocked by:** 17, 18
 
-**Status:** needs-triage
+**Status:** needs-info
 
 - [ ] `make run-containers` starts both containers, runs at least 5 MMA iterations, and tears down containers
 - [ ] Per-iteration log shows `Δneff > 0` (optimizer maximizes Δneff, starts from zero at uniform ρ=0.25, improves over iterations)
@@ -38,3 +38,14 @@ Although ticket 18 remains claimed, gyptis responds to its multi-domain input.
 The immediate blocker is the pipeline's positive-only uniform-doping mapping:
 it cannot form the PN-junction baseline required for ticket 19 while retaining
 the ticket 15 uniform-`ρ` initial condition.
+
+2026-08-17 follow-up: a fixed p/n polarity split from the mesh x-midline was
+tested while preserving uniform `ρ=0.25` as the magnitude field, then reverted.
+`make run-containers RUN_ARGS='--no-jit --max-iter 5 --output-dir
+/tmp/prismo-ticket-19-outputs'` completed five evaluations and stopped both
+containers, but did not meet the signal criterion: iteration 1 returned
+`Δneff=-1.192093e-07`, `‖∇f‖=9.5679e+17`; iterations 2–5 returned zero for
+both values. This is consistent with ChargeTransport's documented mixed-sign
+PN solve fallback after MMA moves the initial profile. Ticket needs a solver
+that accepts evolved mixed-sign profiles without identity fallback before it
+can generate the required plots.
