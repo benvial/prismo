@@ -49,7 +49,7 @@
 
       Run the full pipeline from the command line with ``prismo``.
 
-   .. grid-item-card:: :iconify:`mdi:semiconductor-diode` Soref–Bennett model
+   .. grid-item-card:: :iconify:`tabler:circuit-diode` Soref–Bennett model
 
       Carrier-induced index change through the Soref–Bennett equations.
 
