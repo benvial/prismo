@@ -4,8 +4,9 @@
 # Tesseract API module for prismo_gyptis
 # Electromagnetic eigenmode component (gyptis / FEniCS).
 #
-# Real implementation: 2D waveguide eigenmode solve with a finite-difference
-# VJP. Falls back to an effective-medium stub when gyptis/FEniCS is absent.
+# Real implementation: 2D waveguide eigenmode solve + Hellmann-Feynman
+# eigen-adjoint VJP, per tickets 03 and 10. Falls back to effective-medium
+# stub when gyptis/FEniCS is not installed.
 
 from typing import Any
 
@@ -150,6 +151,7 @@ def apply(inputs: InputSchema) -> OutputSchema:
     global _solve_state
     _solve_state = {
         "simu": simu,
+        "epsilon": epsilon.copy(),
         "n_domains": n_domains,
         "k0": k0,
         "eigen_index": j_fundamental,
@@ -169,12 +171,18 @@ def vector_jacobian_product(
     vjp_outputs: set[str],
     cotangent_vector: dict[str, npt.ArrayLike],
 ) -> dict[str, npt.ArrayLike]:
-    """Compute a VJP with centered differences of the public forward map.
+    """Adjoint gradient pass via Hellmann-Feynman eigen-adjoint.
 
-    gyptis's PML formulation produces a non-Hermitian generalized eigenproblem.
-    A right-eigenvector-only Hellmann-Feynman quotient is invalid there; centered
-    differences provide a reliable derivative until a left-eigenvector adjoint is
-    available.
+    For the non-Hermitian generalized eigenproblem A x = lambda B x where
+    lambda = kz^2, the eigenvalue sensitivity to subdomain permittivity
+    epsilon_d is:
+
+        d(lambda)/d(epsilon_d) = ( y^H (dA/d(eps_d) - lambda dB/d(eps_d)) x )
+                               / ( y^H B x )
+
+    where x and y are the right and left eigenvectors, respectively.
+
+    The result is chained through neff = sqrt(lambda)/k0.
 
     Args:
         inputs: Same InputSchema as the preceding apply() call.
@@ -200,20 +208,156 @@ def vector_jacobian_product(
     n = len(epsilon)
 
     try:
-        _ensure_dolfin()
+        dolfin = _ensure_dolfin()
         _ensure_gyptis()
     except ImportError:
         vjp["epsilon"] = np.full(n, cotangent / n)
         return vjp
 
-    step = 1e-4
-    gradient = np.empty(n)
-    for index in range(n):
-        perturbation = np.zeros(n)
-        perturbation[index] = step
-        upper = apply(InputSchema(epsilon=epsilon + perturbation))
-        lower = apply(InputSchema(epsilon=epsilon - perturbation))
-        gradient[index] = (float(upper.neff_sq) - float(lower.neff_sq)) / (2 * step)
+    global _solve_state
+    if _solve_state is None:
+        raise RuntimeError(
+            "vector_jacobian_product called before apply(). "
+            "Run apply() first to populate the solve state."
+        )
 
-    vjp["epsilon"] = cotangent * gradient
+    simu = _solve_state["simu"]
+    if not np.array_equal(epsilon, _solve_state["epsilon"]):
+        raise RuntimeError(
+            "vector_jacobian_product inputs differ from the preceding apply() call. "
+            "Run apply() with these inputs first."
+        )
+    k0 = _solve_state["k0"]
+
+    # Reassemble exactly as gyptis' eigensolve implementation does, then use
+    # slepc4py directly because DOLFIN does not expose left eigenvectors.
+    from gyptis.complex import Constant, dot, inner, vector
+    from gyptis.materials import Coefficient
+    from slepc4py import SLEPc
+
+    wf = simu.formulation.weak
+    zero = Constant((0.0, 0.0, 0.0))
+    dv = dot(zero, simu.formulation.test) * simu.formulation.dx
+    dv = dv.real + dv.imag
+
+    bcs = simu.formulation.build_boundary_conditions()
+
+    A_mat = dolfin.PETScMatrix()
+    B_mat = dolfin.PETScMatrix()
+    b = dolfin.PETScVector()
+    dolfin.assemble_system(wf[0], dv, bcs, A_tensor=A_mat, b_tensor=b)
+    dolfin.assemble_system(wf[1], dv, A_tensor=B_mat, b_tensor=b)
+    A = A_mat.mat()
+    B = B_mat.mat()
+
+    eigensolver = SLEPc.EPS().create(A.getComm())
+    eigensolver.setOperators(A, B)
+    eigensolver.setProblemType(SLEPc.EPS.ProblemType.GNHEP)
+    eigensolver.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
+    eigensolver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_MAGNITUDE)
+    eigensolver.setTarget(k0 * k0)
+    spectral_transform = eigensolver.getST()
+    spectral_transform.setType(SLEPc.ST.Type.SINVERT)
+    spectral_transform.setShift(k0 * k0)
+    eigensolver.setDimensions(8)
+    eigensolver.setTolerances(1e-6)
+    eigensolver.setTwoSided(True)
+    eigensolver.solve()
+    if eigensolver.getConverged() == 0:
+        raise RuntimeError("two-sided SLEPc eigensolve did not converge")
+
+    rx = A.createVecRight()
+    cx = A.createVecRight()
+    ry = A.createVecRight()
+    cy = A.createVecRight()
+    lam = eigensolver.getEigenpair(0, rx, cx)
+    eigensolver.getLeftEigenvector(0, ry, cy)
+    kz = np.sqrt(lam)
+    neff = float(np.real(kz / k0))
+
+    def left_right_product(matrix: Any) -> complex:
+        matrix_rx = matrix.createVecRight()
+        matrix_cx = matrix.createVecRight()
+        matrix.mult(rx, matrix_rx)
+        matrix.mult(cx, matrix_cx)
+        return (
+            ry.dot(matrix_rx)
+            + cy.dot(matrix_cx)
+            + 1j * (ry.dot(matrix_cx) - cy.dot(matrix_rx))
+        )
+
+    denominator = left_right_product(B)
+    if abs(denominator) == 0.0:
+        raise RuntimeError("left/right eigenvectors have zero B-inner product")
+
+    u = simu.formulation.trial
+    v = simu.formulation.test
+
+    et = vector([u[0], u[1], 0.0])
+    ez = u[2]
+    vt = vector([v[0], v[1], 0.0])
+    vz = v[2]
+    zhat = vector([0.0, 0.0, 1.0])
+    epsilon_coefficient = simu.formulation.epsilon
+    pml_domains = {pml.applied_domain for pml in epsilon_coefficient.pmls}
+    physical_domains = [
+        name for name in epsilon_coefficient.dict if name not in pml_domains
+    ]
+
+    dneff_sq_deps = np.zeros(len(np.asarray(inputs.epsilon)))
+
+    for d_idx in range(len(np.asarray(inputs.epsilon))):
+        domain_name = f"domain_{d_idx + 1}"
+        unit_materials = {
+            name: float(name == domain_name) for name in physical_domains
+        }
+        epsilon_derivative = Coefficient(
+            unit_materials,
+            geometry=epsilon_coefficient.geometry,
+            pmls=epsilon_coefficient.pmls,
+            dim=epsilon_coefficient.dim,
+            degree=epsilon_coefficient.degree,
+            element=epsilon_coefficient.element,
+        ).as_property(dim=3)
+        affected_domains = [
+            domain_name,
+            *[
+                pml.applied_domain
+                for pml in epsilon_coefficient.pmls
+                if pml.matched_domain == domain_name
+            ],
+        ]
+
+        # Each physical epsilon also controls its matched PML tensors.
+        # Boundary-condition contributions are parameter-independent.
+        dA_form = 0
+        dB_form = 0
+        for region in affected_domains:
+            dA_form += (
+                -Constant(k0 * k0)
+                * inner(epsilon_derivative[region] * et, vt)
+                * simu.dx(region)
+            )
+            dB_form += (
+                Constant(k0 * k0)
+                * inner(
+                    epsilon_derivative[region] * (ez * zhat),
+                    vz * zhat,
+                )
+                * simu.dx(region)
+            )
+
+        dA = dolfin.PETScMatrix()
+        dB = dolfin.PETScMatrix()
+        dolfin.assemble(dA_form.real + dA_form.imag, tensor=dA)
+        dolfin.assemble(dB_form.real + dB_form.imag, tensor=dB)
+
+        dlam_deps = (
+            left_right_product(dA.mat())
+            - lam * left_right_product(dB.mat())
+        ) / denominator
+        dneff_deps = np.real(dlam_deps / (2.0 * k0 * kz))
+        dneff_sq_deps[d_idx] = 2.0 * neff * dneff_deps
+
+    vjp["epsilon"] = cotangent * dneff_sq_deps
     return vjp
