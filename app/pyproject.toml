@@ -26,6 +26,16 @@ dev = [
     "matplotlib",
     "numpy",
 ]
+docs = [
+    "sphinx",
+    "shibuya",
+    "sphinx-copybutton",
+    "sphinx-design",
+    "myst-parser",
+    "sphinx-iconify",
+    "sphinx-autodoc-typehints",
+    "sphinx-sitemap",
+]
 
 [project.scripts]
 "prismo" = "prismo.main:entrypoint"
