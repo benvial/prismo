@@ -13,8 +13,8 @@ try:
     release = get_version("prismo")
 except PackageNotFoundError:
     release = "0.0.0"
-copyright = "Copyright &copy; 2026, The Prismo Community"
-author = "The Prismo Community"
+copyright = "Copyright &copy; 2026, Benjamin Vial"
+author = "Benjamin Vial"
 
 extensions = [
     "sphinx.ext.autodoc",
