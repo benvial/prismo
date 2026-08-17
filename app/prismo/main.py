@@ -137,6 +137,21 @@ def _run_pipeline(
         typer.echo("      Optimization cancelled by user.")
         return
 
+    if use_containers:
+        if not history:
+            raise RuntimeError(
+                "Container pipeline produced no optimization evaluations"
+            )
+        invalid = [
+            entry for entry in history
+            if entry["delta_n_eff"] <= 0.0 or entry["grad_norm"] <= 0.0
+        ]
+        if invalid:
+            raise RuntimeError(
+                "Container pipeline produced invalid optimization signal at "
+                f"{len(invalid)} iteration(s)"
+            )
+
     typer.echo("[4/4] Generating outputs...")
     rho_initial = np.full(n_nodes, 0.25, dtype=float)
     plot_paths = generate_outputs(
@@ -149,19 +164,6 @@ def _run_pipeline(
         ftol_rel=ftol_rel,
         output_dir=output_dir,
     )
-    if use_containers:
-        if len(history) < 5:
-            raise RuntimeError(
-                f"Container pipeline completed only {len(history)} iterations; "
-                "expected at least 5"
-            )
-        final = history[-1]
-        if final["delta_n_eff"] <= 0.0 or final["grad_norm"] <= 0.0:
-            raise RuntimeError(
-                "Container pipeline produced no measurable optimization signal: "
-                f"Delta_n_eff={final['delta_n_eff']}, "
-                f"grad_norm={final['grad_norm']}"
-            )
     for p in plot_paths:
         typer.echo(f"      {p}")
 

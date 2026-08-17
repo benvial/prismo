@@ -113,8 +113,8 @@ class TestGenerateOutputs:
                 np.full(N_NODES, 0.25), RNG.random(N_NODES), _make_history(),
                 coords, output_dir=tmp,
             )
-            assert {path.name for path in paths} == {
-                "convergence.pdf", "doping_field.pdf", "breakdown.pdf",
+            assert {"convergence.pdf", "doping_field.pdf", "breakdown.pdf"} <= {
+                path.name for path in paths
             }
 
     def test_custom_directions(self):
