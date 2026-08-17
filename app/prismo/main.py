@@ -133,6 +133,7 @@ def _run_pipeline(
             H_sum=H_sum,
             max_iter=optimization_max_iter,
             ftol_rel=optimization_ftol_rel,
+            min_mma_evaluations=5 if use_containers else 0,
             use_jit=not no_jit,
         )
         typer.echo(f"      Optimization complete: {len(history)} iterations")
@@ -168,7 +169,7 @@ def _run_pipeline(
         mesh_coords=coords,
         geometry=geometry,
         pipeline_fn=pipeline_fn,
-        ftol_rel=ftol_rel,
+        ftol_rel=optimization_ftol_rel,
         output_dir=output_dir,
     )
     for p in plot_paths:

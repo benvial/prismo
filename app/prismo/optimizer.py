@@ -40,6 +40,7 @@ def optimize_doping(
     *,
     max_iter: int = 200,
     ftol_rel: float = 1e-5,
+    min_mma_evaluations: int = 0,
     use_jit: bool = True,
 ) -> tuple[np.ndarray, list[_HistoryEntry]]:
     """Run the NLopt MMA optimization loop.
@@ -60,6 +61,8 @@ def optimize_doping(
         r_min: Filter radius in meters (default 50 nm).
         max_iter: Maximum MMA iterations.
         ftol_rel: Relative tolerance on the objective for early stopping.
+        min_mma_evaluations: Minimum objective evaluations completed by MMA
+            before falling back to CCSAQ after a roundoff-limited solve.
         use_jit: JIT-compile the gradient computation.
 
     Returns:
@@ -83,13 +86,9 @@ def optimize_doping(
 
             mesh_coords = read_mesh_node_coordinates(mesh_path)
             if mesh_coords.shape[0] == 0:
-                raise ValueError(
-                    f"Could not read node coordinates from {mesh_path}"
-                )
+                raise ValueError(f"Could not read node coordinates from {mesh_path}")
         if mesh_coords is None:
-            raise ValueError(
-                "mesh_coords or mesh_path required to build filter matrix"
-            )
+            raise ValueError("mesh_coords or mesh_path required to build filter matrix")
         H_sparse = assemble_filter_matrix(mesh_coords, r_min=r_min)
         H = jnp.asarray(H_sparse.toarray())
         H_sum = jnp.sum(H, axis=1)
@@ -114,6 +113,7 @@ def optimize_doping(
     prev_handler = signal.signal(signal.SIGINT, _sigint_handler)
 
     try:
+
         def _obj(rho_np: np.ndarray, grad_out: np.ndarray) -> float:
             nonlocal prev_rho
 
@@ -135,13 +135,15 @@ def optimize_doping(
             g_norm = float(np.linalg.norm(grad_out))
             wall = time.perf_counter() - t_start
 
-            history.append({
-                "iteration": iter_count,
-                "delta_n_eff": float(value),
-                "delta_rho": delta,
-                "grad_norm": g_norm,
-                "wall_time": wall,
-            })
+            history.append(
+                {
+                    "iteration": iter_count,
+                    "delta_n_eff": float(value),
+                    "delta_rho": delta,
+                    "grad_norm": g_norm,
+                    "wall_time": wall,
+                }
+            )
             print(
                 f"iter {iter_count:4d}  "
                 f"Δneff={value:+.6e}  "
@@ -163,7 +165,13 @@ def optimize_doping(
             try:
                 rho_opt = opt.optimize(initial_rho.copy())
                 break
-            except nlopt.RoundoffLimited:
+            except nlopt.RoundoffLimited as exc:
+                if algorithm == nlopt.LD_MMA and len(history) < min_mma_evaluations:
+                    raise RuntimeError(
+                        "MMA stopped after "
+                        f"{len(history)} evaluations; expected at least "
+                        f"{min_mma_evaluations}"
+                    ) from exc
                 if algorithm == nlopt.LD_CCSAQ:
                     rho_opt = initial_rho
                     break
@@ -182,16 +190,14 @@ def optimize_doping(
 
 
 def _save_checkpoint(
-    rho: np.ndarray, history: list[_HistoryEntry],
+    rho: np.ndarray,
+    history: list[_HistoryEntry],
 ) -> None:
     """Save optimization progress to ``outputs/checkpoint.json``."""
     out_dir = Path("outputs")
     out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         "rho_opt": rho.tolist(),
-        "history": [
-            {k: v for k, v in entry.items()}
-            for entry in history
-        ],
+        "history": [{k: v for k, v in entry.items()} for entry in history],
     }
     (out_dir / "checkpoint.json").write_text(json.dumps(checkpoint, indent=2))
