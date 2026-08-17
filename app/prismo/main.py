@@ -59,6 +59,7 @@ def run(
             mesh_path=mesh_path,
             output_dir=output_dir,
             no_jit=no_jit,
+            use_containers=use_containers,
         )
     finally:
         if use_containers:
@@ -73,6 +74,7 @@ def _run_pipeline(
     mesh_path: str,
     output_dir: str,
     no_jit: bool,
+    use_containers: bool,
 ) -> None:
     from prismo.density_filter import assemble_filter_matrix
     from prismo.optimizer import OptimizationCancelled, optimize_doping
@@ -147,6 +149,19 @@ def _run_pipeline(
         ftol_rel=ftol_rel,
         output_dir=output_dir,
     )
+    if use_containers:
+        if len(history) < 5:
+            raise RuntimeError(
+                f"Container pipeline completed only {len(history)} iterations; "
+                "expected at least 5"
+            )
+        final = history[-1]
+        if final["delta_n_eff"] <= 0.0 or final["grad_norm"] <= 0.0:
+            raise RuntimeError(
+                "Container pipeline produced no measurable optimization signal: "
+                f"Delta_n_eff={final['delta_n_eff']}, "
+                f"grad_norm={final['grad_norm']}"
+            )
     for p in plot_paths:
         typer.echo(f"      {p}")
 

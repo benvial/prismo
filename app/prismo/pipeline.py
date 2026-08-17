@@ -42,6 +42,7 @@ _ct_api: Any | None = _load_tesseract_api("chargetransport")
 _gyptis_api: Any | None = _load_tesseract_api("gyptis")
 
 _DEFAULT_BACKGROUND_EPSILON: float = 3.4757**2
+_DEFAULT_DOMAIN_COUNT: int = 3
 _M3_TO_CM3: float = 1e-6
 _DEFAULT_COEFFS: SorefBennettCoefficients = SorefBennettCoefficients()
 
@@ -311,6 +312,26 @@ def _gyptis_vjp_impl(
     return np.asarray(vjp_result["epsilon"], dtype=out_dtype)
 
 
+def _build_domain_epsilon(
+    delta_eps: jax.Array,
+    background_epsilon: jax.Array,
+    domain_count: int,
+    active_domains: tuple[int, ...] | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Map nodal silicon perturbation onto gyptis material domains."""
+    if domain_count < 1:
+        raise ValueError("domain_count must be positive")
+    if active_domains is None:
+        active_domains = (0,)
+    if any(index < 0 or index >= domain_count for index in active_domains):
+        raise ValueError("active_domains contains an invalid domain index")
+
+    delta_mean = jnp.mean(delta_eps)
+    epsilon_bg = jnp.full((domain_count,), background_epsilon, dtype=delta_eps.dtype)
+    epsilon_pert = epsilon_bg.at[jnp.asarray(active_domains)].add(delta_mean)
+    return epsilon_bg, epsilon_pert
+
+
 def _gyptis_call_impl(epsilon: jax.Array) -> jax.Array:
     if not _HAS_GYPTIS and not _HAS_GYPTIS_CONTAINER:
         return jnp.mean(epsilon)
@@ -426,6 +447,8 @@ def pipeline(
     H_sum: jax.Array | None = None,
     mesh_ref: MeshRef | None = None,
     background_epsilon: float | None = None,
+    domain_count: int = _DEFAULT_DOMAIN_COUNT,
+    active_domains: tuple[int, ...] | None = None,
 ) -> jax.Array:
     """Rho -> Delta n_eff differentiable pipeline.
 
@@ -437,6 +460,8 @@ def pipeline(
         mesh_ref: ``MeshRef`` forwarded to ChargeTransport calls.
         background_epsilon: Background Si relative permittivity
             (default: ``n_si^2 = 3.4757^2``).
+        domain_count: Number of gyptis material domains.
+        active_domains: Zero-based gyptis domains receiving the perturbation.
 
     Returns:
         ``Delta n_eff = n_eff(0 V) - n_eff(-5 V)``.
@@ -479,11 +504,10 @@ def pipeline(
     delta_eps, _ = _sb_jax(n1, p1, n0, p0)
 
     # 6. gyptis eigenmode solves
-    delta_eps_mean = jnp.mean(delta_eps)
-    bg = jnp.asarray(background_epsilon, dtype=delta_eps_mean.dtype)
-
-    epsilon_bg = jnp.array([bg])
-    epsilon_pert = jnp.array([bg + delta_eps_mean])
+    bg = jnp.asarray(background_epsilon, dtype=delta_eps.dtype)
+    epsilon_bg, epsilon_pert = _build_domain_epsilon(
+        delta_eps, bg, domain_count, active_domains,
+    )
 
     neff_sq_0 = _gyptis_call_jax(epsilon_bg)
     neff_sq_1 = _gyptis_call_jax(epsilon_pert)

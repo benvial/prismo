@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 from prismo.outputs import (
+    generate_outputs,
     plot_convergence,
     plot_delta_neff_breakdown,
     plot_doping_field,
@@ -102,6 +103,19 @@ class TestGradientValidationPlot:
             path = plot_gradient_validation(pipeline, rho, n_directions=2, output_dir=tmp)
             assert Path(path).exists()
             assert Path(path).suffix == ".pdf"
+
+
+class TestGenerateOutputs:
+    def test_includes_breakdown_plot(self):
+        coords = _make_coords()
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = generate_outputs(
+                np.full(N_NODES, 0.25), RNG.random(N_NODES), _make_history(),
+                coords, output_dir=tmp,
+            )
+            assert {path.name for path in paths} == {
+                "convergence.pdf", "doping_field.pdf", "breakdown.pdf",
+            }
 
     def test_custom_directions(self):
         import jax.numpy as jnp

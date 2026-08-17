@@ -129,6 +129,8 @@ def apply(inputs: InputSchema) -> OutputSchema:
         Squared effective index of the fundamental guided mode.
     """
     epsilon = np.asarray(inputs.epsilon, dtype=float)
+    if epsilon.ndim != 1 or epsilon.size == 0:
+        raise ValueError("epsilon must contain at least one material domain")
 
     try:
         _ensure_dolfin()
@@ -196,7 +198,10 @@ def vector_jacobian_product(
         return vjp
 
     cotangent = float(np.asarray(cotangent_vector["neff_sq"]))
-    n = len(np.asarray(inputs.epsilon))
+    epsilon = np.asarray(inputs.epsilon, dtype=float)
+    if epsilon.ndim != 1 or epsilon.size == 0:
+        raise ValueError("epsilon must contain at least one material domain")
+    n = len(epsilon)
 
     try:
         dolfin = _ensure_dolfin()

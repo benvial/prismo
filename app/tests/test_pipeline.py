@@ -9,7 +9,7 @@ import pytest
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp  # noqa: E402
 from prismo.density_filter import assemble_filter_matrix  # noqa: E402
-from prismo.pipeline import _sb_jax, pipeline  # noqa: E402
+from prismo.pipeline import _build_domain_epsilon, _sb_jax, pipeline  # noqa: E402
 from prismo.soref_bennett import soref_bennett as _sb_numpy  # noqa: E402
 from prismo_shared.schemas import CarrierDensityField  # noqa: E402
 
@@ -167,10 +167,26 @@ class TestPipelineStub:
         exp_dn = coeffs.A_e * dN**coeffs.B_e + coeffs.A_h * dN**coeffs.B_h
         exp_deps = 2.0 * coeffs.background_index * exp_dn
         bg = pl._DEFAULT_BACKGROUND_EPSILON
-        # gyptis stub returns mean(epsilon); neff = sqrt(mean(eps)).
-        exp_result = float(np.sqrt(bg) - np.sqrt(bg + exp_deps))
+        # Default domain mapping perturbs one of three equal domains.
+        exp_result = float(np.sqrt(bg) - np.sqrt(bg + exp_deps / 3.0))
         np.testing.assert_allclose(float(result), exp_result, rtol=1e-6)
         assert float(result) != 0.0
+
+    def test_domain_epsilon_keeps_inactive_domains_at_background(self):
+        delta = jnp.asarray([1.0, 3.0, 5.0])
+        bg, pert = _build_domain_epsilon(delta, jnp.asarray(12.0), 3)
+        np.testing.assert_array_equal(bg, [12.0, 12.0, 12.0])
+        np.testing.assert_allclose(pert, [15.0, 12.0, 12.0])
+
+    def test_domain_epsilon_can_activate_multiple_domains(self):
+        _, pert = _build_domain_epsilon(
+            jnp.asarray([2.0, 4.0]), jnp.asarray(10.0), 4, (0, 2),
+        )
+        np.testing.assert_allclose(pert, [13.0, 10.0, 13.0, 10.0])
+
+    def test_domain_epsilon_rejects_invalid_domain(self):
+        with pytest.raises(ValueError, match="invalid domain"):
+            _build_domain_epsilon(jnp.ones(2), jnp.asarray(1.0), 2, (2,))
 
     def test_forward_returns_zero_pre_container(self, rho):
         result = pipeline(rho)

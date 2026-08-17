@@ -158,14 +158,16 @@ def _overlay_geometry(ax: plt.Axes, geometry: object) -> None:
 
     Coordinates are converted from meters to µm.
     """
-    rib_l = geometry.rib_left * 1e6
-    rib_r = geometry.rib_right * 1e6
-    slab_top = geometry.slab_top * 1e6
-    rib_top = geometry.rib_top * 1e6
-    sub_top = geometry.substrate_thickness * 1e6
-    hw = geometry.half_width * 1e6
-    ct_off = geometry.contact_offset * 1e6
-    ct_w = geometry.contact_width * 1e6
+    # Geometry is duck-typed to keep plotting independent from mesh module.
+    geom = geometry  # type: ignore[assignment]
+    rib_l = geom.rib_left * 1e6  # type: ignore[attr-defined]
+    rib_r = geom.rib_right * 1e6  # type: ignore[attr-defined]
+    slab_top = geom.slab_top * 1e6  # type: ignore[attr-defined]
+    rib_top = geom.rib_top * 1e6  # type: ignore[attr-defined]
+    sub_top = geom.substrate_thickness * 1e6  # type: ignore[attr-defined]
+    hw = geom.half_width * 1e6  # type: ignore[attr-defined]
+    ct_off = geom.contact_offset * 1e6  # type: ignore[attr-defined]
+    ct_w = geom.contact_width * 1e6  # type: ignore[attr-defined]
 
     ax.plot([rib_l, rib_r], [slab_top, slab_top], "w--", linewidth=0.8, alpha=0.7)
     ax.plot([rib_l, rib_r], [rib_top, rib_top], "w--", linewidth=0.8, alpha=0.7)
@@ -343,5 +345,12 @@ def generate_outputs(
             pipeline_fn, rho_jax, n_directions=3, output_dir=out,
         )
         paths.append(gv)
+
+    breakdown = plot_delta_neff_breakdown(
+        float(history[-1]["delta_n_eff"]) if history else 0.0,
+        0.0,
+        output_dir=out,
+    )
+    paths.append(breakdown)
 
     return paths
