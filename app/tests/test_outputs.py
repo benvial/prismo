@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 from prismo.outputs import (
     generate_outputs,
     plot_convergence,
@@ -103,6 +104,42 @@ class TestGradientValidationPlot:
             path = plot_gradient_validation(pipeline, rho, n_directions=2, output_dir=tmp)
             assert Path(path).exists()
             assert Path(path).suffix == ".pdf"
+
+    def test_keeps_finite_differences_inside_density_bounds(self):
+        import jax
+        import jax.numpy as jnp
+
+        received: list[np.ndarray] = []
+
+        def bounded_pipeline(rho):
+            if not isinstance(rho, jax.core.Tracer):
+                received.append(np.asarray(rho))
+            return jnp.sum(rho**2)
+
+        rho = jnp.asarray([0.001, 0.5])
+        direction = jnp.asarray([-1.0, 0.0])
+        with tempfile.TemporaryDirectory() as tmp:
+            plot_gradient_validation(
+                bounded_pipeline,
+                rho,
+                directions=[direction],
+                step_sizes=np.asarray([1e-4, 1e-3, 1e-2]),
+                output_dir=tmp,
+            )
+
+        assert all(np.all(values >= 0.0) and np.all(values <= 1.0) for values in received)
+
+    def test_rejects_gradient_validation_without_feasible_steps(self):
+        import jax.numpy as jnp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with pytest.raises(ValueError, match="no feasible"):
+                plot_gradient_validation(
+                    lambda rho: jnp.sum(rho**2),
+                    jnp.asarray([0.0, 0.5]),
+                    directions=[jnp.asarray([-1.0, 0.0])],
+                    output_dir=tmp,
+                )
 
 
 class TestGenerateOutputs:

@@ -14,7 +14,11 @@ from prismo.soref_bennett import soref_bennett as _sb_numpy  # noqa: E402
 from prismo_shared.schemas import CarrierDensityField  # noqa: E402
 
 RNG = np.random.default_rng(0)
-jax.config.update("jax_enable_x64", True)
+
+
+def test_pipeline_enables_float64() -> None:
+    """Effective-index differences must not be quantized at float32 epsilon."""
+    assert jax.config.jax_enable_x64
 
 
 def _grid_coords(n: int = 16, spacing: float = 20e-9) -> np.ndarray:
@@ -206,6 +210,40 @@ class TestPipelineStub:
         np.testing.assert_allclose(received[0], [-1e14, 1e21])
         np.testing.assert_allclose(received[1], [-1e14, 1e21])
         assert float(result) > 0.0
+
+    def test_effective_index_objective_is_positive_for_either_shift_direction(
+        self, monkeypatch,
+    ):
+        """Optimization maximizes phase-shift magnitude, not its mode-sign."""
+        import prismo.pipeline as pl
+
+        def fake_ct(doping, bias_voltage, mesh_ref=None):
+            carriers = jnp.where(
+                bias_voltage == 0.0,
+                jnp.zeros_like(doping),
+                jnp.full_like(doping, 1e24),
+            )
+            return carriers, carriers
+
+        monkeypatch.setattr(pl, "_ct_call_jax", fake_ct)
+
+        result = pl.pipeline(jnp.asarray([0.25, 0.25]))
+
+        assert float(result) > 0.0
+
+    def test_effective_index_objective_has_zero_gradient_at_zero_shift(
+        self, monkeypatch,
+    ):
+        """The positive phase-shift objective stays differentiable at zero."""
+        import prismo.pipeline as pl
+
+        def fake_ct(doping, bias_voltage, mesh_ref=None):
+            return doping, doping
+
+        monkeypatch.setattr(pl, "_ct_call_jax", fake_ct)
+
+        rho = jnp.asarray([0.25, 0.25])
+        np.testing.assert_allclose(jax.grad(pl.pipeline)(rho), 0.0, atol=1e-20)
 
     def test_domain_epsilon_keeps_inactive_domains_at_background(self):
         delta = jnp.asarray([1.0, 3.0, 5.0])

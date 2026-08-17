@@ -18,6 +18,8 @@ import jax.numpy as jnp
 import numpy as np
 from prismo_shared.schemas import MeshRef, SorefBennettCoefficients
 
+jax.config.update("jax_enable_x64", True)
+
 _COMPONENTS_DIR = Path(__file__).resolve().parents[2] / "components" / "tesseracts"
 
 
@@ -483,7 +485,7 @@ def pipeline(
         active_domains: Zero-based gyptis domains receiving the perturbation.
 
     Returns:
-        ``Delta n_eff = n_eff(0 V) - n_eff(-5 V)``.
+        Smooth positive effective-index shift magnitude between 0 V and -5 V.
     """
     if background_epsilon is None:
         background_epsilon = _DEFAULT_BACKGROUND_EPSILON
@@ -539,4 +541,6 @@ def pipeline(
     neff_0 = jnp.sqrt(jnp.maximum(neff_sq_0, 0.0))
     neff_1 = jnp.sqrt(jnp.maximum(neff_sq_1, 0.0))
 
-    return neff_1 - neff_0
+    delta_neff = neff_1 - neff_0
+    # Keep a positive, differentiable objective when the mode shift is zero.
+    return jnp.hypot(delta_neff, jnp.asarray(1e-15, dtype=delta_neff.dtype))

@@ -241,6 +241,7 @@ def plot_gradient_validation(
     rho: jax.Array,
     directions: list[jax.Array] | None = None,
     n_directions: int = 3,
+    step_sizes: np.ndarray | None = None,
     output_dir: str | Path | None = None,
 ) -> Path:
     """Gradient validation: relative error vs FD step size.
@@ -252,6 +253,8 @@ def plot_gradient_validation(
             ``None``.
         n_directions: Number of random directions (ignored if
             ``directions`` given).
+        step_sizes: Central-difference steps. Defaults to 20 logarithmic
+            steps from ``1e-6`` to ``1e-1``.
         output_dir: Directory to write ``gradient_validation.pdf``.
 
     Returns:
@@ -270,13 +273,24 @@ def plot_gradient_validation(
             directions.append(d)
         n_directions = len(directions)
 
-    step_sizes = np.logspace(-6, -1, 20)
+    if step_sizes is None:
+        step_sizes = np.logspace(-6, -1, 20)
 
     fig, ax = plt.subplots(figsize=(6, 4))
 
     for i, direction in enumerate(directions):
+        positive = np.asarray(direction) > 0.0
+        negative = np.asarray(direction) < 0.0
+        rho_np = np.asarray(rho)
+        max_step = min(
+            np.min((1.0 - rho_np[positive]) / np.asarray(direction)[positive], initial=np.inf),
+            np.min(rho_np[negative] / -np.asarray(direction)[negative], initial=np.inf),
+        )
+        feasible_steps = step_sizes[step_sizes < max_step]
+        if len(feasible_steps) == 0:
+            continue
         errors = []
-        for h in step_sizes:
+        for h in feasible_steps:
             f_plus = pipeline_fn(rho + h * direction)
             f_minus = pipeline_fn(rho - h * direction)
             fd_val = (f_plus - f_minus) / (2.0 * h)
@@ -284,7 +298,10 @@ def plot_gradient_validation(
             denom = max(float(abs(exact_val)), 1e-30)
             errors.append(float(abs(fd_val - exact_val)) / denom)
         label = f"direction {i+1}" if n_directions > 1 else "FD"
-        ax.loglog(step_sizes, errors, "o-", markersize=3, label=label)
+        ax.loglog(feasible_steps, errors, "o-", markersize=3, label=label)
+
+    if not ax.lines:
+        raise ValueError("Gradient validation has no feasible finite-difference steps")
 
     ax.plot(step_sizes, step_sizes, "k--", alpha=0.4, label=r"$O(h)$")
     ax.set_xlabel("Step size h")
@@ -308,6 +325,9 @@ def generate_outputs(
     geometry: object | None = None,
     pipeline_fn: Callable[..., jax.Array] | None = None,
     ftol_rel: float | None = None,
+    gradient_validation_directions: int = 3,
+    gradient_validation_steps: np.ndarray | None = None,
+    gradient_validation_rho: np.ndarray | None = None,
     output_dir: str | Path | None = None,
 ) -> list[Path]:
     """Generate all paper-ready output plots.
@@ -321,6 +341,10 @@ def generate_outputs(
         pipeline_fn: Differentiable pipeline function for gradient
             validation. Skipped if ``None``.
         ftol_rel: MMA relative tolerance for the convergence marker.
+        gradient_validation_directions: Number of finite-difference directions.
+        gradient_validation_steps: Central-difference steps for gradient validation.
+        gradient_validation_rho: Reference design for gradient validation.
+            Defaults to ``rho_opt``.
         output_dir: Output directory (default: ``outputs/``).
 
     Returns:
@@ -340,9 +364,15 @@ def generate_outputs(
     if pipeline_fn is not None:
         import jax.numpy as jnp
 
-        rho_jax = jnp.asarray(rho_opt)
+        rho_jax = jnp.asarray(
+            rho_opt if gradient_validation_rho is None else gradient_validation_rho,
+        )
         gv = plot_gradient_validation(
-            pipeline_fn, rho_jax, n_directions=3, output_dir=out,
+            pipeline_fn,
+            rho_jax,
+            n_directions=gradient_validation_directions,
+            step_sizes=gradient_validation_steps,
+            output_dir=out,
         )
         paths.append(gv)
 

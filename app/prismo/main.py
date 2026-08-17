@@ -17,6 +17,7 @@ app = typer.Typer(name="prismo")
 
 _DEFAULT_OUTPUT_DIR = Path("outputs")
 _DEFAULT_MESH = _DEFAULT_OUTPUT_DIR / "waveguide.msh"
+_MIN_CONTAINER_OBJECTIVE = 1e-12
 
 
 @app.command()
@@ -159,7 +160,10 @@ def _run_pipeline(
         invalid = [
             entry
             for entry in history
-            if entry["delta_n_eff"] <= 0.0 or entry["grad_norm"] <= 0.0
+            if (
+                entry["delta_n_eff"] <= _MIN_CONTAINER_OBJECTIVE
+                or entry["grad_norm"] <= 0.0
+            )
         ]
         if invalid:
             raise RuntimeError(
@@ -177,6 +181,11 @@ def _run_pipeline(
         geometry=geometry,
         pipeline_fn=partial(pipeline_fn, polarity=polarity),
         ftol_rel=optimization_ftol_rel,
+        gradient_validation_directions=1 if use_containers else 3,
+        gradient_validation_steps=(
+            np.logspace(-4, -2, 3) if use_containers else None
+        ),
+        gradient_validation_rho=rho_initial if use_containers else None,
         output_dir=output_dir,
     )
     for p in plot_paths:

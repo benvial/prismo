@@ -55,6 +55,7 @@ def test_container_run_passes_fixed_pn_polarity_to_optimization(
 
     coords = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
     captured: dict[str, object] = {}
+    output_captured: dict[str, object] = {}
     history = [
         {
             "iteration": index,
@@ -77,9 +78,12 @@ def test_container_run_passes_fixed_pn_polarity_to_optimization(
     monkeypatch.setattr(
         outputs_module,
         "generate_outputs",
-        lambda **kwargs: [tmp_path / name for name in (
-            "convergence.pdf", "doping_field.pdf", "gradient_validation.pdf",
-        )],
+        lambda **kwargs: (
+            output_captured.update(kwargs)
+            or [tmp_path / name for name in (
+                "convergence.pdf", "doping_field.pdf", "gradient_validation.pdf",
+            )]
+        ),
     )
 
     main_module._run_pipeline(
@@ -94,3 +98,49 @@ def test_container_run_passes_fixed_pn_polarity_to_optimization(
 
     np.testing.assert_array_equal(captured["polarity"], [-1.0, -1.0, 1.0])
     assert captured["min_mma_evaluations"] == 5
+    assert output_captured["gradient_validation_directions"] == 1
+    np.testing.assert_allclose(
+        output_captured["gradient_validation_steps"], [1e-4, 1e-3, 1e-2],
+    )
+    np.testing.assert_allclose(
+        output_captured["gradient_validation_rho"], np.full(3, 0.25),
+    )
+
+
+def test_container_run_rejects_near_zero_objective(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The positive smoothing floor cannot pass a zero-physics container run."""
+    import prismo.main as main_module
+    import prismo.optimizer as optimizer_module
+    import prismo.waveguide_mesh as mesh_module
+
+    coords = np.asarray([[0.0, 0.0], [1.0, 0.0]])
+    history = [
+        {
+            "iteration": index,
+            "delta_n_eff": 1e-15,
+            "delta_rho": 0.0,
+            "grad_norm": 1e-4,
+            "wall_time": 0.1,
+        }
+        for index in range(1, 6)
+    ]
+    monkeypatch.setattr(mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh")
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        optimizer_module,
+        "optimize_doping",
+        lambda **_: (np.full(2, 0.25), history),
+    )
+
+    with pytest.raises(RuntimeError, match="invalid optimization signal"):
+        main_module._run_pipeline(
+            r_min=50e-9,
+            max_iter=5,
+            ftol_rel=1e-5,
+            mesh_path=str(tmp_path / "mesh.msh"),
+            output_dir=str(tmp_path),
+            no_jit=True,
+            use_containers=True,
+        )
