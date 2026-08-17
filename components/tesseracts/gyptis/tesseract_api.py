@@ -223,11 +223,9 @@ def vector_jacobian_product(
 
     # --- 1. Re-assemble A and B (identical to eigensolve internals) ---
     wf = simu.formulation.weak
-    dv = dolfin.PETScVector()
-
-    V = simu.formulation.space
-    trial = dolfin.TrialFunction(V)
-    dv.init(dolfin.as_backend_type(trial.vector()).vec())
+    zero = dolfin.Constant((0.0, 0.0, 0.0))
+    dv = dolfin.dot(zero, simu.formulation.test) * simu.formulation.dx
+    dv = dv.real + dv.imag
 
     bcs = simu.formulation.build_boundary_conditions()
 

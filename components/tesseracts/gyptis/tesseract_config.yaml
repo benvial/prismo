@@ -38,6 +38,19 @@ build_config:
   # on the platform they were built for.
   target_platform: "native"
 
+  package_data:
+    - ["warmup.py", "/tmp/gyptis-warmup.py"]
+
+  custom_build_steps:
+    - |
+      ENV XDG_CACHE_HOME=/opt/gyptis-cache \
+          DIJITSO_CACHE_DIR=/opt/gyptis-cache/dijitso \
+          INSTANT_CACHE_DIR=/opt/gyptis-cache/instant \
+          MPLCONFIGDIR=/tmp/matplotlib
+      RUN mkdir -p /opt/gyptis-cache/dijitso /opt/gyptis-cache/instant \
+          /opt/gyptis-cache/matplotlib /tmp/matplotlib && \
+          python /tmp/gyptis-warmup.py
+
   # Additional packages to install in the container (via apt-get)
   # extra_packages:
   #  - package_name
