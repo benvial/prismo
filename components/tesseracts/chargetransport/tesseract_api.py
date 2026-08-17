@@ -14,7 +14,6 @@
 import json
 import os
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -203,8 +202,8 @@ def _run_julia_adjoint(
     """Call ``julia adjoint.jl`` with NPY file arguments.
 
     Runs the discrete adjoint solve inside Julia and returns the VJP
-    vector dJ/d(doping) per node. Falls back to identity VJP when the
-    subprocess fails.
+    vector dJ/d(doping) per node. A failed or malformed solve raises so
+    callers cannot optimize against a silent zero-gradient fallback.
 
     Returns:
         VJP vector per mesh node.
@@ -236,18 +235,22 @@ def _run_julia_adjoint(
                 cmd, check=True, capture_output=True, text=True,
                 timeout=_JULIA_TIMEOUT_S,
             )
-            return np.load(output_path)
+            vjp = np.asarray(np.load(output_path), dtype=float)
+            if vjp.shape != doping.shape:
+                raise RuntimeError(
+                    "Julia adjoint solve returned VJP shape "
+                    f"{vjp.shape}; expected {doping.shape}."
+                )
+            if not np.all(np.isfinite(vjp)):
+                raise RuntimeError("Julia adjoint solve returned non-finite VJP values.")
+            return vjp
         except (
             subprocess.CalledProcessError,
             subprocess.TimeoutExpired,
             FileNotFoundError,
+            ValueError,
         ) as exc:
-            print(
-                f"WARNING: julia adjoint solve failed ({exc}); "
-                "falling back to zero VJP",
-                file=sys.stderr,
-            )
-            return np.zeros(len(doping))
+            raise RuntimeError(f"Julia adjoint solve failed: {exc}") from exc
 
 
 #
@@ -304,8 +307,9 @@ def vector_jacobian_product(
     """Adjoint gradient pass via discrete adjoint inside Julia.
 
     When Julia is available, invokes ``julia adjoint.jl`` with the
-    doping array, cotangent vectors, and bias voltage. Falls back to
-    identity VJP when Julia is not present.
+    doping array, cotangent vectors, and bias voltage. Local development
+    without Julia retains a deterministic identity VJP; failures from an
+    available Julia solver propagate to the caller.
 
     Args:
         inputs: Same InputSchema as the preceding apply() call.

@@ -60,6 +60,11 @@ def make_inputs(doping: np.ndarray | None = None) -> InputSchema:
     return InputSchema(doping=doping)
 
 
+def _smooth_mixed_sign_pn_profile() -> np.ndarray:
+    magnitude = np.geomspace(1e14, 1e20, 62)
+    return np.where(np.arange(62) < 31, -magnitude[::-1], magnitude)
+
+
 # ---------------------------------------------------------------------------
 # Schema validation
 # ---------------------------------------------------------------------------
@@ -274,18 +279,18 @@ def test_apply_propagates_julia_timeout(
         apply(InputSchema(doping=doping, bias_voltage=-5.0))
 
 
-def test_vjp_returns_zeros_when_julia_times_out(
+def test_vjp_propagates_julia_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     inputs = make_inputs()
     _force_julia_path_with_timeout(monkeypatch)
-    result = vector_jacobian_product(
-        inputs,
-        {"doping"},
-        {"electrons", "holes"},
-        {"electrons": np.ones(N_NODES), "holes": np.ones(N_NODES)},
-    )
-    np.testing.assert_allclose(result["doping"], np.zeros(N_NODES))
+    with pytest.raises(RuntimeError, match="Julia adjoint solve failed"):
+        vector_jacobian_product(
+            inputs,
+            {"doping"},
+            {"electrons", "holes"},
+            {"electrons": np.ones(N_NODES), "holes": np.ones(N_NODES)},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -305,8 +310,7 @@ def test_apply_with_julia_subprocess() -> None:
 @pytest.mark.skipif(not _julia_available(), reason="Julia not installed")
 def test_apply_solves_smooth_mixed_sign_pn_profile(bias_voltage: float) -> None:
     """Public apply returns physical fields for smooth PN profiles."""
-    magnitude = np.geomspace(1e14, 1e20, 62)
-    doping = np.where(np.arange(62) < 31, -magnitude[::-1], magnitude)
+    doping = _smooth_mixed_sign_pn_profile()
     outputs = apply(InputSchema(doping=doping, bias_voltage=bias_voltage))
 
     electrons = np.asarray(outputs.electrons)
@@ -315,6 +319,50 @@ def test_apply_solves_smooth_mixed_sign_pn_profile(bias_voltage: float) -> None:
     assert np.all(np.isfinite(holes))
     assert not np.allclose(electrons, doping)
     assert not np.allclose(holes, doping)
+
+
+@pytest.mark.parametrize("bias_voltage", [0.0, -5.0])
+@pytest.mark.skipif(not _julia_available(), reason="Julia not installed")
+def test_vjp_is_finite_for_smooth_mixed_sign_pn_profile(bias_voltage: float) -> None:
+    """Public VJP returns responsive per-node gradients for supported PN profiles."""
+    doping = _smooth_mixed_sign_pn_profile()
+    inputs = InputSchema(doping=doping, bias_voltage=bias_voltage)
+    result = vector_jacobian_product(
+        inputs,
+        {"doping"},
+        {"electrons", "holes"},
+        {"electrons": np.ones_like(doping), "holes": np.ones_like(doping)},
+    )
+    vjp = np.asarray(result["doping"])
+
+    assert vjp.shape == doping.shape
+    assert np.all(np.isfinite(vjp))
+    assert not np.allclose(vjp, 0.0)
+
+
+@pytest.mark.parametrize("bias_voltage", [0.0, -5.0])
+@pytest.mark.skipif(not _julia_available(), reason="Julia not installed")
+def test_vjp_matches_pn_forward_directional_difference(bias_voltage: float) -> None:
+    """Public VJP matches finite differences of the public PN forward solve."""
+    doping = _smooth_mixed_sign_pn_profile()
+    direction = np.sin(np.arange(len(doping)) * 0.37)
+    inputs = InputSchema(doping=doping, bias_voltage=bias_voltage)
+    cotangent = {"electrons": np.ones_like(doping), "holes": np.ones_like(doping)}
+    vjp = np.asarray(
+        vector_jacobian_product(
+            inputs, {"doping"}, {"electrons", "holes"}, cotangent
+        )["doping"]
+    )
+
+    step = 1e12
+    def objective(doping_field: np.ndarray) -> float:
+        outputs = apply(InputSchema(doping=doping_field, bias_voltage=bias_voltage))
+        return float(np.sum(outputs.electrons) + np.sum(outputs.holes))
+
+    finite_difference = (objective(doping + step * direction) - objective(
+        doping - step * direction
+    )) / (2 * step)
+    np.testing.assert_allclose(np.dot(vjp, direction), finite_difference, rtol=1e-2)
 
 
 def _make_minimal_triangle_msh(path: str) -> None:

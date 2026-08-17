@@ -65,6 +65,42 @@ function central_diff_density(sol, data, dof_idx, inode, epsilon)
     return dn, dp
 end
 
+function residual_doping_derivative(ctsys, sol, data, inode)
+    doping = data.paramsnodal.doping
+    original = doping[inode]
+    step = max(abs(original) * 1e-6, 1e8)
+
+    doping[inode] = original + step
+    residual_plus, _ = VoronoiFVM.evaluate_residual_and_jacobian(ctsys.fvmsys, sol.u)
+
+    doping[inode] = original - step
+    residual_minus, _ = VoronoiFVM.evaluate_residual_and_jacobian(ctsys.fvmsys, sol.u)
+
+    doping[inode] = original
+    return (residual_plus - residual_minus) / (2step)
+end
+
+function residual_boundary_potential_derivative(ctsys, sol, data, ibreg)
+    potentials = data.params.bψEQ
+    original = potentials[ibreg]
+    step = 1e-8
+
+    potentials[ibreg] = original + step
+    residual_plus, _ = VoronoiFVM.evaluate_residual_and_jacobian(ctsys.fvmsys, sol.u)
+
+    potentials[ibreg] = original - step
+    residual_minus, _ = VoronoiFVM.evaluate_residual_and_jacobian(ctsys.fvmsys, sol.u)
+
+    potentials[ibreg] = original
+    return (residual_plus - residual_minus) / (2step)
+end
+
+function boundary_potential_doping_derivative(sol, data, nspec, inode)
+    psi_idx = dof_index(nspec, inode, DOF_PSI)
+    dn_dpsi, dp_dpsi = central_diff_density(sol, data, psi_idx, inode, 1e-8)
+    return inv(dp_dpsi - dn_dpsi)
+end
+
 function main()
     doping_path, cot_n_path, cot_p_path, bias_path, output_path, mesh_path =
         parse_adjoint_args()
@@ -128,9 +164,16 @@ function main()
     lambda = J_csc' \ (-dJ_dx)
 
     vjp = zeros(Float64, n_nodes)
+    grid = ctsys.fvmsys.grid
     for k in 1:n_nodes
-        psi_idx = dof_index(nspec, k, DOF_PSI)
-        vjp[k] = -lambda[psi_idx]
+        dF_dN = residual_doping_derivative(ctsys, sol, data, k)
+        for ibreg in grid[BFaceRegions]
+            if grid[BFaceNodes][ibreg] == k
+                dpsi_dN = boundary_potential_doping_derivative(sol, data, nspec, k)
+                dF_dN += residual_boundary_potential_derivative(ctsys, sol, data, ibreg) * dpsi_dN
+            end
+        end
+        vjp[k] = dot(lambda, dF_dN)
     end
 
     npzwrite(output_path, vjp)
