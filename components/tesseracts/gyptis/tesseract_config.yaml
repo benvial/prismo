@@ -48,8 +48,9 @@ build_config:
           INSTANT_CACHE_DIR=/opt/gyptis-cache/instant \
           MPLCONFIGDIR=/tmp/matplotlib
       RUN mkdir -p /opt/gyptis-cache/dijitso /opt/gyptis-cache/instant \
-          /opt/gyptis-cache/matplotlib /tmp/matplotlib && \
-          python /tmp/gyptis-warmup.py
+          /tmp/matplotlib && \
+          python /tmp/gyptis-warmup.py && \
+          chmod -R a+rwX /opt/gyptis-cache
 
   # Additional packages to install in the container (via apt-get)
   # extra_packages:

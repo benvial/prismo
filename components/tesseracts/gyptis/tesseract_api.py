@@ -4,9 +4,8 @@
 # Tesseract API module for prismo_gyptis
 # Electromagnetic eigenmode component (gyptis / FEniCS).
 #
-# Real implementation: 2D waveguide eigenmode solve + Hellmann-Feynman
-# eigen-adjoint VJP, per tickets 03 and 10. Falls back to effective-medium
-# stub when gyptis/FEniCS is not installed.
+# Real implementation: 2D waveguide eigenmode solve with a finite-difference
+# VJP. Falls back to an effective-medium stub when gyptis/FEniCS is absent.
 
 from typing import Any
 
@@ -170,15 +169,12 @@ def vector_jacobian_product(
     vjp_outputs: set[str],
     cotangent_vector: dict[str, npt.ArrayLike],
 ) -> dict[str, npt.ArrayLike]:
-    """Adjoint gradient pass via Hellmann-Feynman eigen-adjoint.
+    """Compute a VJP with centered differences of the public forward map.
 
-    For the generalized eigenproblem A x = lambda B x where lambda = kz^2,
-    the eigenvalue sensitivity to subdomain permittivity epsilon_d is:
-
-        d(lambda)/d(epsilon_d) = ( x^H (dA/d(eps_d) - lambda dB/d(eps_d)) x )
-                               / ( x^H B x )
-
-    with d(neff)/d(eps_d) chained through neff = sqrt(lambda)/k0.
+    gyptis's PML formulation produces a non-Hermitian generalized eigenproblem.
+    A right-eigenvector-only Hellmann-Feynman quotient is invalid there; centered
+    differences provide a reliable derivative until a left-eigenvector adjoint is
+    available.
 
     Args:
         inputs: Same InputSchema as the preceding apply() call.
@@ -204,95 +200,20 @@ def vector_jacobian_product(
     n = len(epsilon)
 
     try:
-        dolfin = _ensure_dolfin()
+        _ensure_dolfin()
         _ensure_gyptis()
     except ImportError:
         vjp["epsilon"] = np.full(n, cotangent / n)
         return vjp
 
-    global _solve_state
-    if _solve_state is None:
-        raise RuntimeError(
-            "vector_jacobian_product called before apply(). "
-            "Run apply() first to populate the solve state."
-        )
+    step = 1e-4
+    gradient = np.empty(n)
+    for index in range(n):
+        perturbation = np.zeros(n)
+        perturbation[index] = step
+        upper = apply(InputSchema(epsilon=epsilon + perturbation))
+        lower = apply(InputSchema(epsilon=epsilon - perturbation))
+        gradient[index] = (float(upper.neff_sq) - float(lower.neff_sq)) / (2 * step)
 
-    simu = _solve_state["simu"]
-    k0 = _solve_state["k0"]
-    j = _solve_state["eigen_index"]
-
-    # --- 1. Re-assemble A and B (identical to eigensolve internals) ---
-    wf = simu.formulation.weak
-    zero = dolfin.Constant((0.0, 0.0, 0.0))
-    dv = dolfin.dot(zero, simu.formulation.test) * simu.formulation.dx
-    dv = dv.real + dv.imag
-
-    bcs = simu.formulation.build_boundary_conditions()
-
-    A_mat = dolfin.PETScMatrix()
-    B_mat = dolfin.PETScMatrix()
-    b = dolfin.PETScVector()
-    dolfin.assemble_system(wf[0], dv, bcs, A_tensor=A_mat, b_tensor=b)
-    dolfin.assemble_system(wf[1], dv, bcs, A_tensor=B_mat, b_tensor=b)
-    _amat = A_mat.mat()
-    Bmat = B_mat.mat()
-
-    # --- 2. Get raw eigenvector (real + imag parts, global dof order) ---
-    ev_re, ev_im, rx, cx = simu.eigensolver.get_eigenpair(j)
-    lam = ev_re + 1j * ev_im
-    kz = np.sqrt(lam)
-    neff = kz / k0
-
-    # --- 3. Per-subdomain derivative matrices + Hellmann-Feynman ---
-    u = simu.formulation.trial
-    v = simu.formulation.test
-
-    et = dolfin.as_vector([u[0], u[1], 0.0])
-    ez = u[2]
-    vt = dolfin.as_vector([v[0], v[1], 0.0])
-    vz = v[2]
-    zhat = dolfin.as_vector([0.0, 0.0, 1.0])
-
-    dneff_sq_deps = np.zeros(len(np.asarray(inputs.epsilon)))
-
-    for d_idx in range(len(np.asarray(inputs.epsilon))):
-        domain_name = str(d_idx + 1)
-        dx_d = simu.dx(domain_name)
-
-        # M_tt = -k0^2 int e_t * v_t dx  (dA/d(eps_d))
-        form_tt = -dolfin.Constant(k0 * k0) * dolfin.inner(et, vt) * dx_d
-        F_tt = form_tt.real + form_tt.imag
-        Mtt = dolfin.PETScMatrix()
-        dolfin.assemble(F_tt, tensor=Mtt)
-        for bc in bcs:
-            bc.apply(Mtt)
-        Mtt_mat = Mtt.mat()
-
-        # M_zz = +k0^2 int e_z * v_z dx  (dB/d(eps_d))
-        form_zz = (
-            dolfin.Constant(k0 * k0)
-            * dolfin.inner(ez * zhat, vz * zhat)
-            * dx_d
-        )
-        F_zz = form_zz.real + form_zz.imag
-        Mzz = dolfin.PETScMatrix()
-        dolfin.assemble(F_zz, tensor=Mzz)
-        for bc in bcs:
-            bc.apply(Mzz)
-        Mzz_mat = Mzz.mat()
-
-        # M_d = dA/d(eps_d) - lambda * dB/d(eps_d)
-        # Collapsed-real doubled-space Hermitian form:
-        #   num = rx^T M_d rx + cx^T M_d cx
-        num = rx.dot(Mtt_mat * rx) + cx.dot(Mtt_mat * cx)
-        num -= lam * (rx.dot(Mzz_mat * rx) + cx.dot(Mzz_mat * cx))
-        den = rx.dot(Bmat * rx) + cx.dot(Bmat * cx)
-
-        dlam_deps = num / den
-        dneff_deps = dlam_deps / (2.0 * k0 * kz)
-
-        # Chain: dneff_sq/d(eps_d) = 2 * neff * dneff/d(eps_d)
-        dneff_sq_deps[d_idx] = 2.0 * neff * dneff_deps
-
-    vjp["epsilon"] = cotangent * dneff_sq_deps
+    vjp["epsilon"] = cotangent * gradient
     return vjp

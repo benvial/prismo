@@ -203,15 +203,19 @@ def test_gyptis_apply_runs_eigen_solve() -> None:
 @pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
 def test_gyptis_vjp_matches_finite_difference() -> None:
     """Real gyptis VJP must match finite-difference gradient of the eigen solve."""
-    n_domains = 3
-    epsilon = np.array([12.0, 2.0, 1.0], dtype=float)
+    n_domains = 4
+    epsilon = np.array([12.0, 11.0, 1.0, 1.0], dtype=float)
     perturbation = np.random.RandomState(42).randn(n_domains) * 0.1
     h = 1e-3
 
+    apply(make_inputs(epsilon))
     vjp_result = vector_jacobian_product(
         make_inputs(epsilon), {"epsilon"}, {"neff_sq"}, {"neff_sq": 1.0}
     )
     vjp = np.asarray(vjp_result["epsilon"])
+    assert vjp.shape == (n_domains,)
+    assert np.all(np.isfinite(vjp))
+    assert np.any(vjp != 0.0)
 
     f_plus = float(apply(make_inputs(epsilon + h * perturbation)).neff_sq)
     f_minus = float(apply(make_inputs(epsilon - h * perturbation)).neff_sq)
