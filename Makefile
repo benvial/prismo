@@ -1,4 +1,6 @@
-.PHONY: help new build test gen-tests data run clean
+.PHONY: help new build test gen-tests data run run-containers clean
+
+PYTHON ?= python
 
 help:
 	@echo "Available targets:"
@@ -9,6 +11,7 @@ help:
 	@echo "  gen-tests NAME FILE=case.json - Capture a test case by running an input payload (make gen-tests mytess FILE=in.json)"
 	@echo "  data                          - Pull example data"
 	@echo "  run                           - Run app end-to-end"
+	@echo "  run-containers                - Run app with both Docker containers"
 	@echo "  clean                         - Remove build artifacts, caches, and temp files"
 
 new:
@@ -164,11 +167,11 @@ data:
 
 run:
 	@echo "Running app..."
-	@prismo run $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
+	@PYTHONPATH=app:components/shared_code:$${PYTHONPATH} $(PYTHON) -m prismo.main $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
 
 run-containers:
 	@echo "Running app with Docker containers..."
-	@prismo run --use-containers $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
+	@PYTHONPATH=app:components/shared_code:$${PYTHONPATH} $(PYTHON) -m prismo.main --use-containers $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
 
 clean:
 	@echo "Cleaning build artifacts, caches, and temp files..."

@@ -19,7 +19,9 @@ jax.config.update("jax_enable_x64", True)
 
 def _grid_coords(n: int = 16, spacing: float = 20e-9) -> np.ndarray:
     xs, ys = np.meshgrid(
-        np.arange(n) * spacing, np.arange(n) * spacing, indexing="xy",
+        np.arange(n) * spacing,
+        np.arange(n) * spacing,
+        indexing="xy",
     )
     return np.stack([xs.ravel(), ys.ravel()], axis=1)
 
@@ -56,10 +58,14 @@ class TestSorefBennettJax:
             ),
         )
         np.testing.assert_allclose(
-            depsilon_jax, np.asarray(result_np.delta_permittivity), rtol=1e-12,
+            depsilon_jax,
+            np.asarray(result_np.delta_permittivity),
+            rtol=1e-12,
         )
         np.testing.assert_allclose(
-            dalpha_jax, np.asarray(result_np.delta_absorption), rtol=1e-12,
+            dalpha_jax,
+            np.asarray(result_np.delta_absorption),
+            rtol=1e-12,
         )
 
     def test_differentiable_elements(self):
@@ -99,13 +105,17 @@ class TestSorefBennettJax:
         exp_dn = coeffs.A_e * dN**coeffs.B_e + coeffs.A_h * dN**coeffs.B_h
         exp_depsilon = 2.0 * coeffs.background_index * exp_dn
         np.testing.assert_allclose(
-            depsilon, jnp.full(self.N_NODES, exp_depsilon), rtol=1e-6,
+            depsilon,
+            jnp.full(self.N_NODES, exp_depsilon),
+            rtol=1e-6,
         )
         assert jnp.all(depsilon > 0)
         # Depletion removes absorption: dalpha < 0.
         exp_dalpha = -(coeffs.C_e * dN**coeffs.D_e + coeffs.C_h * dN**coeffs.D_h)
         np.testing.assert_allclose(
-            dalpha, jnp.full(self.N_NODES, exp_dalpha), rtol=1e-6,
+            dalpha,
+            jnp.full(self.N_NODES, exp_dalpha),
+            rtol=1e-6,
         )
 
     def test_antisymmetric_in_density_change(self):
@@ -180,7 +190,10 @@ class TestPipelineStub:
 
     def test_domain_epsilon_can_activate_multiple_domains(self):
         _, pert = _build_domain_epsilon(
-            jnp.asarray([2.0, 4.0]), jnp.asarray(10.0), 4, (0, 2),
+            jnp.asarray([2.0, 4.0]),
+            jnp.asarray(10.0),
+            4,
+            (0, 2),
         )
         np.testing.assert_allclose(pert, [13.0, 10.0, 13.0, 10.0])
 
@@ -219,6 +232,46 @@ class TestPipelineStub:
 
         result64 = pipeline(jnp.asarray(rho, dtype=jnp.float64))
         assert result64.dtype == jnp.float64
+
+
+class TestContainerPipeline:
+    def test_container_startup_failure_raises(self, monkeypatch):
+        """Container mode must not continue through a local stub."""
+        import sys
+        import types
+
+        import prismo.pipeline as pl
+
+        class FailingTesseract:
+            @classmethod
+            def from_image(cls, image):
+                raise RuntimeError(f"image unavailable: {image}")
+
+        monkeypatch.setitem(
+            sys.modules,
+            "tesseract_core",
+            types.SimpleNamespace(Tesseract=FailingTesseract),
+        )
+        monkeypatch.setattr(pl, "_ct_tesseract", None)
+        monkeypatch.setattr(pl, "_gyptis_tesseract", None)
+        monkeypatch.setattr(pl, "_HAS_CT_CONTAINER", False)
+        monkeypatch.setattr(pl, "_HAS_GYPTIS_CONTAINER", False)
+
+        with pytest.raises(RuntimeError, match="ChargeTransport container"):
+            pl.init_tesseract_containers()
+
+    def test_gyptis_container_failure_does_not_use_local_stub(self, monkeypatch):
+        """A failed container request must abort the container pipeline."""
+        import prismo.pipeline as pl
+
+        class FailingTesseract:
+            def apply(self, inputs):
+                raise RuntimeError("HTTP 500")
+
+        monkeypatch.setattr(pl, "_gyptis_tesseract", FailingTesseract())
+
+        with pytest.raises(RuntimeError, match="HTTP 500"):
+            pl._gyptis_forward_impl(np.array([12.0, 12.0]))
 
 
 class TestPipelineWithFilter:
@@ -351,8 +404,7 @@ class TestPipelineGradientValidation:
 
                     if h <= 1e-4:
                         assert rel_error < 1.0, (
-                            f"FD error too large at h={h}: "
-                            f"rel_error={rel_error:.2e}"
+                            f"FD error too large at h={h}: rel_error={rel_error:.2e}"
                         )
 
     def test_gradient_vs_fd_multiple_rho(self):

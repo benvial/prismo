@@ -59,36 +59,32 @@ def init_tesseract_containers() -> None:
     """Start tesseract Docker containers for ChargeTransport and gyptis.
 
     Must be called before optimization. Containers stay running until
-    ``teardown_containers()`` is called. Falls back silently if the
-    ``tesseract_core`` package or Docker is unavailable.
+    ``teardown_containers()`` is called. Startup is all-or-nothing so a
+    container run can never silently use local component stubs.
     """
     global _ct_tesseract, _gyptis_tesseract, _HAS_CT_CONTAINER, _HAS_GYPTIS_CONTAINER
     try:
         from tesseract_core import Tesseract  # type: ignore[import-untyped]
-    except ImportError:
-        import sys
-        print(
-            "tesseract_core not installed — skipping container init. "
-            "Install with: pip install tesseract-core",
-            file=sys.stderr,
-        )
-        return
+    except ImportError as exc:
+        raise RuntimeError(
+            "tesseract_core is required for container pipeline runs"
+        ) from exc
 
     try:
         _ct_tesseract = Tesseract.from_image("prismo_chargetransport:latest")
         _ct_tesseract.serve()
         _HAS_CT_CONTAINER = True
     except Exception as exc:
-        import sys
-        print(f"Failed to start ChargeTransport container: {exc}", file=sys.stderr)
+        teardown_containers()
+        raise RuntimeError("Failed to start ChargeTransport container") from exc
 
     try:
         _gyptis_tesseract = Tesseract.from_image("prismo_gyptis:latest")
         _gyptis_tesseract.serve()
         _HAS_GYPTIS_CONTAINER = True
     except Exception as exc:
-        import sys
-        print(f"Failed to start gyptis container: {exc}", file=sys.stderr)
+        teardown_containers()
+        raise RuntimeError("Failed to start gyptis container") from exc
 
 
 def teardown_containers() -> None:
@@ -121,14 +117,17 @@ def _filter_jax(rho: jax.Array, H: jax.Array, H_sum: jax.Array) -> jax.Array:
 
 
 def _filter_jax_fwd(
-    rho: jax.Array, H: jax.Array, H_sum: jax.Array,
+    rho: jax.Array,
+    H: jax.Array,
+    H_sum: jax.Array,
 ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
     rho_tilde = (H @ rho) / H_sum
     return rho_tilde, (H, H_sum)
 
 
 def _filter_jax_bwd(
-    res: tuple[jax.Array, jax.Array], g: jax.Array,
+    res: tuple[jax.Array, jax.Array],
+    g: jax.Array,
 ) -> tuple[jax.Array, None, None]:
     H, H_sum = res
     return H.T @ (g / H_sum), None, None
@@ -141,7 +140,9 @@ _filter_jax.defvjp(_filter_jax_fwd, _filter_jax_bwd)
 
 
 def _ct_forward_impl(
-    doping_np: np.ndarray, bias_voltage: float, mesh_ref: MeshRef | None,
+    doping_np: np.ndarray,
+    bias_voltage: float,
+    mesh_ref: MeshRef | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if _ct_tesseract is not None:
         inputs: dict[str, Any] = {
@@ -158,7 +159,9 @@ def _ct_forward_impl(
     if _ct_api is None:
         return doping_np.copy(), doping_np.copy()
     inputs = _ct_api.InputSchema(
-        doping=doping_np, bias_voltage=bias_voltage, mesh_ref=mesh_ref,
+        doping=doping_np,
+        bias_voltage=bias_voltage,
+        mesh_ref=mesh_ref,
     )
     outputs = _ct_api.apply(inputs)
     return (
@@ -186,33 +189,45 @@ def _ct_vjp_impl(
             "holes": cot_p.tolist(),
         }
         vjp_result = _ct_tesseract.vector_jacobian_product(
-            inputs, ["doping"], ["electrons", "holes"], cotangent,
+            inputs,
+            ["doping"],
+            ["electrons", "holes"],
+            cotangent,
         )
         return np.asarray(vjp_result["doping"], dtype=doping_np.dtype)
     if _ct_api is None:
         return cot_n + cot_p
     inputs = _ct_api.InputSchema(
-        doping=doping_np, bias_voltage=bias_voltage, mesh_ref=mesh_ref,
+        doping=doping_np,
+        bias_voltage=bias_voltage,
+        mesh_ref=mesh_ref,
     )
     ct_cotangent: dict[str, np.ndarray] = {
         "electrons": cot_n,
         "holes": cot_p,
     }
     vjp_result = _ct_api.vector_jacobian_product(
-        inputs, {"doping"}, {"electrons", "holes"}, ct_cotangent,
+        inputs,
+        {"doping"},
+        {"electrons", "holes"},
+        ct_cotangent,
     )
     return np.asarray(vjp_result["doping"], dtype=doping_np.dtype)
 
 
 def _ct_call_impl(
-    doping: jax.Array, bias_voltage: float, mesh_ref: MeshRef | None,
+    doping: jax.Array,
+    bias_voltage: float,
+    mesh_ref: MeshRef | None,
 ) -> tuple[jax.Array, jax.Array]:
     if not _HAS_CT and not _HAS_CT_CONTAINER:
         return doping, doping
     return jax.pure_callback(
         _ct_forward_impl,
         (_shaped_like(doping), _shaped_like(doping)),
-        doping, bias_voltage, mesh_ref,
+        doping,
+        bias_voltage,
+        mesh_ref,
     )
 
 
@@ -221,19 +236,25 @@ def _ct_call_impl(
 
 @jax.custom_vjp
 def _ct_call_jax(
-    doping: jax.Array, bias_voltage: float, mesh_ref: MeshRef | None = None,
+    doping: jax.Array,
+    bias_voltage: float,
+    mesh_ref: MeshRef | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     return _ct_call_impl(doping, bias_voltage, mesh_ref)
 
 
 def _ct_call_fwd(
-    doping: jax.Array, bias_voltage: float, mesh_ref: MeshRef | None = None,
+    doping: jax.Array,
+    bias_voltage: float,
+    mesh_ref: MeshRef | None = None,
 ) -> tuple[
     tuple[jax.Array, jax.Array],
     tuple[jax.Array, float, MeshRef | None],
 ]:
     return _ct_call_impl(doping, bias_voltage, mesh_ref), (
-        doping, bias_voltage, mesh_ref,
+        doping,
+        bias_voltage,
+        mesh_ref,
     )
 
 
@@ -250,8 +271,11 @@ def _ct_call_bwd(
     vjp = jax.pure_callback(
         _ct_vjp_impl,
         _shaped_like(doping),
-        doping, bias_voltage, mesh_ref,
-        g_electrons, g_holes,
+        doping,
+        bias_voltage,
+        mesh_ref,
+        g_electrons,
+        g_holes,
     )
     return vjp, None, None
 
@@ -265,16 +289,8 @@ _ct_call_jax.defvjp(_ct_call_fwd, _ct_call_bwd)
 def _gyptis_forward_impl(epsilon_np: np.ndarray) -> np.ndarray:
     out_dtype = epsilon_np.dtype
     if _gyptis_tesseract is not None:
-        try:
-            result = _gyptis_tesseract.apply({"epsilon": epsilon_np.tolist()})
-            return np.asarray(result["neff_sq"], dtype=out_dtype)
-        except Exception as exc:
-            import sys
-            print(
-                f"WARNING: gyptis container apply failed ({exc}); "
-                "falling back to local/stub path",
-                file=sys.stderr,
-            )
+        result = _gyptis_tesseract.apply({"epsilon": epsilon_np.tolist()})
+        return np.asarray(result["neff_sq"], dtype=out_dtype)
     if _gyptis_api is None:
         return np.asarray(np.mean(epsilon_np), dtype=out_dtype)
     inputs = _gyptis_api.InputSchema(epsilon=epsilon_np)
@@ -283,30 +299,27 @@ def _gyptis_forward_impl(epsilon_np: np.ndarray) -> np.ndarray:
 
 
 def _gyptis_vjp_impl(
-    epsilon_np: np.ndarray, cot_neff_sq: np.ndarray,
+    epsilon_np: np.ndarray,
+    cot_neff_sq: np.ndarray,
 ) -> np.ndarray:
     n = len(epsilon_np)
     out_dtype = epsilon_np.dtype
     if _gyptis_tesseract is not None:
         cotangent = {"neff_sq": float(cot_neff_sq)}
-        try:
-            vjp_result = _gyptis_tesseract.vector_jacobian_product(
-                {"epsilon": epsilon_np.tolist()},
-                ["epsilon"], ["neff_sq"], cotangent,
-            )
-            return np.asarray(vjp_result["epsilon"], dtype=out_dtype)
-        except Exception as exc:
-            import sys
-            print(
-                f"WARNING: gyptis container VJP failed ({exc}); "
-                "falling back to local/stub path",
-                file=sys.stderr,
-            )
+        vjp_result = _gyptis_tesseract.vector_jacobian_product(
+            {"epsilon": epsilon_np.tolist()},
+            ["epsilon"],
+            ["neff_sq"],
+            cotangent,
+        )
+        return np.asarray(vjp_result["epsilon"], dtype=out_dtype)
     if _gyptis_api is None:
         return np.full(n, float(cot_neff_sq) / n, dtype=out_dtype)
     inputs = _gyptis_api.InputSchema(epsilon=epsilon_np)
     vjp_result = _gyptis_api.vector_jacobian_product(
-        inputs, {"epsilon"}, {"neff_sq"},
+        inputs,
+        {"epsilon"},
+        {"neff_sq"},
         {"neff_sq": np.asarray(cot_neff_sq)},
     )
     return np.asarray(vjp_result["epsilon"], dtype=out_dtype)
@@ -357,7 +370,8 @@ def _gyptis_call_fwd(
 
 
 def _gyptis_call_bwd(
-    res: tuple[jax.Array], g: jax.Array,
+    res: tuple[jax.Array],
+    g: jax.Array,
 ) -> tuple[jax.Array]:
     (epsilon,) = res
 
@@ -368,7 +382,8 @@ def _gyptis_call_bwd(
     vjp = jax.pure_callback(
         _gyptis_vjp_impl,
         _shaped_like(epsilon),
-        epsilon, g,
+        epsilon,
+        g,
     )
     return (vjp,)
 
@@ -396,13 +411,15 @@ def _signed_pow(x: jax.Array, p: float) -> jax.Array:
 
 
 def _signed_pow_fwd(
-    x: jax.Array, p: float,
+    x: jax.Array,
+    p: float,
 ) -> tuple[jax.Array, tuple[jax.Array, float]]:
     return _signed_pow(x, p), (x, p)
 
 
 def _signed_pow_bwd(
-    res: tuple[jax.Array, float], g: jax.Array,
+    res: tuple[jax.Array, float],
+    g: jax.Array,
 ) -> tuple[jax.Array, None]:
     x, p = res
     grad_x = jnp.where(x != 0, p * jnp.abs(x) ** (p - 1.0), 0.0)
@@ -429,9 +446,8 @@ def _sb_jax(
         coeffs.A_e * _signed_pow(dn_e, coeffs.B_e)
         + coeffs.A_h * _signed_pow(dn_h, coeffs.B_h)
     )
-    dalpha = (
-        coeffs.C_e * _signed_pow(dn_e, coeffs.D_e)
-        + coeffs.C_h * _signed_pow(dn_h, coeffs.D_h)
+    dalpha = coeffs.C_e * _signed_pow(dn_e, coeffs.D_e) + coeffs.C_h * _signed_pow(
+        dn_h, coeffs.D_h
     )
     depsilon = 2.0 * coeffs.background_index * dn
 
@@ -506,7 +522,10 @@ def pipeline(
     # 6. gyptis eigenmode solves
     bg = jnp.asarray(background_epsilon, dtype=delta_eps.dtype)
     epsilon_bg, epsilon_pert = _build_domain_epsilon(
-        delta_eps, bg, domain_count, active_domains,
+        delta_eps,
+        bg,
+        domain_count,
+        active_domains,
     )
 
     neff_sq_0 = _gyptis_call_jax(epsilon_bg)

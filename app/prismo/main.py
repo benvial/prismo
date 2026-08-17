@@ -24,14 +24,18 @@ def run(
     max_iter: int = typer.Option(200, help="Max MMA iterations"),
     ftol_rel: float = typer.Option(1e-5, help="Relative tolerance on objective"),
     mesh_path: str = typer.Option(
-        str(_DEFAULT_MESH), help="Path to waveguide .msh file",
+        str(_DEFAULT_MESH),
+        help="Path to waveguide .msh file",
     ),
     output_dir: str = typer.Option(
-        str(_DEFAULT_OUTPUT_DIR), help="Directory for output plots",
+        str(_DEFAULT_OUTPUT_DIR),
+        help="Directory for output plots",
     ),
     no_jit: bool = typer.Option(False, help="Disable JIT compilation"),
     use_containers: bool = typer.Option(
-        False, "--use-containers", help="Run tesseract components via Docker containers",
+        False,
+        "--use-containers",
+        help="Run tesseract components via Docker containers",
     ),
 ) -> None:
     """Run the PRISMO differentiable pipeline end-to-end.
@@ -100,12 +104,13 @@ def _run_pipeline(
     coords = read_mesh_node_coordinates(actual_mesh)
     if coords.shape[0] == 0:
         typer.echo(
-            "      WARNING: empty mesh (gmsh not available?). "
-            "Using synthetic 8x8 grid."
+            "      WARNING: empty mesh (gmsh not available?). Using synthetic 8x8 grid."
         )
         n_side = 8
         xs, ys = np.meshgrid(
-            np.arange(n_side) * 20e-9, np.arange(n_side) * 20e-9, indexing="xy",
+            np.arange(n_side) * 20e-9,
+            np.arange(n_side) * 20e-9,
+            indexing="xy",
         )
         coords = np.stack([xs.ravel(), ys.ravel()], axis=1)
     n_nodes = coords.shape[0]
@@ -116,7 +121,7 @@ def _run_pipeline(
     H_sparse = assemble_filter_matrix(coords, r_min=r_min)
     H_dense = jnp.asarray(H_sparse.toarray())
     H_sum = jnp.sum(H_dense, axis=1)
-    typer.echo(f"      Filter radius: {r_min*1e9:.0f} nm")
+    typer.echo(f"      Filter radius: {r_min * 1e9:.0f} nm")
 
     typer.echo("[3/4] Running NLopt MMA optimization...")
     try:
@@ -130,20 +135,20 @@ def _run_pipeline(
         )
         typer.echo(f"      Optimization complete: {len(history)} iterations")
         if history:
-            typer.echo(
-                f"      Final Delta_n_eff = {history[-1]['delta_n_eff']:+.6e}"
-            )
+            typer.echo(f"      Final Delta_n_eff = {history[-1]['delta_n_eff']:+.6e}")
     except OptimizationCancelled:
         typer.echo("      Optimization cancelled by user.")
         return
 
     if use_containers:
-        if not history:
+        if len(history) < 5:
             raise RuntimeError(
-                "Container pipeline produced no optimization evaluations"
+                f"Container pipeline completed only {len(history)} iterations; "
+                "expected at least 5"
             )
         invalid = [
-            entry for entry in history
+            entry
+            for entry in history
             if entry["delta_n_eff"] <= 0.0 or entry["grad_norm"] <= 0.0
         ]
         if invalid:
