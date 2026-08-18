@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import typer
@@ -49,13 +50,15 @@ def run(
     4. Generate paper-ready plots
     """
     from prismo.pipeline import (
+        PipelineComponents,
         init_tesseract_containers,
         teardown_containers,
     )
 
+    components: PipelineComponents | None = None
     if use_containers:
         typer.echo("Starting tesseract Docker containers...")
-        init_tesseract_containers()
+        components = init_tesseract_containers()
 
     try:
         _run_pipeline(
@@ -66,11 +69,12 @@ def run(
             output_dir=output_dir,
             no_jit=no_jit,
             use_containers=use_containers,
+            components=components,
         )
     finally:
-        if use_containers:
+        if use_containers and components is not None:
             typer.echo("Stopping tesseract containers...")
-            teardown_containers()
+            teardown_containers(components)
 
 
 def _run_pipeline(
@@ -81,6 +85,7 @@ def _run_pipeline(
     output_dir: str,
     no_jit: bool,
     use_containers: bool,
+    components: Any | None = None,
 ) -> None:
     from prismo.density_filter import assemble_filter_matrix
     from prismo.optimizer import OptimizationCancelled, optimize_doping
@@ -143,6 +148,7 @@ def _run_pipeline(
             ftol_rel=optimization_ftol_rel,
             min_mma_evaluations=5 if use_containers else 0,
             use_jit=not no_jit,
+            components=components,
         )
         typer.echo(f"      Optimization complete: {len(history)} iterations")
         if history:
@@ -179,7 +185,7 @@ def _run_pipeline(
         history=history,
         mesh_coords=coords,
         geometry=geometry,
-        pipeline_fn=partial(pipeline_fn, polarity=polarity),
+        pipeline_fn=partial(pipeline_fn, polarity=polarity, components=components),
         ftol_rel=optimization_ftol_rel,
         gradient_validation_directions=1 if use_containers else 3,
         gradient_validation_steps=(

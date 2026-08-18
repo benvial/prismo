@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import importlib.util
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -48,21 +49,10 @@ def _load_tesseract_api(name: str) -> Any | None:
         return None
 
 
-_ct_api: Any | None = _load_tesseract_api("chargetransport")
-_gyptis_api: Any | None = _load_tesseract_api("gyptis")
-
 _DEFAULT_BACKGROUND_EPSILON: float = 3.4757**2
 _DEFAULT_DOMAIN_COUNT: int = 3
 _M3_TO_CM3: float = 1e-6
 _DEFAULT_COEFFS: SorefBennettCoefficients = SorefBennettCoefficients()
-
-_HAS_CT: bool = _ct_api is not None
-_HAS_GYPTIS: bool = _gyptis_api is not None
-
-_ct_tesseract: Any | None = None
-_gyptis_tesseract: Any | None = None
-_HAS_CT_CONTAINER: bool = False
-_HAS_GYPTIS_CONTAINER: bool = False
 
 
 @dataclass
@@ -75,27 +65,9 @@ class _PhaseTiming:
     cold_seconds: float = 0.0
 
 
-_background_neff_sq: dict[tuple[tuple[int, ...], str, bytes], np.ndarray] = {}
 _timing_lock = RLock()
 _active_phase_timing: dict[str, _PhaseTiming] | None = None
 _seen_timing_phases: set[str] = set()
-
-
-def clear_pipeline_runtime_state() -> None:
-    """Clear lifecycle-owned background modes and timing state.
-
-    A background eigenmode is valid only while its component lifecycle and
-    immutable optical configuration remain unchanged. Container startup and
-    teardown both begin a new lifecycle.
-    """
-    global _active_phase_timing
-    with _timing_lock:
-        _background_neff_sq.clear()
-        _active_phase_timing = None
-        _seen_timing_phases.clear()
-    shutdown_worker = getattr(_ct_api, "shutdown", None)
-    if callable(shutdown_worker):
-        shutdown_worker()
 
 
 def begin_pipeline_callback_timing() -> None:
@@ -140,15 +112,14 @@ def _record_phase_timing(name: str, started_at: float) -> None:
             timing.cold_seconds += elapsed
 
 
-def init_tesseract_containers() -> None:
-    """Start tesseract Docker containers for ChargeTransport and gyptis.
+def init_tesseract_containers() -> PipelineComponents:
+    """Start tesseract Docker containers and bundle the live components.
 
-    Must be called before optimization. Containers stay running until
-    ``teardown_containers()`` is called. Startup is all-or-nothing so a
+    Returns a :class:`PipelineComponents` the caller owns and passes to
+    ``pipeline()``. Containers stay running until the bundle's ``close()`` is
+    called (see ``teardown_containers``). Startup is all-or-nothing so a
     container run can never silently use local component stubs.
     """
-    global _ct_tesseract, _gyptis_tesseract, _HAS_CT_CONTAINER, _HAS_GYPTIS_CONTAINER
-    clear_pipeline_runtime_state()
     try:
         from tesseract_core import Tesseract  # type: ignore[import-untyped]
     except ImportError as exc:
@@ -156,35 +127,38 @@ def init_tesseract_containers() -> None:
             "tesseract_core is required for container pipeline runs"
         ) from exc
 
+    closers: list[Callable[[], None]] = []
     try:
-        _ct_tesseract = Tesseract.from_image("prismo_chargetransport:latest")
-        _ct_tesseract.serve()
-        _HAS_CT_CONTAINER = True
+        ct_tesseract = Tesseract.from_image("prismo_chargetransport:latest")
+        ct_tesseract.serve()
+        closers.append(ct_tesseract.teardown)
     except Exception as exc:
-        teardown_containers()
+        for close in reversed(closers):
+            close()
         raise RuntimeError("Failed to start ChargeTransport container") from exc
 
     try:
-        _gyptis_tesseract = Tesseract.from_image("prismo_gyptis:latest")
-        _gyptis_tesseract.serve()
-        _HAS_GYPTIS_CONTAINER = True
+        gyptis_tesseract = Tesseract.from_image("prismo_gyptis:latest")
+        gyptis_tesseract.serve()
+        closers.append(gyptis_tesseract.teardown)
     except Exception as exc:
-        teardown_containers()
+        for close in reversed(closers):
+            close()
         raise RuntimeError("Failed to start gyptis container") from exc
 
+    chargetransport = build_chargetransport_component(container=ct_tesseract)
+    gyptis, gyptis_background = build_gyptis_components(container=gyptis_tesseract)
+    return PipelineComponents(
+        chargetransport=chargetransport,
+        gyptis=gyptis,
+        gyptis_background=gyptis_background,
+        closers=tuple(closers),
+    )
 
-def teardown_containers() -> None:
-    """Stop and remove running tesseract containers."""
-    global _ct_tesseract, _gyptis_tesseract, _HAS_CT_CONTAINER, _HAS_GYPTIS_CONTAINER
-    if _ct_tesseract is not None:
-        _ct_tesseract.teardown()
-        _ct_tesseract = None
-    _HAS_CT_CONTAINER = False
-    if _gyptis_tesseract is not None:
-        _gyptis_tesseract.teardown()
-        _gyptis_tesseract = None
-    _HAS_GYPTIS_CONTAINER = False
-    clear_pipeline_runtime_state()
+
+def teardown_containers(components: PipelineComponents) -> None:
+    """Stop and remove the running tesseract containers owned by ``components``."""
+    components.close()
 
 
 def _shaped_like(arr: jax.Array) -> jax.ShapeDtypeStruct:
@@ -223,7 +197,7 @@ def _filter_jax_bwd(
 _filter_jax.defvjp(_filter_jax_fwd, _filter_jax_bwd)
 
 
-# -- ChargeTransport external implementation -------------------------------------
+# -- ChargeTransport component ---------------------------------------------------
 
 
 def _ct_container_inputs(
@@ -238,86 +212,6 @@ def _ct_container_inputs(
     if mesh_ref is not None:
         inputs["mesh_ref"] = mesh_ref.model_dump()
     return inputs
-
-
-def _ct_forward_impl(
-    doping_np: np.ndarray,
-    bias_voltage: float,
-    mesh_ref: MeshRef | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    started_at = time.perf_counter()
-    phase = f"ct_forward_{bias_voltage:g}V"
-
-    def from_container(tess: Any) -> tuple[np.ndarray, np.ndarray]:
-        result = tess.apply(_ct_container_inputs(doping_np, bias_voltage, mesh_ref))
-        return (
-            np.asarray(result["electrons"], dtype=doping_np.dtype),
-            np.asarray(result["holes"], dtype=doping_np.dtype),
-        )
-
-    def from_local(api: Any) -> tuple[np.ndarray, np.ndarray]:
-        outputs = api.apply(
-            api.InputSchema(
-                doping=doping_np, bias_voltage=bias_voltage, mesh_ref=mesh_ref
-            )
-        )
-        return (
-            np.asarray(outputs.electrons, dtype=doping_np.dtype),
-            np.asarray(outputs.holes, dtype=doping_np.dtype),
-        )
-
-    try:
-        return invoke_tesseract(
-            _ct_tesseract,
-            _ct_api,
-            container_call=from_container,
-            local_call=from_local,
-        )
-    finally:
-        _record_phase_timing(phase, started_at)
-
-
-def _ct_vjp_impl(
-    doping_np: np.ndarray,
-    cotangent: tuple[np.ndarray, np.ndarray],
-    bias_voltage: float,
-    mesh_ref: MeshRef | None = None,
-) -> np.ndarray:
-    cot_n, cot_p = cotangent
-    started_at = time.perf_counter()
-
-    def from_container(tess: Any) -> np.ndarray:
-        vjp_result = tess.vector_jacobian_product(
-            _ct_container_inputs(doping_np, bias_voltage, mesh_ref),
-            ["doping"],
-            ["electrons", "holes"],
-            {"electrons": cot_n.tolist(), "holes": cot_p.tolist()},
-        )
-        return np.asarray(vjp_result["doping"], dtype=doping_np.dtype)
-
-    def from_local(api: Any) -> np.ndarray:
-        vjp_result = api.vector_jacobian_product(
-            api.InputSchema(
-                doping=doping_np, bias_voltage=bias_voltage, mesh_ref=mesh_ref
-            ),
-            {"doping"},
-            {"electrons", "holes"},
-            {"electrons": cot_n, "holes": cot_p},
-        )
-        return np.asarray(vjp_result["doping"], dtype=doping_np.dtype)
-
-    try:
-        return invoke_tesseract(
-            _ct_tesseract,
-            _ct_api,
-            container_call=from_container,
-            local_call=from_local,
-        )
-    finally:
-        _record_phase_timing("ct_vjp", started_at)
-
-
-# -- ChargeTransport JAX wrapper -------------------------------------------------
 
 
 def _ct_out_struct(
@@ -346,96 +240,118 @@ def _ct_stub_vjp(
     return g_electrons + g_holes
 
 
-_ct_call_jax = DifferentiableComponent(
-    forward=_ct_forward_impl,
-    vjp=_ct_vjp_impl,
-    out_struct=_ct_out_struct,
-    stub_forward=_ct_stub_forward,
-    stub_vjp=_ct_stub_vjp,
-    available=lambda: _HAS_CT or _HAS_CT_CONTAINER,
-)
+def build_chargetransport_component(
+    container: Any | None = None,
+    local_api: Any | None = None,
+) -> DifferentiableComponent:
+    """Build the ChargeTransport component bound to one backend.
 
+    ``container`` is a running Tesseract handle; ``local_api`` an in-process
+    ``tesseract_api`` module. With neither, the component is a differentiable
+    identity stub. The backend is captured here, not read from module globals.
+    """
 
-# -- gyptis external implementation ----------------------------------------------
-
-
-def _gyptis_forward_impl(
-    epsilon_np: np.ndarray,
-    *,
-    phase: str = "gyptis_perturbed_forward",
-) -> np.ndarray:
-    out_dtype = epsilon_np.dtype
-    started_at = time.perf_counter()
-
-    def from_container(tess: Any) -> np.ndarray:
-        result = tess.apply({"epsilon": epsilon_np.tolist()})
-        return np.asarray(result["neff_sq"], dtype=out_dtype)
-
-    def from_local(api: Any) -> np.ndarray:
-        outputs = api.apply(api.InputSchema(epsilon=epsilon_np))
-        return np.asarray(outputs.neff_sq, dtype=out_dtype)
-
-    try:
-        return invoke_tesseract(
-            _gyptis_tesseract,
-            _gyptis_api,
-            container_call=from_container,
-            local_call=from_local,
-        )
-    finally:
-        _record_phase_timing(phase, started_at)
-
-
-def _gyptis_background_forward_impl(epsilon_np: np.ndarray) -> np.ndarray:
-    """Evaluate immutable background epsilon once per component lifecycle."""
-    key = (epsilon_np.shape, epsilon_np.dtype.str, epsilon_np.tobytes())
-    with _timing_lock:
-        cached = _background_neff_sq.get(key)
-    if cached is not None:
+    def forward(
+        doping_np: np.ndarray,
+        bias_voltage: float,
+        mesh_ref: MeshRef | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         started_at = time.perf_counter()
-        _record_phase_timing("gyptis_background_cache", started_at)
-        return cached.copy()
+        phase = f"ct_forward_{bias_voltage:g}V"
 
-    result = _gyptis_forward_impl(epsilon_np, phase="gyptis_background_forward")
-    with _timing_lock:
-        _background_neff_sq[key] = result.copy()
-    return result
+        def from_container(tess: Any) -> tuple[np.ndarray, np.ndarray]:
+            result = tess.apply(
+                _ct_container_inputs(doping_np, bias_voltage, mesh_ref)
+            )
+            return (
+                np.asarray(result["electrons"], dtype=doping_np.dtype),
+                np.asarray(result["holes"], dtype=doping_np.dtype),
+            )
+
+        def from_local(api: Any) -> tuple[np.ndarray, np.ndarray]:
+            outputs = api.apply(
+                api.InputSchema(
+                    doping=doping_np, bias_voltage=bias_voltage, mesh_ref=mesh_ref
+                )
+            )
+            return (
+                np.asarray(outputs.electrons, dtype=doping_np.dtype),
+                np.asarray(outputs.holes, dtype=doping_np.dtype),
+            )
+
+        try:
+            return invoke_tesseract(
+                container,
+                local_api,
+                container_call=from_container,
+                local_call=from_local,
+            )
+        finally:
+            _record_phase_timing(phase, started_at)
+
+    def vjp(
+        doping_np: np.ndarray,
+        cotangent: tuple[np.ndarray, np.ndarray],
+        bias_voltage: float,
+        mesh_ref: MeshRef | None = None,
+    ) -> np.ndarray:
+        cot_n, cot_p = cotangent
+        started_at = time.perf_counter()
+
+        def from_container(tess: Any) -> np.ndarray:
+            vjp_result = tess.vector_jacobian_product(
+                _ct_container_inputs(doping_np, bias_voltage, mesh_ref),
+                ["doping"],
+                ["electrons", "holes"],
+                {"electrons": cot_n.tolist(), "holes": cot_p.tolist()},
+            )
+            return np.asarray(vjp_result["doping"], dtype=doping_np.dtype)
+
+        def from_local(api: Any) -> np.ndarray:
+            vjp_result = api.vector_jacobian_product(
+                api.InputSchema(
+                    doping=doping_np, bias_voltage=bias_voltage, mesh_ref=mesh_ref
+                ),
+                {"doping"},
+                {"electrons", "holes"},
+                {"electrons": cot_n, "holes": cot_p},
+            )
+            return np.asarray(vjp_result["doping"], dtype=doping_np.dtype)
+
+        try:
+            return invoke_tesseract(
+                container,
+                local_api,
+                container_call=from_container,
+                local_call=from_local,
+            )
+        finally:
+            _record_phase_timing("ct_vjp", started_at)
+
+    return DifferentiableComponent(
+        forward=forward,
+        vjp=vjp,
+        out_struct=_ct_out_struct,
+        stub_forward=_ct_stub_forward,
+        stub_vjp=_ct_stub_vjp,
+        available=lambda: container is not None or local_api is not None,
+    )
 
 
-def _gyptis_vjp_impl(
-    epsilon_np: np.ndarray,
-    cot_neff_sq: np.ndarray,
-) -> np.ndarray:
-    out_dtype = epsilon_np.dtype
-    started_at = time.perf_counter()
+# -- gyptis component ------------------------------------------------------------
 
-    def from_container(tess: Any) -> np.ndarray:
-        vjp_result = tess.vector_jacobian_product(
-            {"epsilon": epsilon_np.tolist()},
-            ["epsilon"],
-            ["neff_sq"],
-            {"neff_sq": float(cot_neff_sq)},
-        )
-        return np.asarray(vjp_result["epsilon"], dtype=out_dtype)
 
-    def from_local(api: Any) -> np.ndarray:
-        vjp_result = api.vector_jacobian_product(
-            api.InputSchema(epsilon=epsilon_np),
-            {"epsilon"},
-            {"neff_sq"},
-            {"neff_sq": np.asarray(cot_neff_sq)},
-        )
-        return np.asarray(vjp_result["epsilon"], dtype=out_dtype)
+def _gyptis_out_struct(epsilon: jax.Array) -> jax.ShapeDtypeStruct:
+    return _scalar_like(epsilon)
 
-    try:
-        return invoke_tesseract(
-            _gyptis_tesseract,
-            _gyptis_api,
-            container_call=from_container,
-            local_call=from_local,
-        )
-    finally:
-        _record_phase_timing("gyptis_vjp", started_at)
+
+def _gyptis_stub_forward(epsilon: jax.Array) -> jax.Array:
+    return jnp.mean(epsilon)
+
+
+def _gyptis_stub_vjp(epsilon: jax.Array, g: jax.Array) -> jax.Array:
+    n = epsilon.shape[0]
+    return jnp.full_like(epsilon, g / n)
 
 
 def _gyptis_background_vjp_impl(
@@ -444,6 +360,117 @@ def _gyptis_background_vjp_impl(
 ) -> np.ndarray:
     """Background permittivity is rho-independent: its cotangent is zero."""
     return np.zeros_like(epsilon_np)
+
+
+def _gyptis_background_stub_vjp(epsilon: jax.Array, g: jax.Array) -> jax.Array:
+    return jnp.zeros_like(epsilon)
+
+
+def build_gyptis_components(
+    container: Any | None = None,
+    local_api: Any | None = None,
+) -> tuple[DifferentiableComponent, DifferentiableComponent]:
+    """Build the perturbed and background gyptis components for one backend.
+
+    Both share a background eigenmode cache owned by this call, so the
+    rho-independent background solve runs once per component lifecycle. The
+    backend is captured here, not read from module globals.
+    """
+    background_cache: dict[tuple[tuple[int, ...], str, bytes], np.ndarray] = {}
+
+    def available() -> bool:
+        return container is not None or local_api is not None
+
+    def forward(
+        epsilon_np: np.ndarray,
+        *,
+        phase: str = "gyptis_perturbed_forward",
+    ) -> np.ndarray:
+        out_dtype = epsilon_np.dtype
+        started_at = time.perf_counter()
+
+        def from_container(tess: Any) -> np.ndarray:
+            result = tess.apply({"epsilon": epsilon_np.tolist()})
+            return np.asarray(result["neff_sq"], dtype=out_dtype)
+
+        def from_local(api: Any) -> np.ndarray:
+            outputs = api.apply(api.InputSchema(epsilon=epsilon_np))
+            return np.asarray(outputs.neff_sq, dtype=out_dtype)
+
+        try:
+            return invoke_tesseract(
+                container,
+                local_api,
+                container_call=from_container,
+                local_call=from_local,
+            )
+        finally:
+            _record_phase_timing(phase, started_at)
+
+    def background_forward(epsilon_np: np.ndarray) -> np.ndarray:
+        key = (epsilon_np.shape, epsilon_np.dtype.str, epsilon_np.tobytes())
+        with _timing_lock:
+            cached = background_cache.get(key)
+        if cached is not None:
+            started_at = time.perf_counter()
+            _record_phase_timing("gyptis_background_cache", started_at)
+            return cached.copy()
+
+        result = forward(epsilon_np, phase="gyptis_background_forward")
+        with _timing_lock:
+            background_cache[key] = result.copy()
+        return result
+
+    def vjp(epsilon_np: np.ndarray, cot_neff_sq: np.ndarray) -> np.ndarray:
+        out_dtype = epsilon_np.dtype
+        started_at = time.perf_counter()
+
+        def from_container(tess: Any) -> np.ndarray:
+            vjp_result = tess.vector_jacobian_product(
+                {"epsilon": epsilon_np.tolist()},
+                ["epsilon"],
+                ["neff_sq"],
+                {"neff_sq": float(cot_neff_sq)},
+            )
+            return np.asarray(vjp_result["epsilon"], dtype=out_dtype)
+
+        def from_local(api: Any) -> np.ndarray:
+            vjp_result = api.vector_jacobian_product(
+                api.InputSchema(epsilon=epsilon_np),
+                {"epsilon"},
+                {"neff_sq"},
+                {"neff_sq": np.asarray(cot_neff_sq)},
+            )
+            return np.asarray(vjp_result["epsilon"], dtype=out_dtype)
+
+        try:
+            return invoke_tesseract(
+                container,
+                local_api,
+                container_call=from_container,
+                local_call=from_local,
+            )
+        finally:
+            _record_phase_timing("gyptis_vjp", started_at)
+
+    perturbed = DifferentiableComponent(
+        forward=forward,
+        vjp=vjp,
+        out_struct=_gyptis_out_struct,
+        stub_forward=_gyptis_stub_forward,
+        stub_vjp=_gyptis_stub_vjp,
+        available=available,
+    )
+    # Background solve: rho-independent, so it contributes a zero cotangent.
+    background = DifferentiableComponent(
+        forward=background_forward,
+        vjp=_gyptis_background_vjp_impl,
+        out_struct=_gyptis_out_struct,
+        stub_forward=_gyptis_stub_forward,
+        stub_vjp=_gyptis_background_stub_vjp,
+        available=available,
+    )
+    return perturbed, background
 
 
 def _build_domain_epsilon(
@@ -466,49 +493,55 @@ def _build_domain_epsilon(
     return epsilon_bg, epsilon_pert
 
 
-# -- gyptis JAX wrappers ---------------------------------------------------------
+# -- Components bundle -----------------------------------------------------------
 
 
-def _gyptis_out_struct(epsilon: jax.Array) -> jax.ShapeDtypeStruct:
-    return _scalar_like(epsilon)
+@dataclass(frozen=True)
+class PipelineComponents:
+    """The differentiable components one ``pipeline()`` call composes.
+
+    Carries all backend state -- container handles or local api modules and
+    the per-lifecycle background eigenmode cache -- so ``pipeline()`` reads no
+    module globals. The container lifecycle builds one on startup and releases
+    it via ``close()``.
+    """
+
+    chargetransport: DifferentiableComponent
+    gyptis: DifferentiableComponent
+    gyptis_background: DifferentiableComponent
+    closers: tuple[Callable[[], None], ...] = field(default=())
+
+    def close(self) -> None:
+        """Release owned resources (containers, worker processes)."""
+        for close in reversed(self.closers):
+            close()
 
 
-def _gyptis_stub_forward(epsilon: jax.Array) -> jax.Array:
-    return jnp.mean(epsilon)
+def build_default_components() -> PipelineComponents:
+    """Build the default in-process components from the local tesseract apis.
+
+    Loads each component's ``tesseract_api`` module if importable; otherwise
+    the component is a differentiable identity stub. Used when ``pipeline()``
+    is called without an explicit bundle (no containers running).
+    """
+    ct_api = _load_tesseract_api("chargetransport")
+    gyptis_api = _load_tesseract_api("gyptis")
+    chargetransport = build_chargetransport_component(local_api=ct_api)
+    gyptis, gyptis_background = build_gyptis_components(local_api=gyptis_api)
+
+    closers: list[Callable[[], None]] = []
+    shutdown_worker = getattr(ct_api, "shutdown", None)
+    if callable(shutdown_worker):
+        closers.append(shutdown_worker)
+    return PipelineComponents(
+        chargetransport=chargetransport,
+        gyptis=gyptis,
+        gyptis_background=gyptis_background,
+        closers=tuple(closers),
+    )
 
 
-def _gyptis_stub_vjp(epsilon: jax.Array, g: jax.Array) -> jax.Array:
-    n = epsilon.shape[0]
-    return jnp.full_like(epsilon, g / n)
-
-
-def _gyptis_background_stub_vjp(epsilon: jax.Array, g: jax.Array) -> jax.Array:
-    return jnp.zeros_like(epsilon)
-
-
-def _gyptis_available() -> bool:
-    return _HAS_GYPTIS or _HAS_GYPTIS_CONTAINER
-
-
-_gyptis_call_jax = DifferentiableComponent(
-    forward=_gyptis_forward_impl,
-    vjp=_gyptis_vjp_impl,
-    out_struct=_gyptis_out_struct,
-    stub_forward=_gyptis_stub_forward,
-    stub_vjp=_gyptis_stub_vjp,
-    available=_gyptis_available,
-)
-
-
-# Background solve: rho-independent, so it contributes a zero cotangent to rho.
-_gyptis_background_call_jax = DifferentiableComponent(
-    forward=_gyptis_background_forward_impl,
-    vjp=_gyptis_background_vjp_impl,
-    out_struct=_gyptis_out_struct,
-    stub_forward=_gyptis_stub_forward,
-    stub_vjp=_gyptis_background_stub_vjp,
-    available=_gyptis_available,
-)
+_DEFAULT_COMPONENTS: PipelineComponents = build_default_components()
 
 
 # 1 cm^-3 = 1e6 m^-3: ChargeTransport output -> Soref-Bennett input.
@@ -586,6 +619,7 @@ def pipeline(
     background_epsilon: float | None = None,
     domain_count: int = _DEFAULT_DOMAIN_COUNT,
     active_domains: tuple[int, ...] | None = None,
+    components: PipelineComponents | None = None,
 ) -> jax.Array:
     """Rho -> Delta n_eff differentiable pipeline.
 
@@ -601,12 +635,16 @@ def pipeline(
             (default: ``n_si^2 = 3.4757^2``).
         domain_count: Number of gyptis material domains.
         active_domains: Zero-based gyptis domains receiving the perturbation.
+        components: Live differentiable components to compose. Defaults to the
+            in-process components built from the local tesseract apis.
 
     Returns:
         Smooth positive effective-index shift magnitude between 0 V and -5 V.
     """
     if background_epsilon is None:
         background_epsilon = _DEFAULT_BACKGROUND_EPSILON
+    if components is None:
+        components = _DEFAULT_COMPONENTS
 
     rho = jnp.asarray(rho)
 
@@ -628,10 +666,10 @@ def pipeline(
         doping = doping * jnp.asarray(polarity, dtype=dtype)
 
     # 3. ChargeTransport at equilibrium (0 V)
-    n0, p0 = _ct_call_jax(doping, 0.0, mesh_ref)
+    n0, p0 = components.chargetransport(doping, 0.0, mesh_ref)
 
     # 4. ChargeTransport at reverse bias (-5 V)
-    n1, p1 = _ct_call_jax(doping, -5.0, mesh_ref)
+    n1, p1 = components.chargetransport(doping, -5.0, mesh_ref)
 
     # CT reports carrier densities in cm^-3 (same unit system as the doping
     # input); Soref-Bennett consumes m^-3 per CarrierDensityField. Convert
@@ -655,8 +693,8 @@ def pipeline(
 
     # Background epsilon does not depend on rho. Cache its eigenmode while
     # keeping the perturbed solve and eigen-adjoint live for every rho.
-    neff_sq_0 = _gyptis_background_call_jax(epsilon_bg)
-    neff_sq_1 = _gyptis_call_jax(epsilon_pert)
+    neff_sq_0 = components.gyptis_background(epsilon_bg)
+    neff_sq_1 = components.gyptis(epsilon_pert)
 
     neff_0 = jnp.sqrt(jnp.maximum(neff_sq_0, 0.0))
     neff_1 = jnp.sqrt(jnp.maximum(neff_sq_1, 0.0))

@@ -21,6 +21,7 @@ import numpy as np
 
 from prismo.density_filter import assemble_filter_matrix
 from prismo.pipeline import (
+    PipelineComponents,
     begin_pipeline_callback_timing,
     finish_pipeline_callback_timing,
     pipeline,
@@ -47,6 +48,7 @@ def optimize_doping(
     ftol_rel: float = 1e-5,
     min_mma_evaluations: int = 0,
     use_jit: bool = True,
+    components: PipelineComponents | None = None,
 ) -> tuple[np.ndarray, list[_HistoryEntry]]:
     """Run the NLopt MMA optimization loop.
 
@@ -70,6 +72,8 @@ def optimize_doping(
         min_mma_evaluations: Minimum objective evaluations completed by MMA
             before falling back to CCSAQ after a roundoff-limited solve.
         use_jit: JIT-compile combined objective and gradient computation.
+        components: Live pipeline components to compose. Defaults to the
+            in-process components (see ``pipeline``).
 
     Returns:
         ``(rho_opt, history)`` where ``rho_opt`` is the optimized design
@@ -100,7 +104,9 @@ def optimize_doping(
         H_sum = jnp.sum(H, axis=1)
 
     def _pipe(rho: jax.Array) -> jax.Array:
-        return pipeline(rho, H=H, H_sum=H_sum, polarity=polarity)
+        return pipeline(
+            rho, H=H, H_sum=H_sum, polarity=polarity, components=components
+        )
 
     value_and_grad_fn = jax.value_and_grad(_pipe)
     if use_jit:

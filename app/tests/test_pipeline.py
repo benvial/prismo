@@ -3,17 +3,32 @@
 Ref: ticket 14 -- end-to-end pipeline via JAX composition.
 """
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp  # noqa: E402
 from prismo.density_filter import assemble_filter_matrix  # noqa: E402
-from prismo.pipeline import _build_domain_epsilon, _sb_jax, pipeline  # noqa: E402
+from prismo.pipeline import (  # noqa: E402
+    PipelineComponents,
+    _build_domain_epsilon,
+    _sb_jax,
+    build_chargetransport_component,
+    build_default_components,
+    build_gyptis_components,
+    pipeline,
+)
 from prismo.soref_bennett import soref_bennett as _sb_numpy  # noqa: E402
 from prismo_shared.schemas import CarrierDensityField  # noqa: E402
 
 RNG = np.random.default_rng(0)
+
+
+def _components_with(**overrides) -> PipelineComponents:
+    """Default in-process components with specific components replaced."""
+    return replace(build_default_components(), **overrides)
 
 
 def test_pipeline_enables_float64() -> None:
@@ -152,7 +167,7 @@ class TestPipelineStub:
         assert result.ndim == 0
         assert jnp.isfinite(result)
 
-    def test_ct_units_converted_for_soref(self, rho, monkeypatch):
+    def test_ct_units_converted_for_soref(self, rho):
         """CT reports carriers in cm^-3; Soref-Bennett expects m^-3.
 
         Stub the external solver boundary: 0 V returns 1e18 cm^-3 carriers,
@@ -172,9 +187,7 @@ class TestPipelineStub:
                 return hi, hi
             return lo, lo
 
-        monkeypatch.setattr(pl, "_ct_call_jax", fake_ct)
-
-        result = pipeline(rho)
+        result = pipeline(rho, components=_components_with(chargetransport=fake_ct))
 
         coeffs = pl._DEFAULT_COEFFS
         dN = 1e18  # cm^-3 depletion
@@ -186,10 +199,8 @@ class TestPipelineStub:
         np.testing.assert_allclose(float(result), exp_result, rtol=1e-6)
         assert float(result) > 0.0
 
-    def test_polarity_forms_mixed_sign_pn_doping(self, monkeypatch):
+    def test_polarity_forms_mixed_sign_pn_doping(self):
         """Container pipeline supplies a fixed P/N polarity per mesh node."""
-        import prismo.pipeline as pl
-
         received: list[np.ndarray] = []
 
         def fake_ct(doping, bias_voltage, mesh_ref=None):
@@ -201,11 +212,10 @@ class TestPipelineStub:
             )
             return carriers, carriers
 
-        monkeypatch.setattr(pl, "_ct_call_jax", fake_ct)
-
-        result = pl.pipeline(
+        result = pipeline(
             jnp.asarray([0.0, 1.0]),
             polarity=jnp.asarray([-1.0, 1.0]),
+            components=_components_with(chargetransport=fake_ct),
         )
 
         np.testing.assert_allclose(received[0], [-1e14, 1e21])
@@ -214,10 +224,8 @@ class TestPipelineStub:
 
     def test_effective_index_objective_is_positive_for_either_shift_direction(
         self,
-        monkeypatch,
     ):
         """Optimization maximizes phase-shift magnitude, not its mode-sign."""
-        import prismo.pipeline as pl
 
         def fake_ct(doping, bias_voltage, mesh_ref=None):
             carriers = jnp.where(
@@ -227,26 +235,23 @@ class TestPipelineStub:
             )
             return carriers, carriers
 
-        monkeypatch.setattr(pl, "_ct_call_jax", fake_ct)
-
-        result = pl.pipeline(jnp.asarray([0.25, 0.25]))
+        result = pipeline(
+            jnp.asarray([0.25, 0.25]),
+            components=_components_with(chargetransport=fake_ct),
+        )
 
         assert float(result) > 0.0
 
-    def test_effective_index_objective_has_zero_gradient_at_zero_shift(
-        self,
-        monkeypatch,
-    ):
+    def test_effective_index_objective_has_zero_gradient_at_zero_shift(self):
         """The positive phase-shift objective stays differentiable at zero."""
-        import prismo.pipeline as pl
 
         def fake_ct(doping, bias_voltage, mesh_ref=None):
             return doping, doping
 
-        monkeypatch.setattr(pl, "_ct_call_jax", fake_ct)
-
+        components = _components_with(chargetransport=fake_ct)
         rho = jnp.asarray([0.25, 0.25])
-        np.testing.assert_allclose(jax.grad(pl.pipeline)(rho), 0.0, atol=1e-20)
+        grad = jax.grad(lambda r: pipeline(r, components=components))(rho)
+        np.testing.assert_allclose(grad, 0.0, atol=1e-20)
 
     def test_domain_epsilon_keeps_inactive_domains_at_background(self):
         delta = jnp.asarray([1.0, 3.0, 5.0])
@@ -301,9 +306,8 @@ class TestPipelineStub:
 
 
 class TestContainerPipeline:
-    def test_background_eigenmode_is_cached_across_pipeline_calls(self, monkeypatch):
+    def test_background_eigenmode_is_cached_across_pipeline_calls(self):
         """Only the rho-independent background solve survives a callback."""
-        import prismo.pipeline as pl
 
         class FakeChargeTransport:
             def apply(self, inputs):
@@ -323,25 +327,30 @@ class TestContainerPipeline:
                 self.epsilon_calls.append(epsilon)
                 return {"neff_sq": float(np.mean(epsilon))}
 
-        ct = FakeChargeTransport()
         gyptis = FakeGyptis()
-        pl.clear_pipeline_runtime_state()
-        monkeypatch.setattr(pl, "_ct_tesseract", ct)
-        monkeypatch.setattr(pl, "_gyptis_tesseract", gyptis)
-        monkeypatch.setattr(pl, "_HAS_CT_CONTAINER", True)
-        monkeypatch.setattr(pl, "_HAS_GYPTIS_CONTAINER", True)
 
+        def build_components() -> PipelineComponents:
+            chargetransport = build_chargetransport_component(
+                container=FakeChargeTransport()
+            )
+            perturbed, background = build_gyptis_components(container=gyptis)
+            return PipelineComponents(
+                chargetransport=chargetransport,
+                gyptis=perturbed,
+                gyptis_background=background,
+            )
+
+        components = build_components()
         rho = jnp.full((4,), 0.25)
-        pipeline(rho)
-        pipeline(rho)
+        pipeline(rho, components=components)
+        pipeline(rho, components=components)
 
         # Two perturbed solves plus one reused rho-independent background solve.
         assert len(gyptis.epsilon_calls) == 3
 
-        pl.clear_pipeline_runtime_state()
-        pipeline(rho)
+        # A fresh bundle starts a new lifecycle: its background cache is empty.
+        pipeline(rho, components=build_components())
         assert len(gyptis.epsilon_calls) == 5
-        pl.clear_pipeline_runtime_state()
 
     def test_container_startup_failure_raises(self, monkeypatch):
         """Container mode must not continue through a local stub."""
@@ -360,26 +369,21 @@ class TestContainerPipeline:
             "tesseract_core",
             types.SimpleNamespace(Tesseract=FailingTesseract),
         )
-        monkeypatch.setattr(pl, "_ct_tesseract", None)
-        monkeypatch.setattr(pl, "_gyptis_tesseract", None)
-        monkeypatch.setattr(pl, "_HAS_CT_CONTAINER", False)
-        monkeypatch.setattr(pl, "_HAS_GYPTIS_CONTAINER", False)
 
         with pytest.raises(RuntimeError, match="ChargeTransport container"):
             pl.init_tesseract_containers()
 
-    def test_gyptis_container_failure_does_not_use_local_stub(self, monkeypatch):
-        """A failed container request must abort the container pipeline."""
-        import prismo.pipeline as pl
+    def test_gyptis_container_failure_does_not_use_local_stub(self):
+        """A failed container request must abort rather than fall to a stub."""
 
         class FailingTesseract:
             def apply(self, inputs):
                 raise RuntimeError("HTTP 500")
 
-        monkeypatch.setattr(pl, "_gyptis_tesseract", FailingTesseract())
+        perturbed, _ = build_gyptis_components(container=FailingTesseract())
 
         with pytest.raises(RuntimeError, match="HTTP 500"):
-            pl._gyptis_forward_impl(np.array([12.0, 12.0]))
+            perturbed.forward(np.array([12.0, 12.0]))
 
 
 class TestPipelineWithFilter:
@@ -571,15 +575,11 @@ class TestPipelineShapeValidation:
         assert dalpha.shape == rho.shape
 
     def test_gyptis_scalar_output(self, rho):
-        from prismo.pipeline import _gyptis_call_jax
-
-        result = _gyptis_call_jax(rho)
+        result = build_default_components().gyptis(rho)
         assert result.ndim == 0
         assert jnp.isfinite(result)
 
     def test_ct_call_output_shapes(self, rho):
-        from prismo.pipeline import _ct_call_jax
-
-        n_out, p_out = _ct_call_jax(rho, 0.0)
+        n_out, p_out = build_default_components().chargetransport(rho, 0.0)
         assert n_out.shape == rho.shape
         assert p_out.shape == rho.shape

@@ -151,11 +151,13 @@ class TestOptimizeDopingAnalytical:
             assert entry["callback_time"] >= 0.0
             assert isinstance(entry["phase_timing"], dict)
 
-    def test_combined_callback_uses_public_component_calls_once(
-        self, rho_initial, monkeypatch
-    ):
+    def test_combined_callback_uses_public_component_calls_once(self, rho_initial):
         """One callback makes two bias forwards and their matching VJPs."""
-        import prismo.pipeline as pl
+        from prismo.pipeline import (
+            PipelineComponents,
+            build_chargetransport_component,
+            build_gyptis_components,
+        )
 
         class FakeChargeTransport:
             def __init__(self):
@@ -206,16 +208,18 @@ class TestOptimizeDopingAnalytical:
 
         ct = FakeChargeTransport()
         gyptis = FakeGyptis()
-        pl.clear_pipeline_runtime_state()
-        monkeypatch.setattr(pl, "_ct_tesseract", ct)
-        monkeypatch.setattr(pl, "_gyptis_tesseract", gyptis)
-        monkeypatch.setattr(pl, "_HAS_CT_CONTAINER", True)
-        monkeypatch.setattr(pl, "_HAS_GYPTIS_CONTAINER", True)
+        perturbed, background = build_gyptis_components(container=gyptis)
+        components = PipelineComponents(
+            chargetransport=build_chargetransport_component(container=ct),
+            gyptis=perturbed,
+            gyptis_background=background,
+        )
 
         _, history = optimize_doping(
             initial_rho=rho_initial,
             max_iter=3,
             use_jit=False,
+            components=components,
         )
 
         assert ct.forward_biases.count(0.0) == len(history)
