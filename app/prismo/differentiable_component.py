@@ -27,9 +27,32 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import Any, TypeVar
 
 import jax
+
+_T = TypeVar("_T")
+
+
+def invoke_tesseract(
+    container: Any | None,
+    local_api: Any | None,
+    *,
+    container_call: Callable[[Any], _T],
+    local_call: Callable[[Any], _T],
+) -> _T:
+    """Route one real component call to its container or local backend.
+
+    The container backend is preferred when present, then the in-process
+    local module. The unavailable (stub) case is handled by
+    :class:`DifferentiableComponent` in JAX space and never reaches here, so
+    a missing backend is a programming error rather than a stub short-circuit.
+    """
+    if container is not None:
+        return container_call(container)
+    if local_api is not None:
+        return local_call(local_api)
+    raise RuntimeError("no component backend available for this call")
 
 
 @dataclass(frozen=True)

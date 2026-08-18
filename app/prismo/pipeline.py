@@ -21,7 +21,10 @@ import jax.numpy as jnp
 import numpy as np
 from prismo_shared.schemas import MeshRef, SorefBennettCoefficients
 
-from prismo.differentiable_component import DifferentiableComponent
+from prismo.differentiable_component import (
+    DifferentiableComponent,
+    invoke_tesseract,
+)
 
 jax.config.update("jax_enable_x64", True)
 
@@ -223,6 +226,20 @@ _filter_jax.defvjp(_filter_jax_fwd, _filter_jax_bwd)
 # -- ChargeTransport external implementation -------------------------------------
 
 
+def _ct_container_inputs(
+    doping_np: np.ndarray,
+    bias_voltage: float,
+    mesh_ref: MeshRef | None,
+) -> dict[str, Any]:
+    inputs: dict[str, Any] = {
+        "doping": doping_np.tolist(),
+        "bias_voltage": float(bias_voltage),
+    }
+    if mesh_ref is not None:
+        inputs["mesh_ref"] = mesh_ref.model_dump()
+    return inputs
+
+
 def _ct_forward_impl(
     doping_np: np.ndarray,
     bias_voltage: float,
@@ -230,30 +247,31 @@ def _ct_forward_impl(
 ) -> tuple[np.ndarray, np.ndarray]:
     started_at = time.perf_counter()
     phase = f"ct_forward_{bias_voltage:g}V"
-    try:
-        if _ct_tesseract is not None:
-            inputs: dict[str, Any] = {
-                "doping": doping_np.tolist(),
-                "bias_voltage": float(bias_voltage),
-            }
-            if mesh_ref is not None:
-                inputs["mesh_ref"] = mesh_ref.model_dump()
-            result = _ct_tesseract.apply(inputs)
-            return (
-                np.asarray(result["electrons"], dtype=doping_np.dtype),
-                np.asarray(result["holes"], dtype=doping_np.dtype),
-            )
-        if _ct_api is None:
-            return doping_np.copy(), doping_np.copy()
-        inputs = _ct_api.InputSchema(
-            doping=doping_np,
-            bias_voltage=bias_voltage,
-            mesh_ref=mesh_ref,
+
+    def from_container(tess: Any) -> tuple[np.ndarray, np.ndarray]:
+        result = tess.apply(_ct_container_inputs(doping_np, bias_voltage, mesh_ref))
+        return (
+            np.asarray(result["electrons"], dtype=doping_np.dtype),
+            np.asarray(result["holes"], dtype=doping_np.dtype),
         )
-        outputs = _ct_api.apply(inputs)
+
+    def from_local(api: Any) -> tuple[np.ndarray, np.ndarray]:
+        outputs = api.apply(
+            api.InputSchema(
+                doping=doping_np, bias_voltage=bias_voltage, mesh_ref=mesh_ref
+            )
+        )
         return (
             np.asarray(outputs.electrons, dtype=doping_np.dtype),
             np.asarray(outputs.holes, dtype=doping_np.dtype),
+        )
+
+    try:
+        return invoke_tesseract(
+            _ct_tesseract,
+            _ct_api,
+            container_call=from_container,
+            local_call=from_local,
         )
     finally:
         _record_phase_timing(phase, started_at)
@@ -267,43 +285,34 @@ def _ct_vjp_impl(
 ) -> np.ndarray:
     cot_n, cot_p = cotangent
     started_at = time.perf_counter()
-    try:
-        if _ct_tesseract is not None:
-            inputs: dict[str, Any] = {
-                "doping": doping_np.tolist(),
-                "bias_voltage": float(bias_voltage),
-            }
-            if mesh_ref is not None:
-                inputs["mesh_ref"] = mesh_ref.model_dump()
-            cotangent: dict[str, Any] = {
-                "electrons": cot_n.tolist(),
-                "holes": cot_p.tolist(),
-            }
-            vjp_result = _ct_tesseract.vector_jacobian_product(
-                inputs,
-                ["doping"],
-                ["electrons", "holes"],
-                cotangent,
-            )
-            return np.asarray(vjp_result["doping"], dtype=doping_np.dtype)
-        if _ct_api is None:
-            return cot_n + cot_p
-        inputs = _ct_api.InputSchema(
-            doping=doping_np,
-            bias_voltage=bias_voltage,
-            mesh_ref=mesh_ref,
-        )
-        ct_cotangent: dict[str, np.ndarray] = {
-            "electrons": cot_n,
-            "holes": cot_p,
-        }
-        vjp_result = _ct_api.vector_jacobian_product(
-            inputs,
-            {"doping"},
-            {"electrons", "holes"},
-            ct_cotangent,
+
+    def from_container(tess: Any) -> np.ndarray:
+        vjp_result = tess.vector_jacobian_product(
+            _ct_container_inputs(doping_np, bias_voltage, mesh_ref),
+            ["doping"],
+            ["electrons", "holes"],
+            {"electrons": cot_n.tolist(), "holes": cot_p.tolist()},
         )
         return np.asarray(vjp_result["doping"], dtype=doping_np.dtype)
+
+    def from_local(api: Any) -> np.ndarray:
+        vjp_result = api.vector_jacobian_product(
+            api.InputSchema(
+                doping=doping_np, bias_voltage=bias_voltage, mesh_ref=mesh_ref
+            ),
+            {"doping"},
+            {"electrons", "holes"},
+            {"electrons": cot_n, "holes": cot_p},
+        )
+        return np.asarray(vjp_result["doping"], dtype=doping_np.dtype)
+
+    try:
+        return invoke_tesseract(
+            _ct_tesseract,
+            _ct_api,
+            container_call=from_container,
+            local_call=from_local,
+        )
     finally:
         _record_phase_timing("ct_vjp", started_at)
 
@@ -357,15 +366,22 @@ def _gyptis_forward_impl(
 ) -> np.ndarray:
     out_dtype = epsilon_np.dtype
     started_at = time.perf_counter()
-    try:
-        if _gyptis_tesseract is not None:
-            result = _gyptis_tesseract.apply({"epsilon": epsilon_np.tolist()})
-            return np.asarray(result["neff_sq"], dtype=out_dtype)
-        if _gyptis_api is None:
-            return np.asarray(np.mean(epsilon_np), dtype=out_dtype)
-        inputs = _gyptis_api.InputSchema(epsilon=epsilon_np)
-        outputs = _gyptis_api.apply(inputs)
+
+    def from_container(tess: Any) -> np.ndarray:
+        result = tess.apply({"epsilon": epsilon_np.tolist()})
+        return np.asarray(result["neff_sq"], dtype=out_dtype)
+
+    def from_local(api: Any) -> np.ndarray:
+        outputs = api.apply(api.InputSchema(epsilon=epsilon_np))
         return np.asarray(outputs.neff_sq, dtype=out_dtype)
+
+    try:
+        return invoke_tesseract(
+            _gyptis_tesseract,
+            _gyptis_api,
+            container_call=from_container,
+            local_call=from_local,
+        )
     finally:
         _record_phase_timing(phase, started_at)
 
@@ -390,31 +406,44 @@ def _gyptis_vjp_impl(
     epsilon_np: np.ndarray,
     cot_neff_sq: np.ndarray,
 ) -> np.ndarray:
-    n = len(epsilon_np)
     out_dtype = epsilon_np.dtype
     started_at = time.perf_counter()
-    try:
-        if _gyptis_tesseract is not None:
-            cotangent = {"neff_sq": float(cot_neff_sq)}
-            vjp_result = _gyptis_tesseract.vector_jacobian_product(
-                {"epsilon": epsilon_np.tolist()},
-                ["epsilon"],
-                ["neff_sq"],
-                cotangent,
-            )
-            return np.asarray(vjp_result["epsilon"], dtype=out_dtype)
-        if _gyptis_api is None:
-            return np.full(n, float(cot_neff_sq) / n, dtype=out_dtype)
-        inputs = _gyptis_api.InputSchema(epsilon=epsilon_np)
-        vjp_result = _gyptis_api.vector_jacobian_product(
-            inputs,
+
+    def from_container(tess: Any) -> np.ndarray:
+        vjp_result = tess.vector_jacobian_product(
+            {"epsilon": epsilon_np.tolist()},
+            ["epsilon"],
+            ["neff_sq"],
+            {"neff_sq": float(cot_neff_sq)},
+        )
+        return np.asarray(vjp_result["epsilon"], dtype=out_dtype)
+
+    def from_local(api: Any) -> np.ndarray:
+        vjp_result = api.vector_jacobian_product(
+            api.InputSchema(epsilon=epsilon_np),
             {"epsilon"},
             {"neff_sq"},
             {"neff_sq": np.asarray(cot_neff_sq)},
         )
         return np.asarray(vjp_result["epsilon"], dtype=out_dtype)
+
+    try:
+        return invoke_tesseract(
+            _gyptis_tesseract,
+            _gyptis_api,
+            container_call=from_container,
+            local_call=from_local,
+        )
     finally:
         _record_phase_timing("gyptis_vjp", started_at)
+
+
+def _gyptis_background_vjp_impl(
+    epsilon_np: np.ndarray,
+    cot_neff_sq: np.ndarray,
+) -> np.ndarray:
+    """Background permittivity is rho-independent: its cotangent is zero."""
+    return np.zeros_like(epsilon_np)
 
 
 def _build_domain_epsilon(
@@ -437,85 +466,48 @@ def _build_domain_epsilon(
     return epsilon_bg, epsilon_pert
 
 
-def _gyptis_call_impl(epsilon: jax.Array) -> jax.Array:
-    if not _HAS_GYPTIS and not _HAS_GYPTIS_CONTAINER:
-        return jnp.mean(epsilon)
-    return jax.pure_callback(
-        _gyptis_forward_impl,
-        _scalar_like(epsilon),
-        epsilon,
-    )
+# -- gyptis JAX wrappers ---------------------------------------------------------
 
 
-def _gyptis_background_call_impl(epsilon: jax.Array) -> jax.Array:
-    if not _HAS_GYPTIS and not _HAS_GYPTIS_CONTAINER:
-        return jnp.mean(epsilon)
-    return jax.pure_callback(
-        _gyptis_background_forward_impl,
-        _scalar_like(epsilon),
-        epsilon,
-    )
+def _gyptis_out_struct(epsilon: jax.Array) -> jax.ShapeDtypeStruct:
+    return _scalar_like(epsilon)
 
 
-# -- gyptis JAX wrapper ----------------------------------------------------------
+def _gyptis_stub_forward(epsilon: jax.Array) -> jax.Array:
+    return jnp.mean(epsilon)
 
 
-@jax.custom_vjp
-def _gyptis_call_jax(epsilon: jax.Array) -> jax.Array:
-    return _gyptis_call_impl(epsilon)
+def _gyptis_stub_vjp(epsilon: jax.Array, g: jax.Array) -> jax.Array:
+    n = epsilon.shape[0]
+    return jnp.full_like(epsilon, g / n)
 
 
-def _gyptis_call_fwd(
-    epsilon: jax.Array,
-) -> tuple[jax.Array, tuple[jax.Array]]:
-    return _gyptis_call_impl(epsilon), (epsilon,)
+def _gyptis_background_stub_vjp(epsilon: jax.Array, g: jax.Array) -> jax.Array:
+    return jnp.zeros_like(epsilon)
 
 
-def _gyptis_call_bwd(
-    res: tuple[jax.Array],
-    g: jax.Array,
-) -> tuple[jax.Array]:
-    (epsilon,) = res
-
-    if not _HAS_GYPTIS and not _HAS_GYPTIS_CONTAINER:
-        n = epsilon.shape[0]
-        return (jnp.full_like(epsilon, g / n),)
-
-    vjp = jax.pure_callback(
-        _gyptis_vjp_impl,
-        _shaped_like(epsilon),
-        epsilon,
-        g,
-    )
-    return (vjp,)
+def _gyptis_available() -> bool:
+    return _HAS_GYPTIS or _HAS_GYPTIS_CONTAINER
 
 
-_gyptis_call_jax.defvjp(_gyptis_call_fwd, _gyptis_call_bwd)
+_gyptis_call_jax = DifferentiableComponent(
+    forward=_gyptis_forward_impl,
+    vjp=_gyptis_vjp_impl,
+    out_struct=_gyptis_out_struct,
+    stub_forward=_gyptis_stub_forward,
+    stub_vjp=_gyptis_stub_vjp,
+    available=_gyptis_available,
+)
 
 
-@jax.custom_vjp
-def _gyptis_background_call_jax(epsilon: jax.Array) -> jax.Array:
-    """Background solve with a deliberately zero rho cotangent."""
-    return _gyptis_background_call_impl(epsilon)
-
-
-def _gyptis_background_call_fwd(
-    epsilon: jax.Array,
-) -> tuple[jax.Array, tuple[jax.Array]]:
-    return _gyptis_background_call_impl(epsilon), (epsilon,)
-
-
-def _gyptis_background_call_bwd(
-    res: tuple[jax.Array],
-    g: jax.Array,
-) -> tuple[jax.Array]:
-    (epsilon,) = res
-    return (jnp.zeros_like(epsilon),)
-
-
-_gyptis_background_call_jax.defvjp(
-    _gyptis_background_call_fwd,
-    _gyptis_background_call_bwd,
+# Background solve: rho-independent, so it contributes a zero cotangent to rho.
+_gyptis_background_call_jax = DifferentiableComponent(
+    forward=_gyptis_background_forward_impl,
+    vjp=_gyptis_background_vjp_impl,
+    out_struct=_gyptis_out_struct,
+    stub_forward=_gyptis_stub_forward,
+    stub_vjp=_gyptis_background_stub_vjp,
+    available=_gyptis_available,
 )
 
 
