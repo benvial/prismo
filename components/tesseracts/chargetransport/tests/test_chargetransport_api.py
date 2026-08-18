@@ -259,8 +259,7 @@ def test_vjp_matches_finite_difference() -> None:
 
 
 def test_vjp_rejects_inputs_without_matching_forward() -> None:
-    _api._solve_states.clear()
-    _api._active_profile = None
+    _api._session_registry.clear()
 
     with pytest.raises(RuntimeError, match="preceding apply"):
         vector_jacobian_product(
@@ -293,8 +292,7 @@ def test_vjp_reuses_matching_persistent_worker_state(
                 np.save(str(request["output_path"]), np.ones_like(doping))
             return {"ok": True}
 
-    _api._solve_states.clear()
-    _api._active_profile = None
+    _api._session_registry.clear()
     monkeypatch.setattr(_api, "_julia_available", lambda: True)
     monkeypatch.setattr(_api, "_get_julia_worker", lambda: FakeWorker(), raising=False)
 

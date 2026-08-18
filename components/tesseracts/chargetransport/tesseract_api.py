@@ -25,6 +25,7 @@ from time import monotonic
 import numpy as np
 import numpy.typing as npt
 from prismo_shared.schemas import MeshRef
+from prismo_shared.session import SolveSessionRegistry, array_identity
 from pydantic import BaseModel, Field
 from tesseract_core.runtime import Array, Differentiable, Float64
 
@@ -79,8 +80,11 @@ class OutputSchema(BaseModel):
 # Module-level state
 #
 
-_solve_states: set[tuple[tuple[object, ...], float, int]] = set()
-_active_profile: tuple[object, ...] | None = None
+# Forward solves live here behind the fixed apply/vjp endpoints; the adjoint
+# retrieves the session whose inputs match. Scoped by doping profile + worker
+# generation so the two bias solves of one autodiff pass coexist while solves
+# from earlier passes (or a restarted worker) are evicted.
+_session_registry = SolveSessionRegistry()
 _julia_worker: "_JuliaWorker | None" = None
 _worker_lock = RLock()
 _worker_generation = 0
@@ -125,7 +129,7 @@ def _forward_state_key(
 ) -> tuple[tuple[object, ...], float, int]:
     """Return an exact identity for a forward solve available to its VJP."""
     mesh_identity = None if mesh_ref is None else mesh_ref.model_dump_json()
-    profile = (doping.shape, doping.dtype.str, doping.tobytes(), mesh_identity)
+    profile = (*array_identity(doping), mesh_identity)
     return profile, float(bias_voltage), worker_generation
 
 
@@ -273,14 +277,13 @@ def _get_julia_worker() -> _JuliaWorker:
 
 
 def shutdown() -> None:
-    """End the Julia-worker lifecycle and invalidate retained forward states."""
-    global _active_profile, _julia_worker, _worker_generation
+    """End the Julia-worker lifecycle and invalidate the retained forward session."""
+    global _julia_worker, _worker_generation
     with _worker_lock:
         worker = _julia_worker
         _julia_worker = None
         _worker_generation += 1
-        _solve_states.clear()
-        _active_profile = None
+        _session_registry.clear()
     if worker is not None:
         worker.close()
 
@@ -411,18 +414,14 @@ def apply(inputs: InputSchema) -> OutputSchema:
         electrons = doping.copy()
         holes = doping.copy()
 
-    global _active_profile
-    state_key = _forward_state_key(
+    identity = _forward_state_key(
         doping,
         inputs.mesh_ref,
         inputs.bias_voltage,
         worker_generation,
     )
-    profile, _, _ = state_key
-    if _active_profile != profile:
-        _solve_states.clear()
-        _active_profile = profile
-    _solve_states.add(state_key)
+    profile, _bias, generation = identity
+    _session_registry.open(identity, scope=(profile, generation))
 
     return OutputSchema(electrons=electrons, holes=holes)
 
@@ -483,13 +482,13 @@ def vector_jacobian_product(
             raise RuntimeError(f"Julia adjoint solve failed: {exc}") from exc
     else:
         worker_generation = _worker_generation
-    state_key = _forward_state_key(
+    identity = _forward_state_key(
         doping,
         inputs.mesh_ref,
         inputs.bias_voltage,
         worker_generation,
     )
-    if state_key not in _solve_states:
+    if _session_registry.match(identity) is None:
         raise RuntimeError(
             "ChargeTransport VJP requires a preceding apply() with identical "
             "doping, mesh reference, and bias voltage."

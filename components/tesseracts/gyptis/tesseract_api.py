@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+from prismo_shared.session import SolveSessionRegistry, array_identity
 from pydantic import BaseModel
 from collections import OrderedDict
 from tesseract_core.runtime import Array, Differentiable, Float64
@@ -49,9 +50,11 @@ class OutputSchema(BaseModel):
 # Module-level state
 #
 
-# Cached after apply() so vector_jacobian_product() can re-access geometry
-# and eigenvector without re-solving.
-_solve_state: dict[str, Any] | None = None
+# The forward solve, behind the fixed apply/vjp endpoints. Its carried state
+# lets vector_jacobian_product() re-access geometry without re-solving; the
+# adjoint retrieves the session whose permittivity matches before using it.
+# No scope is passed, so the registry keeps only the most-recent forward.
+_session_registry = SolveSessionRegistry()
 
 
 #
@@ -148,14 +151,15 @@ def apply(inputs: InputSchema) -> OutputSchema:
     kz = np.sqrt(lam)
     neff = float(np.real(kz / k0))
 
-    global _solve_state
-    _solve_state = {
-        "simu": simu,
-        "epsilon": epsilon.copy(),
-        "n_domains": n_domains,
-        "k0": k0,
-        "eigen_index": j_fundamental,
-    }
+    _session_registry.open(
+        array_identity(epsilon),
+        state={
+            "simu": simu,
+            "n_domains": n_domains,
+            "k0": k0,
+            "eigen_index": j_fundamental,
+        },
+    )
 
     return OutputSchema(neff_sq=neff * neff)
 
@@ -214,20 +218,20 @@ def vector_jacobian_product(
         vjp["epsilon"] = np.full(n, cotangent / n)
         return vjp
 
-    global _solve_state
-    if _solve_state is None:
+    session = _session_registry.match(array_identity(epsilon))
+    if session is None:
+        if _session_registry.has_any():
+            raise RuntimeError(
+                "vector_jacobian_product inputs differ from the preceding "
+                "apply() call. Run apply() with these inputs first."
+            )
         raise RuntimeError(
             "vector_jacobian_product called before apply(). "
             "Run apply() first to populate the solve state."
         )
 
-    simu = _solve_state["simu"]
-    if not np.array_equal(epsilon, _solve_state["epsilon"]):
-        raise RuntimeError(
-            "vector_jacobian_product inputs differ from the preceding apply() call. "
-            "Run apply() with these inputs first."
-        )
-    k0 = _solve_state["k0"]
+    simu = session.state["simu"]
+    k0 = session.state["k0"]
 
     # Reassemble exactly as gyptis' eigensolve implementation does, then use
     # slepc4py directly because DOLFIN does not expose left eigenvectors.
