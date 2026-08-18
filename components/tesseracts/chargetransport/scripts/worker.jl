@@ -1,0 +1,224 @@
+#!/usr/bin/env julia
+
+using JSON
+using NPZ
+
+include(joinpath(@__DIR__, "ct_common.jl"))
+include(joinpath(@__DIR__, "ct_adjoint.jl"))
+
+mutable struct WorkerState
+    mesh_path::String
+    mesh_key::String
+    n_nodes::Int
+    ctsys::Any
+    data::Any
+    cathode_breg::Int
+    n_bregions::Int
+    control::Any
+    profile_key::String
+    equilibrium_sol::Any
+    warm_equilibrium::Any
+    forward_solutions::Dict{Float64, Any}
+    warm_bias_solutions::Dict{Float64, Any}
+end
+
+WorkerState() = WorkerState(
+    "",
+    "",
+    0,
+    nothing,
+    nothing,
+    0,
+    0,
+    nothing,
+    "",
+    nothing,
+    nothing,
+    Dict{Float64, Any}(),
+    Dict{Float64, Any}(),
+)
+
+read_vector(path) = Float64.(vec(npzread(path)))
+
+function rebuild_context!(state, doping, mesh_path, mesh_key)
+    ctsys, data, cathode_breg, n_bregions = build_ct_system(doping, mesh_path)
+    state.mesh_path = mesh_path
+    state.mesh_key = mesh_key
+    state.n_nodes = length(doping)
+    state.ctsys = ctsys
+    state.data = data
+    state.cathode_breg = cathode_breg
+    state.n_bregions = n_bregions
+    state.control = make_solver_control()
+    state.profile_key = ""
+    state.equilibrium_sol = nothing
+    state.warm_equilibrium = nothing
+    empty!(state.forward_solutions)
+    empty!(state.warm_bias_solutions)
+    return nothing
+end
+
+function ensure_profile!(state, doping, mesh_path, mesh_key, profile_key)
+    if state.ctsys === nothing || state.mesh_path != mesh_path ||
+       state.mesh_key != mesh_key || state.n_nodes != length(doping)
+        rebuild_context!(state, doping, mesh_path, mesh_key)
+    end
+    if state.profile_key == profile_key
+        return false
+    end
+
+    # Mark the old physics invalid before a warm solve can mutate its system.
+    state.profile_key = ""
+    state.equilibrium_sol = nothing
+    empty!(state.forward_solutions)
+    equilibrium_sol = solve_equilibrium_with_warm_start(
+        state.ctsys,
+        state.data,
+        doping,
+        state.control,
+        state.warm_equilibrium,
+    )
+    state.profile_key = profile_key
+    state.equilibrium_sol = deepcopy(equilibrium_sol)
+    state.warm_equilibrium = deepcopy(equilibrium_sol)
+    empty!(state.forward_solutions)
+    return true
+end
+
+function forward_solution!(state, doping, mesh_path, mesh_key, profile_key, bias_voltage)
+    profile_changed = ensure_profile!(state, doping, mesh_path, mesh_key, profile_key)
+    if haskey(state.forward_solutions, bias_voltage)
+        if abs(bias_voltage) == 0.0
+            configure_equilibrium!(state.ctsys, state.data)
+        else
+            configure_biased_state!(
+                state.ctsys,
+                state.data,
+                bias_voltage,
+                state.cathode_breg,
+                state.n_bregions,
+            )
+        end
+        return state.forward_solutions[bias_voltage], profile_changed, false
+    end
+
+    if abs(bias_voltage) == 0.0
+        configure_equilibrium!(state.ctsys, state.data)
+        sol = deepcopy(state.equilibrium_sol)
+        used_warm_start = !profile_changed
+    else
+        sol = solve_at_bias_with_warm_start(
+            state.ctsys,
+            state.control,
+            deepcopy(state.equilibrium_sol),
+            bias_voltage,
+            state.cathode_breg,
+            state.n_bregions,
+            get(state.warm_bias_solutions, bias_voltage, nothing),
+        )
+        used_warm_start = haskey(state.warm_bias_solutions, bias_voltage)
+    end
+
+    state.forward_solutions[bias_voltage] = deepcopy(sol)
+    state.warm_bias_solutions[bias_voltage] = deepcopy(sol)
+    return sol, profile_changed, used_warm_start
+end
+
+function carrier_fields(sol, data, n_nodes)
+    electrons = zeros(Float64, n_nodes)
+    holes = zeros(Float64, n_nodes)
+    for inode in 1:n_nodes
+        electrons[inode] = get_density(sol, data, 1, 1; inode = inode)
+        holes[inode] = get_density(sol, data, 2, 1; inode = inode)
+    end
+    return electrons, holes
+end
+
+function process_forward!(state, request)
+    doping = read_vector(String(request["doping_path"]))
+    bias_voltage = Float64(JSON.parsefile(String(request["bias_path"]))["bias_voltage"])
+    mesh_path = String(request["mesh_path"])
+    mesh_key = String(request["mesh_key"])
+    profile_key = String(request["profile_key"])
+    output_path = String(request["output_path"])
+
+    sol, profile_changed, used_warm_start = forward_solution!(
+        state,
+        doping,
+        mesh_path,
+        mesh_key,
+        profile_key,
+        bias_voltage,
+    )
+    electrons, holes = carrier_fields(sol, state.data, length(doping))
+    npzwrite(output_path, Dict("electrons" => electrons, "holes" => holes))
+    return Dict(
+        "ok" => true,
+        "profile_changed" => profile_changed,
+        "used_warm_start" => used_warm_start,
+    )
+end
+
+function process_vjp!(state, request)
+    doping = read_vector(String(request["doping_path"]))
+    bias_voltage = Float64(JSON.parsefile(String(request["bias_path"]))["bias_voltage"])
+    mesh_path = String(request["mesh_path"])
+    mesh_key = String(request["mesh_key"])
+    profile_key = String(request["profile_key"])
+    output_path = String(request["output_path"])
+    state.ctsys === nothing && error("VJP requires a preceding forward solve")
+    state.mesh_path == mesh_path || error("VJP mesh differs from retained forward state")
+    state.mesh_key == mesh_key || error("VJP mesh configuration differs from retained forward state")
+    state.profile_key == profile_key || error("VJP doping differs from retained forward state")
+    haskey(state.forward_solutions, bias_voltage) || error(
+        "VJP bias differs from retained forward state",
+    )
+
+    cot_n = read_vector(String(request["cotangent_electrons_path"]))
+    cot_p = read_vector(String(request["cotangent_holes_path"]))
+    length(cot_n) == length(doping) || error("electron cotangent length mismatch")
+    length(cot_p) == length(doping) || error("hole cotangent length mismatch")
+    vjp = compute_doping_vjp(
+        state.ctsys,
+        state.data,
+        deepcopy(state.forward_solutions[bias_voltage]),
+        deepcopy(state.equilibrium_sol),
+        bias_voltage,
+        state.cathode_breg,
+        state.n_bregions,
+        cot_n,
+        cot_p,
+    )
+    npzwrite(output_path, vjp)
+    return Dict("ok" => true)
+end
+
+function reply(payload)
+    JSON.print(stdout, payload)
+    print(stdout, "\n")
+    flush(stdout)
+end
+
+function main()
+    state = WorkerState()
+    for line in eachline(stdin)
+        try
+            request = JSON.parse(line)
+            operation = String(request["operation"])
+            if operation == "shutdown"
+                reply(Dict("ok" => true))
+                break
+            elseif operation == "forward"
+                reply(process_forward!(state, request))
+            elseif operation == "vjp"
+                reply(process_vjp!(state, request))
+            else
+                error("unknown worker operation: $operation")
+            end
+        catch err
+            reply(Dict("ok" => false, "error" => sprint(showerror, err)))
+        end
+    end
+end
+
+main()

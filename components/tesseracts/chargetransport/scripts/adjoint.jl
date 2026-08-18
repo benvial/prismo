@@ -1,16 +1,10 @@
 #!/usr/bin/env julia
 
-using NPZ
 using JSON
-using LinearAlgebra
-using SparseArrays
+using NPZ
 
-# VoronoiFVM access (qualified) comes from ct_common.jl.
 include(joinpath(@__DIR__, "ct_common.jl"))
-
-const SPEC_E = 1
-const SPEC_H = 2
-const DOF_PSI = 3
+include(joinpath(@__DIR__, "ct_adjoint.jl"))
 
 function parse_adjoint_args()
     doping_path = ""
@@ -20,162 +14,61 @@ function parse_adjoint_args()
     output_path = ""
     mesh_path = ""
 
-    args = ARGS
     i = 1
-    while i <= length(args)
-        if args[i] == "--doping" && i + 1 <= length(args)
-            doping_path = args[i+1]; i += 2
-        elseif args[i] == "--cotangent_n" && i + 1 <= length(args)
-            cot_n_path = args[i+1]; i += 2
-        elseif args[i] == "--cotangent_p" && i + 1 <= length(args)
-            cot_p_path = args[i+1]; i += 2
-        elseif args[i] == "--bias" && i + 1 <= length(args)
-            bias_path = args[i+1]; i += 2
-        elseif args[i] == "--output" && i + 1 <= length(args)
-            output_path = args[i+1]; i += 2
-        elseif args[i] == "--mesh" && i + 1 <= length(args)
-            mesh_path = args[i+1]; i += 2
+    while i <= length(ARGS)
+        if ARGS[i] == "--doping" && i + 1 <= length(ARGS)
+            doping_path = ARGS[i + 1]; i += 2
+        elseif ARGS[i] == "--cotangent_n" && i + 1 <= length(ARGS)
+            cot_n_path = ARGS[i + 1]; i += 2
+        elseif ARGS[i] == "--cotangent_p" && i + 1 <= length(ARGS)
+            cot_p_path = ARGS[i + 1]; i += 2
+        elseif ARGS[i] == "--bias" && i + 1 <= length(ARGS)
+            bias_path = ARGS[i + 1]; i += 2
+        elseif ARGS[i] == "--output" && i + 1 <= length(ARGS)
+            output_path = ARGS[i + 1]; i += 2
+        elseif ARGS[i] == "--mesh" && i + 1 <= length(ARGS)
+            mesh_path = ARGS[i + 1]; i += 2
         else
             i += 1
         end
     end
-
     return doping_path, cot_n_path, cot_p_path, bias_path, output_path, mesh_path
 end
 
-function dof_index(nspec, node, spec)
-    return (node - 1) * nspec + spec
-end
-
-function central_diff_density(sol, data, dof_idx, inode, epsilon)
-    u_orig = sol.u[dof_idx]
-
-    sol.u[dof_idx] = u_orig + epsilon
-    n_plus = get_density(sol, data, SPEC_E, 1; inode = inode)
-    p_plus = get_density(sol, data, SPEC_H, 1; inode = inode)
-
-    sol.u[dof_idx] = u_orig - epsilon
-    n_minus = get_density(sol, data, SPEC_E, 1; inode = inode)
-    p_minus = get_density(sol, data, SPEC_H, 1; inode = inode)
-
-    sol.u[dof_idx] = u_orig
-
-    dn = (n_plus - n_minus) / (2epsilon)
-    dp = (p_plus - p_minus) / (2epsilon)
-    return dn, dp
-end
-
-function residual_doping_derivative(ctsys, sol, data, inode)
-    doping = data.paramsnodal.doping
-    original = doping[inode]
-    step = max(abs(original) * 1e-6, 1e8)
-
-    doping[inode] = original + step
-    residual_plus, _ = VoronoiFVM.evaluate_residual_and_jacobian(ctsys.fvmsys, sol.u)
-
-    doping[inode] = original - step
-    residual_minus, _ = VoronoiFVM.evaluate_residual_and_jacobian(ctsys.fvmsys, sol.u)
-
-    doping[inode] = original
-    return (residual_plus - residual_minus) / (2step)
-end
-
-function residual_boundary_potential_derivative(ctsys, sol, data, ibreg)
-    potentials = data.params.bψEQ
-    original = potentials[ibreg]
-    step = 1e-8
-
-    potentials[ibreg] = original + step
-    residual_plus, _ = VoronoiFVM.evaluate_residual_and_jacobian(ctsys.fvmsys, sol.u)
-
-    potentials[ibreg] = original - step
-    residual_minus, _ = VoronoiFVM.evaluate_residual_and_jacobian(ctsys.fvmsys, sol.u)
-
-    potentials[ibreg] = original
-    return (residual_plus - residual_minus) / (2step)
-end
-
-function boundary_potential_doping_derivative(sol, data, nspec, inode)
-    psi_idx = dof_index(nspec, inode, DOF_PSI)
-    dn_dpsi, dp_dpsi = central_diff_density(sol, data, psi_idx, inode, 1e-8)
-    return inv(dp_dpsi - dn_dpsi)
-end
+read_vector(path) = Float64.(vec(npzread(path)))
 
 function main()
     doping_path, cot_n_path, cot_p_path, bias_path, output_path, mesh_path =
         parse_adjoint_args()
-
-    doping_raw = npzread(doping_path)
-    if ndims(doping_raw) > 1
-        doping_raw = vec(doping_raw)
-    end
-    doping = Float64.(doping_raw)
-    n_nodes = length(doping)
-
-    cot_n_raw = npzread(cot_n_path)
-    if ndims(cot_n_raw) > 1
-        cot_n_raw = vec(cot_n_raw)
-    end
-    cot_n = Float64.(cot_n_raw)
-
-    cot_p_raw = npzread(cot_p_path)
-    if ndims(cot_p_raw) > 1
-        cot_p_raw = vec(cot_p_raw)
-    end
-    cot_p = Float64.(cot_p_raw)
-
-    if length(cot_n) != n_nodes || length(cot_p) != n_nodes
-        error("cotangent length mismatch: doping has $n_nodes nodes, " *
-              "cot_n has $(length(cot_n)), cot_p has $(length(cot_p))")
-    end
-
-    bias = JSON.parsefile(bias_path)
-    bias_voltage = Float64(bias["bias_voltage"])
+    doping = read_vector(doping_path)
+    cot_n = read_vector(cot_n_path)
+    cot_p = read_vector(cot_p_path)
+    length(cot_n) == length(doping) || error("electron cotangent length mismatch")
+    length(cot_p) == length(doping) || error("hole cotangent length mismatch")
+    bias_voltage = Float64(JSON.parsefile(bias_path)["bias_voltage"])
 
     ctsys, data, cathode_breg, n_bregions = build_ct_system(doping, mesh_path)
-
     control = make_solver_control()
-
-    u0 = solve_equilibrium(ctsys, data, doping, control)
-    sol = solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregions)
-
-    residual, J_ext = VoronoiFVM.evaluate_residual_and_jacobian(ctsys.fvmsys, sol.u)
-    J_csc = SparseMatrixCSC(ExtendableSparse.flush!(J_ext))
-
-    nspec = VoronoiFVM.num_species(ctsys.fvmsys)
-    ndof = nspec * n_nodes
-    dJ_dx = zeros(Float64, ndof)
-    epsilon = 1e-8
-
-    for k in 1:n_nodes
-        e_idx = dof_index(nspec, k, SPEC_E)
-        h_idx = dof_index(nspec, k, SPEC_H)
-        psi_idx = dof_index(nspec, k, DOF_PSI)
-
-        dn_de, dp_de = central_diff_density(sol, data, e_idx, k, epsilon)
-        dn_dh, dp_dh = central_diff_density(sol, data, h_idx, k, epsilon)
-        dn_dpsi, dp_dpsi = central_diff_density(sol, data, psi_idx, k, epsilon)
-
-        dJ_dx[e_idx] = cot_n[k] * dn_de + cot_p[k] * dp_de
-        dJ_dx[h_idx] = cot_n[k] * dn_dh + cot_p[k] * dp_dh
-        dJ_dx[psi_idx] = cot_n[k] * dn_dpsi + cot_p[k] * dp_dpsi
-    end
-
-    lambda = J_csc' \ (-dJ_dx)
-
-    vjp = zeros(Float64, n_nodes)
-    grid = ctsys.fvmsys.grid
-    for k in 1:n_nodes
-        dF_dN = residual_doping_derivative(ctsys, sol, data, k)
-        for ibreg in grid[BFaceRegions]
-            if grid[BFaceNodes][ibreg] == k
-                dpsi_dN = boundary_potential_doping_derivative(sol, data, nspec, k)
-                dF_dN += residual_boundary_potential_derivative(ctsys, sol, data, ibreg) * dpsi_dN
-            end
-        end
-        vjp[k] = dot(lambda, dF_dN)
-    end
-
+    equilibrium_sol = solve_equilibrium(ctsys, data, doping, control)
+    sol = solve_at_bias(
+        ctsys,
+        control,
+        equilibrium_sol,
+        bias_voltage,
+        cathode_breg,
+        n_bregions,
+    )
+    vjp = compute_doping_vjp(
+        ctsys,
+        data,
+        sol,
+        equilibrium_sol,
+        bias_voltage,
+        cathode_breg,
+        n_bregions,
+        cot_n,
+        cot_p,
+    )
     npzwrite(output_path, vjp)
 end
 

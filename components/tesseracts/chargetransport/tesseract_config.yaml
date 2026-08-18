@@ -1,11 +1,11 @@
 # Tesseract configuration file
 # ChargeTransport.jl semiconductor drift-diffusion solver (Julia)
-# Subprocess pattern: Python tesseract_api.py calls julia script.jl with NPY args
+# Worker pattern: Python tesseract_api.py owns one Julia worker with NPY I/O
 # Ref: tickets 02 (container + I/O), 06 (container build)
 
 name: "prismo_chargetransport"
 version: "0.1.0"
-description: "ChargeTransport.jl drift-diffusion solver with discrete adjoint VJP via subprocess"
+description: "ChargeTransport.jl drift-diffusion solver with persistent-worker discrete-adjoint VJP"
 
 build_config:
   # Python version installed via uv

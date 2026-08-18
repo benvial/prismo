@@ -118,6 +118,67 @@ function build_ct_system(doping, mesh_path)
     return ctsys, data, cathode_breg, n_bregions
 end
 
+# Update a reusable system without rebuilding its mesh/material data.
+function set_doping!(data, doping)
+    for i in eachindex(doping)
+        data.paramsnodal.doping[i] = doping[i]
+    end
+    return nothing
+end
+
+# Put the system into its equilibrium contact configuration.
+function configure_equilibrium!(ctsys, data)
+    grid = ctsys.fvmsys.grid
+    fvmsys = ctsys.fvmsys
+    fvmsys.physics.data.calculationType = ChargeTransport.InEquilibrium
+    for ibreg in grid[BFaceRegions]
+        set_contact!(ctsys, ibreg, Δu = 0.0)
+    end
+    fvmsys.physics.data.λ1 = 1.0
+    return nothing
+end
+
+# Match ChargeTransport._equilibrium_solve!'s selected parent node exactly.
+function equilibrium_bpsi_parent_node(grid, ibreg)
+    boundary_grid = subgrid(grid, [ibreg], boundary = true)
+    parents = boundary_grid[NodeParents]
+    isempty(parents) && error("missing boundary node for region $ibreg")
+    return parents[1]
+end
+
+# Store the equilibrium quantities needed by a subsequent biased solve.
+function store_equilibrium_contact_data!(ctsys, data, sol)
+    grid = ctsys.fvmsys.grid
+    params = data.params
+    paramsnodal = data.paramsnodal
+    ipsi = data.index_psi
+    constants = data.constants
+
+    for ibreg in grid[BFaceRegions]
+        inode = equilibrium_bpsi_parent_node(grid, ibreg)
+        params.bψEQ[ibreg] = sol[ipsi, inode]
+    end
+
+    bnode = grid[BFaceNodes]
+    for icc in data.electricCarrierList
+        for ibreg in grid[BFaceRegions]
+            inode = bnode[ibreg]
+            Ncc = params.bDensityOfStates[icc, ibreg] +
+                  paramsnodal.densityOfStates[icc, inode]
+            Ecc = params.bBandEdgeEnergy[icc, ibreg] +
+                  paramsnodal.bandEdgeEnergy[icc, inode]
+            eta = params.chargeNumbers[icc] /
+                  (constants.k_B * params.temperature / constants.q) *
+                  ((sol[icc, inode] - sol[ipsi, inode]) +
+                   Ecc / constants.q)
+            params.bDensityEQ[icc, ibreg] = Ncc * data.F[icc](eta)
+        end
+    end
+
+    data.calculationType = ChargeTransport.OutOfEquilibrium
+    return nothing
+end
+
 # Equilibrium solve with doping-magnitude continuation.
 #
 # ChargeTransport's own embedding (equilibrium_solve!) ramps the nonlinear
@@ -134,11 +195,7 @@ function solve_equilibrium(ctsys, data, doping, control)
     grid = ctsys.fvmsys.grid
     fvmsys = ctsys.fvmsys
 
-    fvmsys.physics.data.calculationType = ChargeTransport.InEquilibrium
-    for ibreg in grid[BFaceRegions]
-        set_contact!(ctsys, ibreg, Δu = 0.0)
-    end
-    fvmsys.physics.data.λ1 = 1.0
+    configure_equilibrium!(ctsys, data)
 
     start_doping = 1e10  # near-intrinsic: converges from a zero start
     max_doping = maximum(abs.(doping); init = 0.0)
@@ -154,36 +211,27 @@ function solve_equilibrium(ctsys, data, doping, control)
         sol = VoronoiFVM.solve(fvmsys, inival = sol, control = control)
     end
 
-    # Post-solve bookkeeping replicated from
-    # ChargeTransport._equilibrium_solve!: boundary equilibrium potentials
-    # and densities are required by the out-of-equilibrium (biased) solve.
-    params = data.params
-    paramsnodal = data.paramsnodal
-    bnode = grid[BFaceNodes]
-    ipsi = data.index_psi
-    constants = data.constants
-
-    for ibreg in grid[BFaceRegions]
-        bψVal = view(sol[ipsi, :], subgrid(grid, [ibreg], boundary = true))[1]
-        params.bψEQ[ibreg] = bψVal
-    end
-
-    for icc in data.electricCarrierList
-        for ibreg in grid[BFaceRegions]
-            Ncc = params.bDensityOfStates[icc, ibreg] +
-                  paramsnodal.densityOfStates[icc, bnode[ibreg]]
-            Ecc = params.bBandEdgeEnergy[icc, ibreg] +
-                  paramsnodal.bandEdgeEnergy[icc, bnode[ibreg]]
-            eta = params.chargeNumbers[icc] /
-                  (constants.k_B * params.temperature / constants.q) *
-                  ((sol[icc, bnode[ibreg]] - sol[ipsi, bnode[ibreg]]) +
-                   Ecc / constants.q)
-            params.bDensityEQ[icc, ibreg] = Ncc * data.F[icc](eta)
-        end
-    end
-
-    data.calculationType = ChargeTransport.OutOfEquilibrium
+    store_equilibrium_contact_data!(ctsys, data, sol)
     return sol
+end
+
+# Try a nearby converged equilibrium as Newton's initial value. The established
+# magnitude continuation remains the recovery path for failed warm starts.
+function solve_equilibrium_with_warm_start(ctsys, data, doping, control, warm_start)
+    warm_start === nothing && return solve_equilibrium(ctsys, data, doping, control)
+
+    set_doping!(data, doping)
+    configure_equilibrium!(ctsys, data)
+    try
+        sol = VoronoiFVM.solve(ctsys.fvmsys, inival = warm_start, control = control)
+        store_equilibrium_contact_data!(ctsys, data, sol)
+        return sol
+    catch e
+        if e isa VoronoiFVM.ConvergenceError || e isa VoronoiFVM.AssemblyError
+            return solve_equilibrium(ctsys, data, doping, control)
+        end
+        rethrow()
+    end
 end
 
 function make_solver_control()
@@ -240,4 +288,35 @@ function solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregion
         end
     end
     return sol
+end
+
+# Reuse a nearby bias-state Newton iterate when it converges immediately. This
+# never weakens the continuation fallback used by ``solve_at_bias``.
+function solve_at_bias_with_warm_start(
+    ctsys,
+    control,
+    u0,
+    bias_voltage,
+    cathode_breg,
+    n_bregions,
+    warm_start,
+)
+    if abs(bias_voltage) == 0.0 || cathode_breg > n_bregions
+        return u0
+    end
+    ctsys.fvmsys.physics.data.calculationType = ChargeTransport.OutOfEquilibrium
+    warm_start === nothing && return solve_at_bias(
+        ctsys, control, u0, bias_voltage, cathode_breg, n_bregions,
+    )
+
+    set_contact!(ctsys, cathode_breg, Δu = bias_voltage)
+    try
+        return solve(ctsys; inival = warm_start, control = control)
+    catch e
+        if e isa VoronoiFVM.ConvergenceError || e isa VoronoiFVM.AssemblyError
+            set_contact!(ctsys, cathode_breg, Δu = 0.0)
+            return solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregions)
+        end
+        rethrow()
+    end
 end

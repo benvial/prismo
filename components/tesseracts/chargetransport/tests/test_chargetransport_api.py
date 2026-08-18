@@ -271,6 +271,63 @@ def test_vjp_rejects_inputs_without_matching_forward() -> None:
         )
 
 
+def test_vjp_reuses_matching_persistent_worker_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A public VJP follows its matching forward in one Julia worker."""
+    requests: list[dict[str, object]] = []
+
+    class FakeWorker:
+        generation = 1
+
+        def request(self, request: dict[str, object]) -> dict[str, bool]:
+            requests.append(request)
+            doping = np.load(str(request["doping_path"]))
+            if request["operation"] == "forward":
+                np.savez(
+                    str(request["output_path"]),
+                    electrons=doping * 2.0,
+                    holes=doping * 3.0,
+                )
+            else:
+                np.save(str(request["output_path"]), np.ones_like(doping))
+            return {"ok": True}
+
+    _api._solve_states.clear()
+    _api._active_profile = None
+    monkeypatch.setattr(_api, "_julia_available", lambda: True)
+    monkeypatch.setattr(_api, "_get_julia_worker", lambda: FakeWorker(), raising=False)
+
+    inputs = make_inputs()
+    apply(inputs)
+    result = vector_jacobian_product(
+        inputs,
+        {"doping"},
+        {"electrons", "holes"},
+        {"electrons": np.ones(N_NODES), "holes": np.ones(N_NODES)},
+    )
+
+    assert np.asarray(result["doping"]).shape == (N_NODES,)
+    assert [request["operation"] for request in requests] == ["forward", "vjp"]
+    assert requests[0]["profile_key"] == requests[1]["profile_key"]
+
+
+def test_shutdown_invalidates_retained_forward_state() -> None:
+    """Worker teardown prevents VJPs from using another run's state."""
+    inputs = make_inputs()
+    apply(inputs)
+
+    _api.shutdown()
+
+    with pytest.raises(RuntimeError, match="preceding apply"):
+        vector_jacobian_product(
+            inputs,
+            {"doping"},
+            {"electrons"},
+            {"electrons": np.ones(N_NODES)},
+        )
+
+
 @pytest.mark.parametrize(
     "forward_inputs,vjp_inputs",
     [
@@ -297,7 +354,9 @@ def test_vjp_rejects_changed_forward_inputs(
 ) -> None:
     apply(forward_inputs)
 
-    with pytest.raises(RuntimeError, match="identical doping, mesh reference, and bias"):
+    with pytest.raises(
+        RuntimeError, match="identical doping, mesh reference, and bias"
+    ):
         vector_jacobian_product(
             vjp_inputs,
             {"doping"},
@@ -405,19 +464,20 @@ def test_vjp_matches_pn_forward_directional_difference(bias_voltage: float) -> N
     apply(inputs)
     cotangent = {"electrons": np.ones_like(doping), "holes": np.ones_like(doping)}
     vjp = np.asarray(
-        vector_jacobian_product(
-            inputs, {"doping"}, {"electrons", "holes"}, cotangent
-        )["doping"]
+        vector_jacobian_product(inputs, {"doping"}, {"electrons", "holes"}, cotangent)[
+            "doping"
+        ]
     )
 
     step = 1e12
+
     def objective(doping_field: np.ndarray) -> float:
         outputs = apply(InputSchema(doping=doping_field, bias_voltage=bias_voltage))
         return float(np.sum(outputs.electrons) + np.sum(outputs.holes))
 
-    finite_difference = (objective(doping + step * direction) - objective(
-        doping - step * direction
-    )) / (2 * step)
+    finite_difference = (
+        objective(doping + step * direction) - objective(doping - step * direction)
+    ) / (2 * step)
     np.testing.assert_allclose(np.dot(vjp, direction), finite_difference, rtol=1e-2)
 
 
@@ -471,6 +531,59 @@ def test_apply_with_mesh_ref_and_physical_groups() -> None:
         assert np.asarray(outputs.holes).shape == (3,)
         assert np.all(np.isfinite(outputs.electrons))
         assert np.all(np.isfinite(outputs.holes))
+    finally:
+        Path(mesh_path).unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("bias_voltage", [0.0, -5.0])
+@pytest.mark.skipif(not _julia_available(), reason="Julia not installed")
+def test_vjp_matches_gmsh_pn_directional_difference(bias_voltage: float) -> None:
+    """Public VJP matches a Gmsh-mesh PN directional finite difference."""
+    with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
+        _make_minimal_triangle_msh(f.name)
+        mesh_path = f.name
+    try:
+        doping = np.array([-1e16, 1e16, 1e16], dtype=float)
+        direction = np.array([0.5, -0.3, 0.2], dtype=float)
+        step = 1e10
+        mesh_ref = _make_mesh_ref(mesh_path, n_nodes=len(doping))
+        inputs = InputSchema(
+            doping=doping,
+            mesh_ref=mesh_ref,
+            bias_voltage=bias_voltage,
+        )
+        apply(inputs)
+        vjp = np.asarray(
+            vector_jacobian_product(
+                inputs,
+                {"doping"},
+                {"electrons", "holes"},
+                {
+                    "electrons": np.ones_like(doping),
+                    "holes": np.ones_like(doping),
+                },
+            )["doping"]
+        )
+
+        def objective(profile: np.ndarray) -> float:
+            outputs = apply(
+                InputSchema(
+                    doping=profile,
+                    mesh_ref=mesh_ref,
+                    bias_voltage=bias_voltage,
+                )
+            )
+            return float(np.sum(outputs.electrons) + np.sum(outputs.holes))
+
+        finite_difference = (
+            objective(doping + step * direction) - objective(doping - step * direction)
+        ) / (2 * step)
+        adjoint_direction = float(np.dot(vjp, direction))
+        relative_error = abs(adjoint_direction - finite_difference) / max(
+            abs(finite_difference),
+            1e-30,
+        )
+        assert relative_error < 0.1
     finally:
         Path(mesh_path).unlink(missing_ok=True)
 

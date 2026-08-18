@@ -1,4 +1,4 @@
-.PHONY: help new build test gen-tests data run run-containers clean
+.PHONY: help new build test gen-tests data run run-containers benchmark clean
 
 PYTHON ?= python
 
@@ -12,6 +12,7 @@ help:
 	@echo "  data                          - Pull example data"
 	@echo "  run                           - Run app end-to-end"
 	@echo "  run-containers                - Run app with both Docker containers"
+	@echo "  benchmark                     - Record cold/warm multiphysics callback timings"
 	@echo "  clean                         - Remove build artifacts, caches, and temp files"
 
 new:
@@ -172,6 +173,10 @@ run:
 run-containers:
 	@echo "Running app with Docker containers..."
 	@PYTHONPATH=app:components/shared_code:$${PYTHONPATH} $(PYTHON) -m prismo.main --use-containers $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
+
+benchmark:
+	@echo "Benchmarking multiphysics optimization callbacks..."
+	@PYTHONPATH=app:components/shared_code:$${PYTHONPATH} $(PYTHON) scripts/benchmark_multiphysics_optimization.py $(BENCHMARK_ARGS)
 
 clean:
 	@echo "Cleaning build artifacts, caches, and temp files..."

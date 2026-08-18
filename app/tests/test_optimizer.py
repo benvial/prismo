@@ -21,7 +21,9 @@ N_NODES = 16
 
 def _grid_coords(n: int = 4, spacing: float = 20e-9) -> np.ndarray:
     xs, ys = np.meshgrid(
-        np.arange(n) * spacing, np.arange(n) * spacing, indexing="xy",
+        np.arange(n) * spacing,
+        np.arange(n) * spacing,
+        indexing="xy",
     )
     return np.stack([xs.ravel(), ys.ravel()], axis=1)
 
@@ -97,10 +99,13 @@ class TestOptimizeDopingAnalytical:
             return -jnp.sum(diff**2)
 
         with mock.patch(
-            "prismo.optimizer.pipeline", side_effect=mock_pipeline,
+            "prismo.optimizer.pipeline",
+            side_effect=mock_pipeline,
         ) as mock_pipe:
             rho_opt, _ = optimize_doping(
-                initial_rho=rho_initial, max_iter=100, ftol_rel=1e-8,
+                initial_rho=rho_initial,
+                max_iter=100,
+                ftol_rel=1e-8,
             )
             assert mock_pipe.called
 
@@ -114,7 +119,8 @@ class TestOptimizeDopingAnalytical:
             return -jnp.sum((rho - target) ** 2)
 
         with mock.patch(
-            "prismo.optimizer.pipeline", side_effect=mock_pipeline,
+            "prismo.optimizer.pipeline",
+            side_effect=mock_pipeline,
         ) as mock_pipe:
             _, history = optimize_doping(
                 initial_rho=rho_initial,
@@ -123,6 +129,106 @@ class TestOptimizeDopingAnalytical:
             )
 
         assert mock_pipe.call_count == len(history)
+
+    def test_records_combined_callback_timing(self, rho_initial):
+        """History exposes the wall time and component phases of each callback."""
+        target = jnp.full(self.N_NODES, 0.8, dtype=jnp.float64)
+
+        def mock_pipeline(rho, **kwargs):
+            return -jnp.sum((rho - target) ** 2)
+
+        with mock.patch(
+            "prismo.optimizer.pipeline",
+            side_effect=mock_pipeline,
+        ):
+            _, history = optimize_doping(
+                initial_rho=rho_initial,
+                max_iter=3,
+                use_jit=False,
+            )
+
+        for entry in history:
+            assert entry["callback_time"] >= 0.0
+            assert isinstance(entry["phase_timing"], dict)
+
+    def test_combined_callback_uses_public_component_calls_once(
+        self, rho_initial, monkeypatch
+    ):
+        """One callback makes two bias forwards and their matching VJPs."""
+        import prismo.pipeline as pl
+
+        class FakeChargeTransport:
+            def __init__(self):
+                self.forward_biases: list[float] = []
+                self.vjp_biases: list[float] = []
+
+            def apply(self, inputs):
+                self.forward_biases.append(inputs["bias_voltage"])
+                doping = np.asarray(inputs["doping"], dtype=float)
+                carrier = np.full_like(
+                    doping,
+                    1e18 if inputs["bias_voltage"] == 0.0 else 0.0,
+                )
+                return {"electrons": carrier, "holes": carrier}
+
+            def vector_jacobian_product(
+                self,
+                inputs,
+                input_names,
+                output_names,
+                cotangent,
+            ):
+                self.vjp_biases.append(inputs["bias_voltage"])
+                return {"doping": np.zeros_like(inputs["doping"], dtype=float)}
+
+        class FakeGyptis:
+            def __init__(self):
+                self.vjp_calls = 0
+
+            def apply(self, inputs):
+                return {"neff_sq": float(np.mean(inputs["epsilon"]))}
+
+            def vector_jacobian_product(
+                self,
+                inputs,
+                input_names,
+                output_names,
+                cotangent,
+            ):
+                self.vjp_calls += 1
+                epsilon = np.asarray(inputs["epsilon"], dtype=float)
+                return {
+                    "epsilon": np.full(
+                        epsilon.shape,
+                        cotangent["neff_sq"] / len(epsilon),
+                    )
+                }
+
+        ct = FakeChargeTransport()
+        gyptis = FakeGyptis()
+        pl.clear_pipeline_runtime_state()
+        monkeypatch.setattr(pl, "_ct_tesseract", ct)
+        monkeypatch.setattr(pl, "_gyptis_tesseract", gyptis)
+        monkeypatch.setattr(pl, "_HAS_CT_CONTAINER", True)
+        monkeypatch.setattr(pl, "_HAS_GYPTIS_CONTAINER", True)
+
+        _, history = optimize_doping(
+            initial_rho=rho_initial,
+            max_iter=3,
+            use_jit=False,
+        )
+
+        assert ct.forward_biases.count(0.0) == len(history)
+        assert ct.forward_biases.count(-5.0) == len(history)
+        assert ct.vjp_biases.count(0.0) == len(history)
+        assert ct.vjp_biases.count(-5.0) == len(history)
+        assert gyptis.vjp_calls == len(history)
+        for entry in history:
+            assert entry["phase_timing"]["ct_forward_0V"]["calls"] == 1
+            assert entry["phase_timing"]["ct_forward_-5V"]["calls"] == 1
+            assert entry["phase_timing"]["ct_vjp"]["calls"] == 2
+            assert entry["phase_timing"]["ct_vjp"]["cold_seconds"] >= 0.0
+            assert entry["phase_timing"]["ct_vjp"]["warm_seconds"] >= 0.0
 
 
 class TestOptimizeDopingWithFilter:
@@ -152,20 +258,27 @@ class TestOptimizeDopingWithFilter:
 
     def test_runs_with_filter(self, rho0, H_dense):
         rho_opt, history = optimize_doping(
-            initial_rho=rho0, H=H_dense, max_iter=3,
+            initial_rho=rho0,
+            H=H_dense,
+            max_iter=3,
         )
         assert rho_opt.shape == rho0.shape
         assert len(history) > 0
 
     def test_box_bounds_preserved_with_filter(self, rho0, H_dense):
         rho_opt, _ = optimize_doping(
-            initial_rho=rho0, H=H_dense, max_iter=5,
+            initial_rho=rho0,
+            H=H_dense,
+            max_iter=5,
         )
         assert np.all(rho_opt >= 0.0)
         assert np.all(rho_opt <= 1.0)
 
     def test_builds_filter_from_coords(self, rho0, coords):
         rho_opt, _ = optimize_doping(
-            initial_rho=rho0, mesh_coords=coords, r_min=50e-9, max_iter=2,
+            initial_rho=rho0,
+            mesh_coords=coords,
+            r_min=50e-9,
+            max_iter=2,
         )
         assert rho_opt.shape == rho0.shape

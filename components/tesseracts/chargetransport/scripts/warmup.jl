@@ -13,17 +13,13 @@
 #   - build_ct_system on the 1D fallback grid AND on a Gmsh 2D mesh file
 #     (different grid types -> different method specializations)
 #   - equilibrium_solve! + solve_at_bias with a reverse-bias ramp
-#   - get_density extraction (also via central differences, adjoint path)
-#   - evaluate_residual_and_jacobian + CSC conversion + sparse backsolve
+#   - get_density extraction and the contracted discrete-adjoint VJP
 #   - NPZ / JSON I/O
 
 using NPZ
 using JSON
-using LinearAlgebra
-using SparseArrays
-
-# VoronoiFVM access (qualified) comes from ct_common.jl.
 include(joinpath(@__DIR__, "ct_common.jl"))
+include(joinpath(@__DIR__, "ct_adjoint.jl"))
 
 const MINIMAL_TRIANGLE_MSH = """
 \$MeshFormat
@@ -49,16 +45,6 @@ const MINIMAL_TRIANGLE_MSH = """
 \$EndElements
 """
 
-function central_diff(sol, data, dof_idx, inode, epsilon)
-    u_orig = sol.u[dof_idx]
-    sol.u[dof_idx] = u_orig + epsilon
-    n_plus = get_density(sol, data, 1, 1; inode = inode)
-    sol.u[dof_idx] = u_orig - epsilon
-    n_minus = get_density(sol, data, 1, 1; inode = inode)
-    sol.u[dof_idx] = u_orig
-    return (n_plus - n_minus) / (2epsilon)
-end
-
 function exercise(doping, mesh_path, bias_voltage)
     n_nodes = length(doping)
     ctsys, data, cathode_breg, n_bregions = build_ct_system(doping, mesh_path)
@@ -69,17 +55,19 @@ function exercise(doping, mesh_path, bias_voltage)
     electrons = [get_density(sol, data, 1, 1; inode = i) for i in 1:n_nodes]
     holes = [get_density(sol, data, 2, 1; inode = i) for i in 1:n_nodes]
 
-    # adjoint-path machinery
-    residual, J_ext = VoronoiFVM.evaluate_residual_and_jacobian(ctsys.fvmsys, sol.u)
-    J_csc = SparseMatrixCSC(ExtendableSparse.flush!(J_ext))
-    nspec = VoronoiFVM.num_species(ctsys.fvmsys)
-    dJ_dx = zeros(Float64, nspec * n_nodes)
-    for k in 1:n_nodes
-        dJ_dx[(k-1)*nspec+1] = central_diff(sol, data, (k-1)*nspec+1, k, 1e-8)
-    end
-    lambda = J_csc' \ (-dJ_dx)
+    vjp = compute_doping_vjp(
+        ctsys,
+        data,
+        sol,
+        u0,
+        bias_voltage,
+        cathode_breg,
+        n_bregions,
+        ones(Float64, n_nodes),
+        ones(Float64, n_nodes),
+    )
 
-    return electrons, holes, lambda
+    return electrons, holes, vjp
 end
 
 function main()

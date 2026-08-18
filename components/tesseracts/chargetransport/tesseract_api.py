@@ -2,20 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Tesseract API module for prismo_chargetransport
-# ChargeTransport.jl semiconductor drift-diffusion component (Julia subprocess).
+# ChargeTransport.jl semiconductor drift-diffusion component (Julia worker).
 #
-# Subprocess pattern: Python wrapper calls ``julia forward.jl`` (or
-# ``julia adjoint.jl`` for the VJP) with NPY/NPZ file arguments.
+# Persistent worker pattern: Python owns one Julia process for the Tesseract
+# lifecycle and exchanges NPY/NPZ file references over JSON lines.
 # Falls back to identity stub when Julia is not installed.
 #
 # Ref: tickets 02 (container + I/O), 03 (forward API), 04 (adjoint),
 #      06 (container build).
 
+import atexit
+import hashlib
 import json
 import os
+import select
 import subprocess
 import tempfile
 from pathlib import Path
+from threading import RLock
+from time import monotonic
 
 import numpy as np
 import numpy.typing as npt
@@ -74,8 +79,11 @@ class OutputSchema(BaseModel):
 # Module-level state
 #
 
-_solve_states: set[tuple[tuple[object, ...], float]] = set()
+_solve_states: set[tuple[tuple[object, ...], float, int]] = set()
 _active_profile: tuple[object, ...] | None = None
+_julia_worker: "_JuliaWorker | None" = None
+_worker_lock = RLock()
+_worker_generation = 0
 
 
 #
@@ -113,37 +121,171 @@ def _forward_state_key(
     doping: np.ndarray,
     mesh_ref: MeshRef | None,
     bias_voltage: float,
-) -> tuple[tuple[object, ...], float]:
+    worker_generation: int,
+) -> tuple[tuple[object, ...], float, int]:
     """Return an exact identity for a forward solve available to its VJP."""
     mesh_identity = None if mesh_ref is None else mesh_ref.model_dump_json()
     profile = (doping.shape, doping.dtype.str, doping.tobytes(), mesh_identity)
-    return profile, float(bias_voltage)
+    return profile, float(bias_voltage), worker_generation
 
 
-def _build_julia_cmd(
-    script: Path,
-    file_args: list[tuple[str, Path]],
-    mesh_ref: MeshRef | None,
-) -> list[str]:
-    """Build a ``julia`` subprocess command line.
+def _worker_profile_key(doping: np.ndarray, mesh_ref: MeshRef | None) -> str:
+    """Return a compact exact profile identity shared with the Julia worker."""
+    mesh_identity = _worker_mesh_identity(mesh_ref)
+    digest = hashlib.sha256()
+    digest.update(repr((doping.shape, doping.dtype.str)).encode())
+    digest.update(np.ascontiguousarray(doping).tobytes())
+    digest.update(mesh_identity)
+    return digest.hexdigest()
 
-    Args:
-        script: Path to the Julia script.
-        file_args: Pairs of (flag, file_path) to append as CLI args.
-        mesh_ref: Optional mesh reference for ``--mesh`` flag.
 
-    Returns:
-        Command list ready for ``subprocess.run``.
-    """
+def _worker_mesh_identity(mesh_ref: MeshRef | None) -> bytes:
+    """Fingerprint mesh metadata and file content independently of doping."""
+    if mesh_ref is None:
+        return b"fallback-1d-mesh"
+
+    digest = hashlib.sha256()
+    digest.update(mesh_ref.model_dump_json().encode())
+    mesh_path = Path(mesh_ref.path)
+    if mesh_path.is_file():
+        digest.update(mesh_path.read_bytes())
+    else:
+        digest.update(b"missing-mesh-file")
+    return digest.digest()
+
+
+def _worker_mesh_key(mesh_ref: MeshRef | None) -> str:
+    """Return the worker configuration key for a mesh reference."""
+    return hashlib.sha256(_worker_mesh_identity(mesh_ref)).hexdigest()
+
+
+class _JuliaWorker:
+    """One Julia process that owns reusable ChargeTransport solver state."""
+
+    def __init__(self, process: subprocess.Popen[str], generation: int) -> None:
+        self._process = process
+        self.generation = generation
+        self._lock = RLock()
+
+    def request(self, request: dict[str, object]) -> dict[str, object]:
+        """Send one request and wait for its JSON response within the budget."""
+        with self._lock:
+            if self._process.poll() is not None:
+                raise RuntimeError("Julia worker exited before handling the request")
+
+            stdin = self._process.stdin
+            stdout = self._process.stdout
+            if stdin is None or stdout is None:
+                raise RuntimeError("Julia worker does not expose a usable pipe")
+
+            try:
+                stdin.write(json.dumps(request) + "\n")
+                stdin.flush()
+            except OSError as exc:
+                self._terminate_locked()
+                raise RuntimeError("Could not send request to Julia worker") from exc
+
+            deadline = monotonic() + _JULIA_TIMEOUT_S
+            diagnostics: list[str] = []
+            while True:
+                remaining = deadline - monotonic()
+                if remaining <= 0.0:
+                    self._terminate_locked()
+                    raise TimeoutError(
+                        f"Julia worker exceeded {_JULIA_TIMEOUT_S:g}s request timeout"
+                    )
+                ready, _, _ = select.select([stdout], [], [], remaining)
+                if not ready:
+                    continue
+                response_line = stdout.readline()
+                if not response_line:
+                    self._terminate_locked()
+                    detail = "; ".join(diagnostics)
+                    raise RuntimeError(
+                        "Julia worker closed its response pipe"
+                        + (f": {detail}" if detail else "")
+                    )
+                try:
+                    response = json.loads(response_line)
+                except json.JSONDecodeError:
+                    diagnostics.append(response_line.strip())
+                    continue
+                if isinstance(response, dict) and "ok" in response:
+                    return response
+                diagnostics.append(response_line.strip())
+
+    def close(self) -> None:
+        """Stop the process, falling back to termination if it is unresponsive."""
+        with self._lock:
+            self._terminate_locked(graceful=True)
+
+    def _terminate_locked(self, *, graceful: bool = False) -> None:
+        process = self._process
+        if process.poll() is not None:
+            return
+        if graceful and process.stdin is not None:
+            try:
+                process.stdin.write('{"operation":"shutdown"}\n')
+                process.stdin.flush()
+                process.wait(timeout=2)
+                return
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def _start_julia_worker(generation: int) -> _JuliaWorker:
+    """Launch the lifecycle-owned Julia worker with the configured sysimage."""
     cmd = ["julia"]
     if _JULIA_SYSIMAGE.is_file():
         cmd.extend(["--sysimage", str(_JULIA_SYSIMAGE)])
-    cmd.append(str(script))
-    for flag, file_path in file_args:
-        cmd.extend([flag, str(file_path)])
-    if mesh_ref is not None:
-        cmd.extend(["--mesh", str(mesh_ref.path)])
-    return cmd
+    cmd.append(str(_SCRIPTS_DIR / "worker.jl"))
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Julia worker failed to start: {exc}") from exc
+    return _JuliaWorker(process, generation)
+
+
+def _get_julia_worker() -> _JuliaWorker:
+    """Return a live worker, invalidating state when a process is replaced."""
+    global _julia_worker, _worker_generation
+    with _worker_lock:
+        if _julia_worker is not None and _julia_worker._process.poll() is None:
+            return _julia_worker
+        if _julia_worker is not None:
+            _julia_worker.close()
+        _worker_generation += 1
+        _julia_worker = _start_julia_worker(_worker_generation)
+        return _julia_worker
+
+
+def shutdown() -> None:
+    """End the Julia-worker lifecycle and invalidate retained forward states."""
+    global _active_profile, _julia_worker, _worker_generation
+    with _worker_lock:
+        worker = _julia_worker
+        _julia_worker = None
+        _worker_generation += 1
+        _solve_states.clear()
+        _active_profile = None
+    if worker is not None:
+        worker.close()
+
+
+atexit.register(shutdown)
 
 
 def _run_julia_forward(
@@ -151,37 +293,27 @@ def _run_julia_forward(
     mesh_ref: MeshRef | None,
     bias_voltage: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Call ``julia forward.jl`` with NPY file arguments.
-
-    Writes doping and bias to temp NPY/JSON files, invokes the Julia
-    subprocess, and reads back carrier densities from NPZ output.
-    A failed or malformed solve raises so callers cannot mistake an identity
-    carrier field for a physical result.
-
-    Returns:
-        (electrons, holes) arrays per mesh node.
-    """
+    """Run a forward solve in the lifecycle-owned Julia worker."""
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
         doping_path = tmpdir / "doping.npy"
         np.save(doping_path, doping)
         bias_path = _write_bias_json(tmpdir, bias_voltage)
         output_path = tmpdir / "carriers.npz"
-
-        cmd = _build_julia_cmd(
-            _SCRIPTS_DIR / "forward.jl",
-            [
-                ("--doping", doping_path),
-                ("--bias", bias_path),
-                ("--output", output_path),
-            ],
-            mesh_ref,
-        )
         try:
-            subprocess.run(
-                cmd, check=True, capture_output=True, text=True,
-                timeout=_JULIA_TIMEOUT_S,
+            response = _get_julia_worker().request(
+                {
+                    "operation": "forward",
+                    "doping_path": str(doping_path),
+                    "bias_path": str(bias_path),
+                    "output_path": str(output_path),
+                    "mesh_path": "" if mesh_ref is None else str(mesh_ref.path),
+                    "mesh_key": _worker_mesh_key(mesh_ref),
+                    "profile_key": _worker_profile_key(doping, mesh_ref),
+                }
             )
+            if response.get("ok") is not True:
+                raise RuntimeError(str(response.get("error", "unknown worker error")))
             with np.load(output_path) as data:
                 electrons = np.asarray(data["electrons"], dtype=float)
                 holes = np.asarray(data["holes"], dtype=float)
@@ -191,15 +323,11 @@ def _run_julia_forward(
                     f"{electrons.shape} and {holes.shape}; expected {doping.shape}."
                 )
             if not np.all(np.isfinite(electrons)) or not np.all(np.isfinite(holes)):
-                raise RuntimeError("Julia forward solve returned non-finite carrier fields.")
+                raise RuntimeError(
+                    "Julia forward solve returned non-finite carrier fields."
+                )
             return electrons, holes
-        except (
-            subprocess.CalledProcessError,
-            subprocess.TimeoutExpired,
-            FileNotFoundError,
-            KeyError,
-            ValueError,
-        ) as exc:
+        except (KeyError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
             raise RuntimeError(f"Julia forward solve failed: {exc}") from exc
 
 
@@ -210,15 +338,7 @@ def _run_julia_adjoint(
     cotangent_electrons: np.ndarray,
     cotangent_holes: np.ndarray,
 ) -> np.ndarray:
-    """Call ``julia adjoint.jl`` with NPY file arguments.
-
-    Runs the discrete adjoint solve inside Julia and returns the VJP
-    vector dJ/d(doping) per node. A failed or malformed solve raises so
-    callers cannot optimize against a silent zero-gradient fallback.
-
-    Returns:
-        VJP vector per mesh node.
-    """
+    """Run a matched-state discrete adjoint in the Julia worker."""
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
         doping_path = tmpdir / "doping.npy"
@@ -229,23 +349,22 @@ def _run_julia_adjoint(
         np.save(cot_p_path, cotangent_holes)
         bias_path = _write_bias_json(tmpdir, bias_voltage)
         output_path = tmpdir / "vjp.npy"
-
-        cmd = _build_julia_cmd(
-            _SCRIPTS_DIR / "adjoint.jl",
-            [
-                ("--doping", doping_path),
-                ("--cotangent_n", cot_n_path),
-                ("--cotangent_p", cot_p_path),
-                ("--bias", bias_path),
-                ("--output", output_path),
-            ],
-            mesh_ref,
-        )
         try:
-            subprocess.run(
-                cmd, check=True, capture_output=True, text=True,
-                timeout=_JULIA_TIMEOUT_S,
+            response = _get_julia_worker().request(
+                {
+                    "operation": "vjp",
+                    "doping_path": str(doping_path),
+                    "cotangent_electrons_path": str(cot_n_path),
+                    "cotangent_holes_path": str(cot_p_path),
+                    "bias_path": str(bias_path),
+                    "output_path": str(output_path),
+                    "mesh_path": "" if mesh_ref is None else str(mesh_ref.path),
+                    "mesh_key": _worker_mesh_key(mesh_ref),
+                    "profile_key": _worker_profile_key(doping, mesh_ref),
+                }
             )
+            if response.get("ok") is not True:
+                raise RuntimeError(str(response.get("error", "unknown worker error")))
             vjp = np.asarray(np.load(output_path), dtype=float)
             if vjp.shape != doping.shape:
                 raise RuntimeError(
@@ -253,14 +372,11 @@ def _run_julia_adjoint(
                     f"{vjp.shape}; expected {doping.shape}."
                 )
             if not np.all(np.isfinite(vjp)):
-                raise RuntimeError("Julia adjoint solve returned non-finite VJP values.")
+                raise RuntimeError(
+                    "Julia adjoint solve returned non-finite VJP values."
+                )
             return vjp
-        except (
-            subprocess.CalledProcessError,
-            subprocess.TimeoutExpired,
-            FileNotFoundError,
-            ValueError,
-        ) as exc:
+        except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
             raise RuntimeError(f"Julia adjoint solve failed: {exc}") from exc
 
 
@@ -272,8 +388,8 @@ def _run_julia_adjoint(
 def apply(inputs: InputSchema) -> OutputSchema:
     """Forward drift-diffusion solve via ChargeTransport.jl.
 
-    When Julia is available, invokes ``julia forward.jl`` with the doping
-    array, mesh reference, and bias voltage written to temp NPY/JSON files.
+    When Julia is available, sends the doping array, mesh reference, and bias
+    voltage to a persistent worker that retains compatible solver state.
     Local development without Julia retains a deterministic identity stub;
     failures from an available Julia solver propagate to the caller.
 
@@ -285,17 +401,24 @@ def apply(inputs: InputSchema) -> OutputSchema:
     """
     doping = np.asarray(inputs.doping, dtype=float)
 
-    if _julia_available() and (_SCRIPTS_DIR / "forward.jl").exists():
+    worker_generation = _worker_generation
+    if _julia_available() and (_SCRIPTS_DIR / "worker.jl").exists():
         electrons, holes = _run_julia_forward(
             doping, inputs.mesh_ref, inputs.bias_voltage
         )
+        worker_generation = _get_julia_worker().generation
     else:
         electrons = doping.copy()
         holes = doping.copy()
 
     global _active_profile
-    state_key = _forward_state_key(doping, inputs.mesh_ref, inputs.bias_voltage)
-    profile, _ = state_key
+    state_key = _forward_state_key(
+        doping,
+        inputs.mesh_ref,
+        inputs.bias_voltage,
+        worker_generation,
+    )
+    profile, _, _ = state_key
     if _active_profile != profile:
         _solve_states.clear()
         _active_profile = profile
@@ -317,10 +440,10 @@ def vector_jacobian_product(
 ) -> dict[str, npt.ArrayLike]:
     """Adjoint gradient pass via discrete adjoint inside Julia.
 
-    When Julia is available, invokes ``julia adjoint.jl`` with the
-    doping array, cotangent vectors, and bias voltage. Local development
-    without Julia retains a deterministic identity VJP; failures from an
-    available Julia solver propagate to the caller.
+    When Julia is available, sends cotangents to the worker that owns the
+    matching forward state. Local development without Julia retains a
+    deterministic identity VJP; failures from an available Julia solver
+    propagate to the caller.
 
     Args:
         inputs: Same InputSchema as the preceding apply() call.
@@ -353,14 +476,26 @@ def vector_jacobian_product(
         holes_cot = np.full(n, float(holes_cot))
 
     doping = np.asarray(inputs.doping, dtype=float)
-    state_key = _forward_state_key(doping, inputs.mesh_ref, inputs.bias_voltage)
+    if _julia_available() and (_SCRIPTS_DIR / "worker.jl").exists():
+        try:
+            worker_generation = _get_julia_worker().generation
+        except RuntimeError as exc:
+            raise RuntimeError(f"Julia adjoint solve failed: {exc}") from exc
+    else:
+        worker_generation = _worker_generation
+    state_key = _forward_state_key(
+        doping,
+        inputs.mesh_ref,
+        inputs.bias_voltage,
+        worker_generation,
+    )
     if state_key not in _solve_states:
         raise RuntimeError(
             "ChargeTransport VJP requires a preceding apply() with identical "
             "doping, mesh reference, and bias voltage."
         )
 
-    if _julia_available() and (_SCRIPTS_DIR / "adjoint.jl").exists():
+    if _julia_available() and (_SCRIPTS_DIR / "worker.jl").exists():
         result = _run_julia_adjoint(
             doping,
             inputs.mesh_ref,

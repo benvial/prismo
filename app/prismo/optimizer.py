@@ -20,7 +20,11 @@ import nlopt
 import numpy as np
 
 from prismo.density_filter import assemble_filter_matrix
-from prismo.pipeline import pipeline
+from prismo.pipeline import (
+    begin_pipeline_callback_timing,
+    finish_pipeline_callback_timing,
+    pipeline,
+)
 
 _HistoryEntry = dict[str, Any]
 
@@ -122,11 +126,17 @@ def optimize_doping(
                 grad_out[:] = 0.0
                 return 0.0
 
-            rho = jnp.asarray(rho_np)
-            value, grad = value_and_grad_fn(rho)
+            callback_started_at = time.perf_counter()
+            begin_pipeline_callback_timing()
+            try:
+                rho = jnp.asarray(rho_np)
+                value, grad = value_and_grad_fn(rho)
 
-            f_val = float(value)
-            grad_out[:] = np.asarray(grad)
+                f_val = float(value)
+                grad_out[:] = np.asarray(grad)
+            finally:
+                phase_timing = finish_pipeline_callback_timing()
+            callback_time = time.perf_counter() - callback_started_at
 
             iter_count = len(history) + 1
             delta = 0.0
@@ -142,6 +152,8 @@ def optimize_doping(
                     "delta_rho": delta,
                     "grad_norm": g_norm,
                     "wall_time": wall,
+                    "callback_time": callback_time,
+                    "phase_timing": phase_timing,
                 }
             )
             print(
@@ -149,6 +161,7 @@ def optimize_doping(
                 f"Δneff={value:+.6e}  "
                 f"‖Δρ‖={delta:.4e}  "
                 f"‖∇f‖={g_norm:.4e}  "
+                f"callback={callback_time:.1f}s  "
                 f"wall={wall:.1f}s"
             )
 

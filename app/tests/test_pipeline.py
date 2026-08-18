@@ -204,7 +204,8 @@ class TestPipelineStub:
         monkeypatch.setattr(pl, "_ct_call_jax", fake_ct)
 
         result = pl.pipeline(
-            jnp.asarray([0.0, 1.0]), polarity=jnp.asarray([-1.0, 1.0]),
+            jnp.asarray([0.0, 1.0]),
+            polarity=jnp.asarray([-1.0, 1.0]),
         )
 
         np.testing.assert_allclose(received[0], [-1e14, 1e21])
@@ -212,7 +213,8 @@ class TestPipelineStub:
         assert float(result) > 0.0
 
     def test_effective_index_objective_is_positive_for_either_shift_direction(
-        self, monkeypatch,
+        self,
+        monkeypatch,
     ):
         """Optimization maximizes phase-shift magnitude, not its mode-sign."""
         import prismo.pipeline as pl
@@ -232,7 +234,8 @@ class TestPipelineStub:
         assert float(result) > 0.0
 
     def test_effective_index_objective_has_zero_gradient_at_zero_shift(
-        self, monkeypatch,
+        self,
+        monkeypatch,
     ):
         """The positive phase-shift objective stays differentiable at zero."""
         import prismo.pipeline as pl
@@ -298,6 +301,48 @@ class TestPipelineStub:
 
 
 class TestContainerPipeline:
+    def test_background_eigenmode_is_cached_across_pipeline_calls(self, monkeypatch):
+        """Only the rho-independent background solve survives a callback."""
+        import prismo.pipeline as pl
+
+        class FakeChargeTransport:
+            def apply(self, inputs):
+                doping = np.asarray(inputs["doping"], dtype=float)
+                carrier = np.full_like(
+                    doping,
+                    1e18 if inputs["bias_voltage"] == 0.0 else 0.0,
+                )
+                return {"electrons": carrier, "holes": carrier}
+
+        class FakeGyptis:
+            def __init__(self):
+                self.epsilon_calls: list[np.ndarray] = []
+
+            def apply(self, inputs):
+                epsilon = np.asarray(inputs["epsilon"], dtype=float)
+                self.epsilon_calls.append(epsilon)
+                return {"neff_sq": float(np.mean(epsilon))}
+
+        ct = FakeChargeTransport()
+        gyptis = FakeGyptis()
+        pl.clear_pipeline_runtime_state()
+        monkeypatch.setattr(pl, "_ct_tesseract", ct)
+        monkeypatch.setattr(pl, "_gyptis_tesseract", gyptis)
+        monkeypatch.setattr(pl, "_HAS_CT_CONTAINER", True)
+        monkeypatch.setattr(pl, "_HAS_GYPTIS_CONTAINER", True)
+
+        rho = jnp.full((4,), 0.25)
+        pipeline(rho)
+        pipeline(rho)
+
+        # Two perturbed solves plus one reused rho-independent background solve.
+        assert len(gyptis.epsilon_calls) == 3
+
+        pl.clear_pipeline_runtime_state()
+        pipeline(rho)
+        assert len(gyptis.epsilon_calls) == 5
+        pl.clear_pipeline_runtime_state()
+
     def test_container_startup_failure_raises(self, monkeypatch):
         """Container mode must not continue through a local stub."""
         import sys
