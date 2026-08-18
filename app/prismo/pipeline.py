@@ -21,6 +21,8 @@ import jax.numpy as jnp
 import numpy as np
 from prismo_shared.schemas import MeshRef, SorefBennettCoefficients
 
+from prismo.differentiable_component import DifferentiableComponent
+
 jax.config.update("jax_enable_x64", True)
 
 _COMPONENTS_DIR = Path(__file__).resolve().parents[2] / "components" / "tesseracts"
@@ -224,7 +226,7 @@ _filter_jax.defvjp(_filter_jax_fwd, _filter_jax_bwd)
 def _ct_forward_impl(
     doping_np: np.ndarray,
     bias_voltage: float,
-    mesh_ref: MeshRef | None,
+    mesh_ref: MeshRef | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     started_at = time.perf_counter()
     phase = f"ct_forward_{bias_voltage:g}V"
@@ -259,11 +261,11 @@ def _ct_forward_impl(
 
 def _ct_vjp_impl(
     doping_np: np.ndarray,
+    cotangent: tuple[np.ndarray, np.ndarray],
     bias_voltage: float,
-    mesh_ref: MeshRef | None,
-    cot_n: np.ndarray,
-    cot_p: np.ndarray,
+    mesh_ref: MeshRef | None = None,
 ) -> np.ndarray:
+    cot_n, cot_p = cotangent
     started_at = time.perf_counter()
     try:
         if _ct_tesseract is not None:
@@ -306,72 +308,43 @@ def _ct_vjp_impl(
         _record_phase_timing("ct_vjp", started_at)
 
 
-def _ct_call_impl(
-    doping: jax.Array,
-    bias_voltage: float,
-    mesh_ref: MeshRef | None,
-) -> tuple[jax.Array, jax.Array]:
-    if not _HAS_CT and not _HAS_CT_CONTAINER:
-        return doping, doping
-    return jax.pure_callback(
-        _ct_forward_impl,
-        (_shaped_like(doping), _shaped_like(doping)),
-        doping,
-        bias_voltage,
-        mesh_ref,
-    )
-
-
 # -- ChargeTransport JAX wrapper -------------------------------------------------
 
 
-@jax.custom_vjp
-def _ct_call_jax(
+def _ct_out_struct(
+    doping: jax.Array,
+    bias_voltage: float,
+    mesh_ref: MeshRef | None = None,
+) -> tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct]:
+    return _shaped_like(doping), _shaped_like(doping)
+
+
+def _ct_stub_forward(
     doping: jax.Array,
     bias_voltage: float,
     mesh_ref: MeshRef | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    return _ct_call_impl(doping, bias_voltage, mesh_ref)
+    return doping, doping
 
 
-def _ct_call_fwd(
+def _ct_stub_vjp(
     doping: jax.Array,
+    g: tuple[jax.Array, jax.Array],
     bias_voltage: float,
     mesh_ref: MeshRef | None = None,
-) -> tuple[
-    tuple[jax.Array, jax.Array],
-    tuple[jax.Array, float, MeshRef | None],
-]:
-    return _ct_call_impl(doping, bias_voltage, mesh_ref), (
-        doping,
-        bias_voltage,
-        mesh_ref,
-    )
-
-
-def _ct_call_bwd(
-    res: tuple[jax.Array, float, MeshRef | None],
-    g: tuple[jax.Array, jax.Array],
-) -> tuple[jax.Array, None, None]:
-    doping, bias_voltage, mesh_ref = res
+) -> jax.Array:
     g_electrons, g_holes = g
-
-    if not _HAS_CT and not _HAS_CT_CONTAINER:
-        return g_electrons + g_holes, None, None
-
-    vjp = jax.pure_callback(
-        _ct_vjp_impl,
-        _shaped_like(doping),
-        doping,
-        bias_voltage,
-        mesh_ref,
-        g_electrons,
-        g_holes,
-    )
-    return vjp, None, None
+    return g_electrons + g_holes
 
 
-_ct_call_jax.defvjp(_ct_call_fwd, _ct_call_bwd)
+_ct_call_jax = DifferentiableComponent(
+    forward=_ct_forward_impl,
+    vjp=_ct_vjp_impl,
+    out_struct=_ct_out_struct,
+    stub_forward=_ct_stub_forward,
+    stub_vjp=_ct_stub_vjp,
+    available=lambda: _HAS_CT or _HAS_CT_CONTAINER,
+)
 
 
 # -- gyptis external implementation ----------------------------------------------
