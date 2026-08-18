@@ -513,6 +513,80 @@ def test_vjp_matches_pn_forward_directional_difference(bias_voltage: float) -> N
     np.testing.assert_allclose(np.dot(vjp, direction), finite_difference, rtol=1e-2)
 
 
+# ---------------------------------------------------------------------------
+# Warm-start solver-state reuse (Julia worker persistence)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _julia_available(), reason="Julia not installed")
+def test_warm_started_solve_matches_robust_continuation() -> None:
+    """A nearby warm-started solve numerically matches a fresh continuation solve.
+
+    ``apply()`` on a first profile leaves the persistent Julia worker holding
+    that profile's converged state. A second, nearby profile then warm-starts
+    Newton from it (``solve_at_bias_with_warm_start`` /
+    ``solve_equilibrium_with_warm_start`` in ct_common.jl). ``shutdown()``
+    discards that retained state, so re-running the second profile afterwards
+    forces the robust doping-magnitude/adaptive-bias continuation path
+    (``solve_equilibrium`` / ``solve_at_bias``) from scratch. Both must
+    converge to the same physical carrier fields.
+    """
+    bias_voltage = -5.0
+    base = _smooth_mixed_sign_pn_profile()
+    nearby = base * 1.01  # small perturbation: stays in Newton's basin
+
+    apply(InputSchema(doping=base, bias_voltage=bias_voltage))
+    warm_started = apply(InputSchema(doping=nearby, bias_voltage=bias_voltage))
+
+    _api.shutdown()
+
+    cold_continuation = apply(InputSchema(doping=nearby, bias_voltage=bias_voltage))
+
+    np.testing.assert_allclose(
+        np.asarray(warm_started.electrons),
+        np.asarray(cold_continuation.electrons),
+        rtol=1e-6,
+        atol=1e-6 * np.max(np.abs(np.asarray(cold_continuation.electrons))),
+    )
+    np.testing.assert_allclose(
+        np.asarray(warm_started.holes),
+        np.asarray(cold_continuation.holes),
+        rtol=1e-6,
+        atol=1e-6 * np.max(np.abs(np.asarray(cold_continuation.holes))),
+    )
+
+
+@pytest.mark.skipif(not _julia_available(), reason="Julia not installed")
+def test_failed_warm_start_falls_back_to_convergence_or_explicit_error() -> None:
+    """A harsh jump that breaks single-step warm-start Newton still resolves cleanly.
+
+    Warm-starting from a mild near-equilibrium profile directly into a large
+    reverse bias on a full-magnitude PN profile is exactly the case
+    ``solve_at_bias_with_warm_start``/``solve_equilibrium_with_warm_start``
+    catch (``VoronoiFVM.ConvergenceError``/``AssemblyError``) and retry
+    through the adaptive continuation path (see ct_common.jl comments on
+    ticket 17: "A single Newton step from equilibrium fails to converge at
+    large reverse bias"). Performance work must not turn that recoverable
+    solve into a silent failure: either it still converges to finite carrier
+    fields, or it raises the same explicit ``RuntimeError`` any other failed
+    ChargeTransport solve would raise.
+    """
+    harsh_doping = _smooth_mixed_sign_pn_profile()
+    # Same node count as harsh_doping: a matching mesh keeps the persistent
+    # worker's context alive (no rebuild) so the next apply() genuinely
+    # attempts a warm start from this mild equilibrium, rather than the
+    # continuation path being reached "for free" via a mesh rebuild.
+    apply(InputSchema(doping=np.full(len(harsh_doping), 1e14), bias_voltage=0.0))
+
+    try:
+        outputs = apply(InputSchema(doping=harsh_doping, bias_voltage=-5.0))
+    except RuntimeError as exc:
+        assert "Julia forward solve failed" in str(exc)
+    else:
+        assert np.all(np.isfinite(np.asarray(outputs.electrons)))
+        assert np.all(np.isfinite(np.asarray(outputs.holes)))
+
+
 def _make_minimal_triangle_msh(path: str) -> None:
     """Write a minimal Gmsh v2.2 mesh with physical-group contacts.
 
