@@ -22,8 +22,7 @@ import numpy as np
 from prismo.density_filter import assemble_filter_matrix
 from prismo.pipeline import (
     PipelineComponents,
-    begin_pipeline_callback_timing,
-    finish_pipeline_callback_timing,
+    default_components,
     pipeline,
 )
 
@@ -103,10 +102,11 @@ def optimize_doping(
         H = jnp.asarray(H_sparse.toarray())
         H_sum = jnp.sum(H, axis=1)
 
+    if components is None:
+        components = default_components()
+
     def _pipe(rho: jax.Array) -> jax.Array:
-        return pipeline(
-            rho, H=H, H_sum=H_sum, polarity=polarity, components=components
-        )
+        return pipeline(rho, H=H, H_sum=H_sum, polarity=polarity, components=components)
 
     value_and_grad_fn = jax.value_and_grad(_pipe)
     if use_jit:
@@ -133,7 +133,6 @@ def optimize_doping(
                 return 0.0
 
             callback_started_at = time.perf_counter()
-            begin_pipeline_callback_timing()
             try:
                 rho = jnp.asarray(rho_np)
                 value, grad = value_and_grad_fn(rho)
@@ -141,7 +140,7 @@ def optimize_doping(
                 f_val = float(value)
                 grad_out[:] = np.asarray(grad)
             finally:
-                phase_timing = finish_pipeline_callback_timing()
+                phase_timing = components.collect_phase_timing()
             callback_time = time.perf_counter() - callback_started_at
 
             iter_count = len(history) + 1

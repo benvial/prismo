@@ -65,51 +65,70 @@ class _PhaseTiming:
     cold_seconds: float = 0.0
 
 
-_timing_lock = RLock()
-_active_phase_timing: dict[str, _PhaseTiming] | None = None
-_seen_timing_phases: set[str] = set()
+class PhaseTimer:
+    """Per-component boundary timing owned by the components, not a global.
 
+    Records elapsed time per phase label (e.g. ``ct_forward_0V``, ``ct_vjp``),
+    tracking cold (first-use) versus warm cost. ``collect`` returns the tallies
+    accumulated since the previous ``collect`` and resets them for the next
+    optimizer callback, while the cold/warm phase memory persists for the
+    component's lifetime.
+    """
 
-def begin_pipeline_callback_timing() -> None:
-    """Start collecting component timings for one optimizer callback."""
-    global _active_phase_timing
-    with _timing_lock:
-        _active_phase_timing = {}
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._tallies: dict[str, _PhaseTiming] = {}
+        self._seen: set[str] = set()
 
+    def record(self, name: str, started_at: float) -> None:
+        """Record one component-boundary call without exposing solver internals."""
+        elapsed = time.perf_counter() - started_at
+        with self._lock:
+            cold = name not in self._seen
+            self._seen.add(name)
+            timing = self._tallies.setdefault(name, _PhaseTiming())
+            timing.calls += 1
+            timing.seconds += elapsed
+            timing.cold_calls += int(cold)
+            if cold:
+                timing.cold_seconds += elapsed
 
-def finish_pipeline_callback_timing() -> dict[str, dict[str, float | int]]:
-    """Return timings collected since ``begin_pipeline_callback_timing``."""
-    global _active_phase_timing
-    with _timing_lock:
-        phases = _active_phase_timing or {}
-        _active_phase_timing = None
-        return {
-            name: {
-                "calls": timing.calls,
-                "seconds": timing.seconds,
-                "cold_calls": timing.cold_calls,
-                "cold_seconds": timing.cold_seconds,
-                "warm_seconds": timing.seconds - timing.cold_seconds,
+    def collect(self) -> dict[str, dict[str, float | int]]:
+        """Return and reset the tallies accumulated since the last collect."""
+        with self._lock:
+            result = {
+                name: {
+                    "calls": timing.calls,
+                    "seconds": timing.seconds,
+                    "cold_calls": timing.cold_calls,
+                    "cold_seconds": timing.cold_seconds,
+                    "warm_seconds": timing.seconds - timing.cold_seconds,
+                }
+                for name, timing in self._tallies.items()
             }
-            for name, timing in phases.items()
-        }
+            self._tallies = {}
+            return result
 
 
-def _record_phase_timing(name: str, started_at: float) -> None:
-    """Record a component-boundary call without exposing solver internals."""
-    global _active_phase_timing
-    elapsed = time.perf_counter() - started_at
-    with _timing_lock:
-        cold = name not in _seen_timing_phases
-        _seen_timing_phases.add(name)
-        if _active_phase_timing is None:
-            return
-        timing = _active_phase_timing.setdefault(name, _PhaseTiming())
-        timing.calls += 1
-        timing.seconds += elapsed
-        timing.cold_calls += int(cold)
-        if cold:
-            timing.cold_seconds += elapsed
+@dataclass(frozen=True)
+class TimedComponent:
+    """A differentiable component paired with the timer it records into.
+
+    Callable exactly like the wrapped component and transparently delegating
+    its attributes, so ``pipeline()`` composes it unchanged. The optimizer
+    reads per-callback timings from ``timer`` after each callback instead of a
+    global begin/finish protocol.
+    """
+
+    component: DifferentiableComponent
+    timer: PhaseTimer
+
+    def __call__(self, x: jax.Array, *static: Any) -> Any:
+        """Evaluate the wrapped component."""
+        return self.component(x, *static)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.component, name)
 
 
 def init_tesseract_containers() -> PipelineComponents:
@@ -243,13 +262,15 @@ def _ct_stub_vjp(
 def build_chargetransport_component(
     container: Any | None = None,
     local_api: Any | None = None,
-) -> DifferentiableComponent:
+) -> TimedComponent:
     """Build the ChargeTransport component bound to one backend.
 
     ``container`` is a running Tesseract handle; ``local_api`` an in-process
     ``tesseract_api`` module. With neither, the component is a differentiable
     identity stub. The backend is captured here, not read from module globals.
+    Returns a :class:`TimedComponent` owning the phase timer it records into.
     """
+    timer = PhaseTimer()
 
     def forward(
         doping_np: np.ndarray,
@@ -260,9 +281,7 @@ def build_chargetransport_component(
         phase = f"ct_forward_{bias_voltage:g}V"
 
         def from_container(tess: Any) -> tuple[np.ndarray, np.ndarray]:
-            result = tess.apply(
-                _ct_container_inputs(doping_np, bias_voltage, mesh_ref)
-            )
+            result = tess.apply(_ct_container_inputs(doping_np, bias_voltage, mesh_ref))
             return (
                 np.asarray(result["electrons"], dtype=doping_np.dtype),
                 np.asarray(result["holes"], dtype=doping_np.dtype),
@@ -287,7 +306,7 @@ def build_chargetransport_component(
                 local_call=from_local,
             )
         finally:
-            _record_phase_timing(phase, started_at)
+            timer.record(phase, started_at)
 
     def vjp(
         doping_np: np.ndarray,
@@ -326,9 +345,9 @@ def build_chargetransport_component(
                 local_call=from_local,
             )
         finally:
-            _record_phase_timing("ct_vjp", started_at)
+            timer.record("ct_vjp", started_at)
 
-    return DifferentiableComponent(
+    component = DifferentiableComponent(
         forward=forward,
         vjp=vjp,
         out_struct=_ct_out_struct,
@@ -336,6 +355,7 @@ def build_chargetransport_component(
         stub_vjp=_ct_stub_vjp,
         available=lambda: container is not None or local_api is not None,
     )
+    return TimedComponent(component, timer)
 
 
 # -- gyptis component ------------------------------------------------------------
@@ -369,14 +389,17 @@ def _gyptis_background_stub_vjp(epsilon: jax.Array, g: jax.Array) -> jax.Array:
 def build_gyptis_components(
     container: Any | None = None,
     local_api: Any | None = None,
-) -> tuple[DifferentiableComponent, DifferentiableComponent]:
+) -> tuple[TimedComponent, TimedComponent]:
     """Build the perturbed and background gyptis components for one backend.
 
     Both share a background eigenmode cache owned by this call, so the
-    rho-independent background solve runs once per component lifecycle. The
+    rho-independent background solve runs once per component lifecycle, and one
+    phase timer, so their combined boundary timings read from one place. The
     backend is captured here, not read from module globals.
     """
     background_cache: dict[tuple[tuple[int, ...], str, bytes], np.ndarray] = {}
+    cache_lock = RLock()
+    timer = PhaseTimer()
 
     def available() -> bool:
         return container is not None or local_api is not None
@@ -405,19 +428,19 @@ def build_gyptis_components(
                 local_call=from_local,
             )
         finally:
-            _record_phase_timing(phase, started_at)
+            timer.record(phase, started_at)
 
     def background_forward(epsilon_np: np.ndarray) -> np.ndarray:
         key = (epsilon_np.shape, epsilon_np.dtype.str, epsilon_np.tobytes())
-        with _timing_lock:
+        with cache_lock:
             cached = background_cache.get(key)
         if cached is not None:
             started_at = time.perf_counter()
-            _record_phase_timing("gyptis_background_cache", started_at)
+            timer.record("gyptis_background_cache", started_at)
             return cached.copy()
 
         result = forward(epsilon_np, phase="gyptis_background_forward")
-        with _timing_lock:
+        with cache_lock:
             background_cache[key] = result.copy()
         return result
 
@@ -451,7 +474,7 @@ def build_gyptis_components(
                 local_call=from_local,
             )
         finally:
-            _record_phase_timing("gyptis_vjp", started_at)
+            timer.record("gyptis_vjp", started_at)
 
     perturbed = DifferentiableComponent(
         forward=forward,
@@ -470,7 +493,7 @@ def build_gyptis_components(
         stub_vjp=_gyptis_background_stub_vjp,
         available=available,
     )
-    return perturbed, background
+    return TimedComponent(perturbed, timer), TimedComponent(background, timer)
 
 
 def _build_domain_epsilon(
@@ -506,15 +529,37 @@ class PipelineComponents:
     it via ``close()``.
     """
 
-    chargetransport: DifferentiableComponent
-    gyptis: DifferentiableComponent
-    gyptis_background: DifferentiableComponent
+    chargetransport: Callable[..., Any]
+    gyptis: Callable[..., Any]
+    gyptis_background: Callable[..., Any]
     closers: tuple[Callable[[], None], ...] = field(default=())
 
     def close(self) -> None:
         """Release owned resources (containers, worker processes)."""
         for close in reversed(self.closers):
             close()
+
+    def collect_phase_timing(self) -> dict[str, dict[str, float | int]]:
+        """Merge each component's per-callback phase timings and reset them.
+
+        Reads the ``PhaseTimer`` each timed component owns rather than a global
+        begin/finish protocol. Components sharing a timer (the gyptis pair) are
+        collected once; components without one (e.g. test fakes) contribute
+        nothing.
+        """
+        merged: dict[str, dict[str, float | int]] = {}
+        seen_timers: set[int] = set()
+        for component in (
+            self.chargetransport,
+            self.gyptis,
+            self.gyptis_background,
+        ):
+            timer = getattr(component, "timer", None)
+            if timer is None or id(timer) in seen_timers:
+                continue
+            seen_timers.add(id(timer))
+            merged.update(timer.collect())
+        return merged
 
 
 def build_default_components() -> PipelineComponents:
@@ -542,6 +587,11 @@ def build_default_components() -> PipelineComponents:
 
 
 _DEFAULT_COMPONENTS: PipelineComponents = build_default_components()
+
+
+def default_components() -> PipelineComponents:
+    """The shared in-process components ``pipeline()`` uses without a bundle."""
+    return _DEFAULT_COMPONENTS
 
 
 # 1 cm^-3 = 1e6 m^-3: ChargeTransport output -> Soref-Bennett input.
