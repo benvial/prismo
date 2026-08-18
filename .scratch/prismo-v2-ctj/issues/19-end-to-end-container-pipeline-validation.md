@@ -4,7 +4,7 @@
 
 **Blocked by:** 17, 18
 
-**Status:** needs-info
+**Status:** superseded by 23
 
 - [ ] `make run-containers` starts both containers, runs at least 5 MMA iterations, and tears down containers
 - [ ] Per-iteration log shows `Δneff > 0` (optimizer maximizes Δneff, starts from zero at uniform ρ=0.25, improves over iterations)
@@ -49,3 +49,9 @@ both values. This is consistent with ChargeTransport's documented mixed-sign
 PN solve fallback after MMA moves the initial profile. Ticket needs a solver
 that accepts evolved mixed-sign profiles without identity fallback before it
 can generate the required plots.
+
+2026-08-18: tickets 21/22 delivered that mixed-sign PN forward/adjoint
+solver, and ticket 23 re-ran this exact scenario successfully — five
+container evaluations, Δneff increasing monotonically, nonzero gradients
+throughout, all four output plots generated. Superseding this ticket in
+favor of 23 rather than duplicating its acceptance criteria here.
