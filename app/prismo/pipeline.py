@@ -24,6 +24,7 @@ from prismo_shared.schemas import MeshRef, SorefBennettCoefficients
 
 from prismo.differentiable_component import (
     DifferentiableComponent,
+    has_backend,
     invoke_tesseract,
 )
 
@@ -131,6 +132,14 @@ class TimedComponent:
         return getattr(self.component, name)
 
 
+def _close_all(
+    closers: tuple[Callable[[], None], ...] | list[Callable[[], None]],
+) -> None:
+    """Run resource closers in reverse (last-acquired first)."""
+    for close in reversed(closers):
+        close()
+
+
 def init_tesseract_containers() -> PipelineComponents:
     """Start tesseract Docker containers and bundle the live components.
 
@@ -152,8 +161,7 @@ def init_tesseract_containers() -> PipelineComponents:
         ct_tesseract.serve()
         closers.append(ct_tesseract.teardown)
     except Exception as exc:
-        for close in reversed(closers):
-            close()
+        _close_all(closers)
         raise RuntimeError("Failed to start ChargeTransport container") from exc
 
     try:
@@ -161,8 +169,7 @@ def init_tesseract_containers() -> PipelineComponents:
         gyptis_tesseract.serve()
         closers.append(gyptis_tesseract.teardown)
     except Exception as exc:
-        for close in reversed(closers):
-            close()
+        _close_all(closers)
         raise RuntimeError("Failed to start gyptis container") from exc
 
     chargetransport = build_chargetransport_component(container=ct_tesseract)
@@ -353,7 +360,7 @@ def build_chargetransport_component(
         out_struct=_ct_out_struct,
         stub_forward=_ct_stub_forward,
         stub_vjp=_ct_stub_vjp,
-        available=lambda: container is not None or local_api is not None,
+        available=lambda: has_backend(container, local_api),
     )
     return TimedComponent(component, timer)
 
@@ -402,7 +409,7 @@ def build_gyptis_components(
     timer = PhaseTimer()
 
     def available() -> bool:
-        return container is not None or local_api is not None
+        return has_backend(container, local_api)
 
     def forward(
         epsilon_np: np.ndarray,
@@ -536,8 +543,7 @@ class PipelineComponents:
 
     def close(self) -> None:
         """Release owned resources (containers, worker processes)."""
-        for close in reversed(self.closers):
-            close()
+        _close_all(self.closers)
 
     def collect_phase_timing(self) -> dict[str, dict[str, float | int]]:
         """Merge each component's per-callback phase timings and reset them.

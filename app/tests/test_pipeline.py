@@ -385,6 +385,41 @@ class TestContainerPipeline:
         with pytest.raises(RuntimeError, match="HTTP 500"):
             perturbed.forward(np.array([12.0, 12.0]))
 
+    def test_two_configured_pipelines_coexist_without_interfering(self):
+        """Differently-configured bundles run in one process independently."""
+
+        class FakeGyptis:
+            def apply(self, inputs):
+                return {"neff_sq": float(np.mean(inputs["epsilon"]))}
+
+        def make_bundle(carriers_0v: float) -> PipelineComponents:
+            def fake_ct(doping, bias_voltage, mesh_ref=None):
+                value = carriers_0v if bias_voltage == 0.0 else 0.0
+                filled = jnp.full_like(doping, value)
+                return filled, filled
+
+            perturbed, background = build_gyptis_components(container=FakeGyptis())
+            return PipelineComponents(
+                chargetransport=fake_ct,
+                gyptis=perturbed,
+                gyptis_background=background,
+            )
+
+        depleting = make_bundle(1e24)  # carriers at 0 V, depleted at -5 V
+        flat = make_bundle(0.0)  # no carrier change between biases
+
+        rho = jnp.full((4,), 0.25)
+        result_depleting = float(pipeline(rho, components=depleting))
+        result_flat = float(pipeline(rho, components=flat))
+
+        # Each pipeline reflects its own components; no shared mutable state.
+        assert result_depleting > 0.0
+        np.testing.assert_allclose(result_flat, 0.0, atol=1e-12)
+        # Re-running the first bundle still yields its own result.
+        assert float(pipeline(rho, components=depleting)) == pytest.approx(
+            result_depleting
+        )
+
 
 class TestComponentTiming:
     """Phase timing is owned by the components, read via the bundle."""

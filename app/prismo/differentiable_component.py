@@ -34,6 +34,11 @@ import jax
 _T = TypeVar("_T")
 
 
+def has_backend(container: Any | None, local_api: Any | None) -> bool:
+    """Whether a real (container or local) backend exists for a component."""
+    return container is not None or local_api is not None
+
+
 def invoke_tesseract(
     container: Any | None,
     local_api: Any | None,
@@ -57,10 +62,13 @@ def invoke_tesseract(
 
 @dataclass(frozen=True)
 class DifferentiableComponent:
-    """A ``(forward, vjp, out_struct)`` triple made JAX-differentiable.
+    """An external component made JAX-differentiable via one adapter.
 
-    Calling the instance evaluates the component with one differentiable
-    array input ``x`` followed by any static (non-differentiated) arguments.
+    Carries the real ``forward``/``vjp`` numpy callables, the forward
+    ``out_struct``, the ``stub_forward``/``stub_vjp`` used when no backend is
+    available, and an ``available`` predicate. Calling the instance evaluates
+    the component with one differentiable array input ``x`` followed by any
+    static (non-differentiated) arguments.
     """
 
     forward: Callable[..., Any]
@@ -81,14 +89,10 @@ class DifferentiableComponent:
         def call(x: jax.Array, static: tuple[Any, ...]) -> Any:
             return self._forward_value(x, static)
 
-        def call_fwd(
-            x: jax.Array, static: tuple[Any, ...]
-        ) -> tuple[Any, jax.Array]:
+        def call_fwd(x: jax.Array, static: tuple[Any, ...]) -> tuple[Any, jax.Array]:
             return self._forward_value(x, static), x
 
-        def call_bwd(
-            static: tuple[Any, ...], x: jax.Array, g: Any
-        ) -> tuple[jax.Array]:
+        def call_bwd(static: tuple[Any, ...], x: jax.Array, g: Any) -> tuple[jax.Array]:
             return (self._vjp_value(x, static, g),)
 
         call.defvjp(call_fwd, call_bwd)
