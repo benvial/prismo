@@ -366,27 +366,55 @@ def test_vjp_rejects_changed_forward_inputs(
 
 
 # ---------------------------------------------------------------------------
-# Subprocess timeout behavior (mocked Julia path)
+# Worker timeout behavior (mocked Julia path)
 # ---------------------------------------------------------------------------
+#
+# The forward/VJP calls dispatch through ``_JuliaWorker.request``, which
+# raises ``TimeoutError`` when its ``select``-based deadline loop expires (see
+# ``_JuliaWorker.request`` in tesseract_api.py). Mocking ``subprocess.run``
+# does not reach that path any more, so these stubs patch ``_get_julia_worker``
+# directly to exercise the real timeout handling in ``_run_julia_forward`` /
+# ``_run_julia_adjoint``.
 
 
-def _force_julia_path_with_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pretend Julia is installed but every invocation hangs past timeout."""
-    import subprocess as sp
+class _AlwaysTimesOutWorker:
+    """Worker stub whose every request exceeds its timeout budget."""
 
-    monkeypatch.setattr(_api, "_julia_available", lambda: True)
+    generation = 999999
 
-    def _hang(*args: object, **kwargs: object) -> None:
-        raise sp.TimeoutExpired(cmd="julia", timeout=1)
+    def request(self, request: dict[str, object]) -> dict[str, object]:
+        raise TimeoutError("Julia worker exceeded 1s request timeout")
 
-    monkeypatch.setattr(_api.subprocess, "run", _hang)
+
+class _ForwardSucceedsThenTimesOutWorker:
+    """Worker stub: one forward request succeeds, later requests time out.
+
+    Lets a test register a matching forward state via a real ``apply()``
+    call before forcing the *next* request (typically a VJP) to time out.
+    """
+
+    generation = 999998
+
+    def __init__(self, doping: np.ndarray) -> None:
+        self._doping = doping
+
+    def request(self, request: dict[str, object]) -> dict[str, object]:
+        if request.get("operation") != "forward":
+            raise TimeoutError("Julia worker exceeded 1s request timeout")
+        np.savez(
+            request["output_path"],
+            electrons=self._doping.copy(),
+            holes=self._doping.copy(),
+        )
+        return {"ok": True}
 
 
 def test_apply_propagates_julia_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     doping = np.array([1e22, -5e21, 0.0, 5e21, -1e22], dtype=float)
-    _force_julia_path_with_timeout(monkeypatch)
+    monkeypatch.setattr(_api, "_julia_available", lambda: True)
+    monkeypatch.setattr(_api, "_get_julia_worker", lambda: _AlwaysTimesOutWorker())
     with pytest.raises(RuntimeError, match="Julia forward solve failed"):
         apply(InputSchema(doping=doping, bias_voltage=-5.0))
 
@@ -394,9 +422,13 @@ def test_apply_propagates_julia_timeout(
 def test_vjp_propagates_julia_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    inputs = make_inputs()
+    doping = np.array([1e22, -5e21, 0.0, 5e21, -1e22], dtype=float)
+    inputs = InputSchema(doping=doping, bias_voltage=-5.0)
+    monkeypatch.setattr(_api, "_julia_available", lambda: True)
+    monkeypatch.setattr(
+        _api, "_get_julia_worker", lambda: _ForwardSucceedsThenTimesOutWorker(doping)
+    )
     apply(inputs)
-    _force_julia_path_with_timeout(monkeypatch)
     with pytest.raises(RuntimeError, match="Julia adjoint solve failed"):
         vector_jacobian_product(
             inputs,
