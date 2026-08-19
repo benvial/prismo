@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib import tri as mtri
 from matplotlib.colors import SymLogNorm
 
 matplotlib.use("Agg")
@@ -37,6 +38,35 @@ def _ensure_output_dir(output_dir: str | Path | None = None) -> Path:
     d = Path(output_dir) if output_dir is not None else _OUTPUT_DIR
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _pcolormesh_field(
+    ax: plt.Axes,
+    x: np.ndarray,
+    y: np.ndarray,
+    values: np.ndarray,
+    **kwargs: object,
+) -> matplotlib.collections.QuadMesh:
+    """Render nodal values with ``pcolormesh``, resampling irregular meshes."""
+    x_values = np.unique(x)
+    y_values = np.unique(y)
+    if x_values.size * y_values.size != values.size:
+        triangulation = mtri.Triangulation(x, y)
+        interpolator = mtri.LinearTriInterpolator(triangulation, values)
+        n_x = min(400, max(2, int(np.sqrt(values.size))))
+        x_grid = np.linspace(x.min(), x.max(), n_x)
+        x_span = x.max() - x.min()
+        y_span = y.max() - y.min()
+        n_y = max(2, round(n_x * y_span / x_span)) if x_span else n_x
+        y_grid = np.linspace(y.min(), y.max(), n_y)
+        xx, yy = np.meshgrid(x_grid, y_grid)
+        return ax.pcolormesh(
+            x_grid, y_grid, interpolator(xx, yy), shading="nearest", **kwargs,
+        )
+
+    order = np.lexsort((x, y))
+    field = np.asarray(values)[order].reshape(y_values.size, x_values.size)
+    return ax.pcolormesh(x_values, y_values, field, shading="nearest", **kwargs)
 
 
 def plot_convergence(
@@ -125,17 +155,18 @@ def plot_doping_field(
 
     fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(10, 4))
 
-    vmin, vmax = 0.0, 1.0
-    scatter_kw: dict = dict(s=1, marker="s", edgecolors="none", vmin=vmin, vmax=vmax)
+    # Signed design field theta in [-1, 1]: diverging map centred on the theta=0
+    # junction so the p-side (theta<0) is not clipped.
+    mesh_kw: dict = dict(vmin=-1.0, vmax=1.0, cmap="RdBu_r")
 
-    ax0.scatter(x, y, c=rho_initial, cmap="viridis", **scatter_kw)
-    ax0.set_title(r"Initial $\rho$ (uniform)")
+    _pcolormesh_field(ax0, x, y, rho_initial, **mesh_kw)
+    ax0.set_title(r"Initial $\theta$")
     ax0.set_xlabel("x [µm]")
     ax0.set_ylabel("y [µm]")
     ax0.set_aspect("equal")
 
-    sc1 = ax1.scatter(x, y, c=rho_opt, cmap="viridis", **scatter_kw)
-    ax1.set_title(r"Optimized $\rho$")
+    sc1 = _pcolormesh_field(ax1, x, y, rho_opt, **mesh_kw)
+    ax1.set_title(r"Optimized $\theta$")
     ax1.set_xlabel("x [µm]")
     ax1.set_ylabel("y [µm]")
     ax1.set_aspect("equal")
@@ -144,8 +175,8 @@ def plot_doping_field(
         _overlay_geometry(ax0, geometry)
         _overlay_geometry(ax1, geometry)
 
-    cbar = fig.colorbar(sc1, ax=[ax0, ax1], shrink=0.7, label=r"$\rho$")
-    cbar.set_ticks([0.0, 0.25, 0.5, 0.75, 1.0])
+    cbar = fig.colorbar(sc1, ax=[ax0, ax1], shrink=0.7, label=r"$\theta$ (signed)")
+    cbar.set_ticks([-1.0, -0.5, 0.0, 0.5, 1.0])
 
     fig.tight_layout()
     path = out / "doping_field.pdf"
@@ -160,6 +191,7 @@ def plot_live_doping_field(
     iteration: int,
     geometry: object | None = None,
     output_dir: str | Path | None = None,
+    name: str | None = None,
 ) -> Path:
     """Update the optimizer's current signed doping-field image.
 
@@ -173,13 +205,11 @@ def plot_live_doping_field(
     limit = max(limit, 1e14)
 
     fig, ax = plt.subplots(figsize=(6, 4))
-    scatter = ax.scatter(
+    mesh = _pcolormesh_field(
+        ax,
         x,
         y,
-        c=doping,
-        s=2,
-        marker="s",
-        edgecolors="none",
+        doping,
         cmap="RdBu_r",
         norm=SymLogNorm(linthresh=1e14, vmin=-limit, vmax=limit, base=10),
     )
@@ -189,11 +219,13 @@ def plot_live_doping_field(
     ax.set_aspect("equal")
     if geometry is not None:
         _overlay_geometry(ax, geometry)
-    fig.colorbar(scatter, ax=ax, label=r"Net doping [cm$^{-3}$]")
+    fig.colorbar(mesh, ax=ax, label=r"Net doping [cm$^{-3}$]")
     fig.tight_layout()
 
-    path = out / "doping_field_live.png"
-    temporary_path = out / ".doping_field_live.tmp.png"
+    name = name or "doping_field_live"
+
+    path = out / f"{name}.png"
+    temporary_path = out / f".{name}.tmp.png"
     fig.savefig(temporary_path)
     plt.close(fig)
     temporary_path.replace(path)
@@ -329,9 +361,11 @@ def plot_gradient_validation(
         positive = np.asarray(direction) > 0.0
         negative = np.asarray(direction) < 0.0
         rho_np = np.asarray(rho)
+        # Keep the perturbed field inside the signed design bounds [-1, 1] so
+        # every FD sample stays feasible for the optimizer's box.
         max_step = min(
             np.min((1.0 - rho_np[positive]) / np.asarray(direction)[positive], initial=np.inf),
-            np.min(rho_np[negative] / -np.asarray(direction)[negative], initial=np.inf),
+            np.min((rho_np[negative] + 1.0) / -np.asarray(direction)[negative], initial=np.inf),
         )
         feasible_steps = step_sizes[step_sizes < max_step]
         if len(feasible_steps) == 0:

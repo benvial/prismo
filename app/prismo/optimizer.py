@@ -40,13 +40,12 @@ def optimize_doping(
     n_nodes: int | None = None,
     H: jax.Array | None = None,
     H_sum: jax.Array | None = None,
-    polarity: jax.Array | None = None,
     mesh_coords: np.ndarray | None = None,
     mesh_path: str | Path | None = None,
     r_min: float = 50e-9,
     *,
     max_iter: int = 200,
-    ftol_rel: float = 1e-5,
+    ftol_rel: float = 1e-3,
     min_mma_evaluations: int = 0,
     use_jit: bool = True,
     on_iteration: Callable[[int, np.ndarray], None] | None = None,
@@ -57,15 +56,16 @@ def optimize_doping(
     """Run the NLopt MMA optimization loop.
 
     Args:
-        initial_rho: Starting design vector ``(n_nodes,)`` in ``[0, 1]``.
-            Defaults to uniform 0.25.
+        initial_rho: Starting signed design field ``(n_nodes,)`` in ``[-1, 1]``.
+            Defaults to a uniform 0.25 fallback; the real run seeds a signed
+            junction (``main.py``). The name is retained for call-site
+            compatibility.
         n_nodes: Number of mesh nodes (derived from ``initial_rho`` if given,
             else required when ``H`` / ``mesh_coords`` / ``mesh_path`` is
             provided).
         H: Dense filter matrix ``(n_nodes, n_nodes)``. Built from
             ``mesh_coords`` or ``mesh_path`` if omitted.
         H_sum: Pre-computed row sums of ``H``.
-        polarity: Fixed per-node P/N polarity applied to doping magnitudes.
         mesh_coords: ``(n_nodes, 2)`` node coordinates for building the
             filter matrix.
         mesh_path: Path to a ``.msh`` file for building the filter matrix
@@ -123,7 +123,6 @@ def optimize_doping(
             rho,
             H=H,
             H_sum=H_sum,
-            polarity=polarity,
             mesh_ref=mesh_ref,
             design_transfer=design_transfer,
             components=components,
@@ -198,8 +197,17 @@ def optimize_doping(
 
         for algorithm in (nlopt.LD_MMA, nlopt.LD_CCSAQ):
             opt = nlopt.opt(algorithm, n_nodes)
-            opt.set_lower_bounds(0.0)
+            # Signed design field: sign(theta) is the free P/N polarity.
+            opt.set_lower_bounds(-1.0)
             opt.set_upper_bounds(1.0)
+            # The default MMA step can jump most nodal densities from the
+            # near-intrinsic initial state to the upper bound in one update.
+            # ChargeTransport's continuation then has no nearby physical
+            # state to warm-start, and its reverse-bias Newton solve can
+            # fail.  Limit only the optimizer's initial move: later steps
+            # still adapt and every value in the signed [-1, 1] design
+            # space remains reachable.
+            opt.set_initial_step(0.05)
             opt.set_max_objective(_obj)
             opt.set_maxeval(max_iter)
             opt.set_ftol_rel(ftol_rel)

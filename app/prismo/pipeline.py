@@ -33,27 +33,76 @@ jax.config.update("jax_enable_x64", True)
 
 _COMPONENTS_DIR = Path(__file__).resolve().parents[2] / "components" / "tesseracts"
 
-# Doping mapping N(rho) = 10^(DOPING_LOG10_MIN + DOPING_LOG10_SPAN * rho) [cm^-3].
-# rho=0 -> 10^14 (intrinsic Si); rho=1 -> 10^21 (solid-solubility limit). See
-# CONTEXT.md.
-DOPING_LOG10_MIN = 14.0
-DOPING_LOG10_SPAN = 7.0
+# Signed net-doping map, zero-referenced and continuous through theta=0:
+#   N(theta) = sign(theta) * DOPING_REFERENCE_CM3 * (10^(DOPING_LOG10_SPAN*|theta|) - 1)
+# theta in [-1, 1] is the single signed design field. sign(theta) is the free
+# P/N polarity, so the junction is exactly the zero-crossing (the optimizer moves
+# it) and counterdoping is not representable. theta=0 -> 0 (net-intrinsic); a
+# larger |theta| dopes harder, saturating at |N| ~ 1e19 cm^-3 at |theta|=1 -- the
+# largest reverse-bias-stable concentration on the shared ChargeTransport mesh,
+# within the B/P solid-solubility and Boltzmann-statistics window. Code = comment
+# = glossary (CONTEXT.md).
+DOPING_REFERENCE_CM3 = 1e14
+DOPING_LOG10_SPAN = 5.0
 
 
-def doping_from_rho(
-    rho: jax.Array,
-    polarity: jax.Array | None = None,
-) -> jax.Array:
-    """Map normalized density to signed net doping in ``cm^-3``."""
-    rho = jnp.asarray(rho)
-    doping = jnp.power(
-        jnp.asarray(10.0, dtype=rho.dtype),
-        jnp.asarray(DOPING_LOG10_MIN, dtype=rho.dtype)
-        + jnp.asarray(DOPING_LOG10_SPAN, dtype=rho.dtype) * rho,
+@jax.custom_jvp
+def doping_from_theta(theta: jax.Array) -> jax.Array:
+    """Map the signed design field ``theta`` to signed net doping in ``cm^-3``.
+
+    ``N(theta) = sign(theta) * 1e14 * (10^(span*|theta|) - 1)``. The map is
+    zero-referenced (``N(0) = 0``) and antisymmetric, so a single ``theta``
+    sign-crossing is a single P/N junction and no node can counterdope.
+    """
+    theta = jnp.asarray(theta)
+    span = jnp.asarray(DOPING_LOG10_SPAN, dtype=theta.dtype)
+    reference = jnp.asarray(DOPING_REFERENCE_CM3, dtype=theta.dtype)
+    magnitude = reference * (jnp.power(10.0, span * jnp.abs(theta)) - 1.0)
+    return jnp.sign(theta) * magnitude
+
+
+@doping_from_theta.defjvp
+def _doping_from_theta_jvp(
+    primals: tuple[jax.Array], tangents: tuple[jax.Array]
+) -> tuple[jax.Array, jax.Array]:
+    """Analytic derivative ``dN/dtheta = 1e14 * ln10 * span * 10^(span*|theta|)``.
+
+    The map is C^1 through the junction: the derivative is even and continuous,
+    with the true slope ``1e14 * ln10 * span`` at ``theta=0``. Autodiff of the
+    raw ``sign(theta) * |theta|`` form collapses to zero there (``sign(0)**2``),
+    so the crossing -- exactly where the optimizer moves the junction -- is given
+    its correct one-sided limit here.
+    """
+    (theta,) = primals
+    (theta_dot,) = tangents
+    theta = jnp.asarray(theta)
+    span = jnp.asarray(DOPING_LOG10_SPAN, dtype=theta.dtype)
+    reference = jnp.asarray(DOPING_REFERENCE_CM3, dtype=theta.dtype)
+    derivative = (
+        reference
+        * jnp.log(jnp.asarray(10.0, dtype=theta.dtype))
+        * span
+        * jnp.power(10.0, span * jnp.abs(theta))
     )
-    if polarity is not None:
-        doping = doping * jnp.asarray(polarity, dtype=rho.dtype)
-    return doping
+    return doping_from_theta(theta), derivative * theta_dot
+
+
+# Initial junction magnitude for the signed design field: moderate, non-degenerate
+# doping the reverse-bias solve converges on, well inside the [-1, 1] bounds.
+_JUNCTION_SEED_THETA = 0.3
+
+
+def seed_signed_junction(coords: np.ndarray) -> jax.Array:
+    """Seed a signed lateral P/N junction across the mesh in every run path.
+
+    Nodes left of the median x seed p-type (``-0.3``), nodes to the right seed
+    n-type (``+0.3``). sign(theta) is a free design variable, so the optimizer
+    can move or dissolve this junction rather than being handed a fixed polarity.
+    """
+    midpoint = np.median(coords[:, 0])
+    return jnp.where(
+        coords[:, 0] <= midpoint, -_JUNCTION_SEED_THETA, _JUNCTION_SEED_THETA
+    )
 
 
 def _load_tesseract_api(name: str) -> Any | None:
@@ -865,24 +914,22 @@ def _sb_jax(
 
 
 def pipeline(
-    rho: jax.Array,
+    theta: jax.Array,
     H: jax.Array | None = None,
     H_sum: jax.Array | None = None,
-    polarity: jax.Array | None = None,
     mesh_ref: MeshRef | None = None,
     background_epsilon: float | None = None,
     design_transfer: jax.Array | None = None,
     components: PipelineComponents | None = None,
 ) -> jax.Array:
-    """Rho -> Delta n_eff differentiable pipeline.
+    """Signed design field theta -> Delta n_eff differentiable pipeline.
 
     Args:
-        rho: Normalized doping density per node in [0,1], shape ``(n_nodes,)``.
+        theta: Signed design field per node in [-1, 1], shape ``(n_nodes,)``.
+            Its sign is the free P/N polarity (junction = zero-crossing).
         H: Dense filter matrix, shape ``(n_nodes, n_nodes)``. Skip filter if
             ``None``.
         H_sum: Pre-computed row sums of ``H``.
-        polarity: Fixed per-node P/N polarity applied to the positive doping
-            magnitude. ``-1`` denotes p-type and ``1`` denotes n-type.
         mesh_ref: ``MeshRef`` forwarded to ChargeTransport calls.
         background_epsilon: Background Si relative permittivity
             (default: ``n_si^2 = 3.4757^2``).
@@ -900,16 +947,16 @@ def pipeline(
     if components is None:
         components = _DEFAULT_COMPONENTS
 
-    # 1. Density filter: rho -> rho_tilde
+    # 1. Density filter: theta -> theta_tilde (linear; regularizes junction width)
     if H is not None:
         if H_sum is None:
             H_sum = jnp.sum(H, axis=1)
-        rho_tilde = _filter_jax(rho, H, H_sum)
+        theta_tilde = _filter_jax(theta, H, H_sum)
     else:
-        rho_tilde = rho
+        theta_tilde = theta
 
-    # 2. Doping mapping: rho_tilde -> N = 10^(14 + 7*rho_tilde) [cm^-3]
-    doping = doping_from_rho(rho_tilde, polarity)
+    # 2. Signed doping mapping: theta_tilde -> N(theta) [cm^-3]
+    doping = doping_from_theta(theta_tilde)
 
     # 3. ChargeTransport at equilibrium (0 V)
     n0, p0 = components.chargetransport(doping, 0.0, mesh_ref)

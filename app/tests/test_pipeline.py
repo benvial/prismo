@@ -15,6 +15,8 @@ from prismo.differentiable_component import DifferentiableComponent  # noqa: E40
 from prismo.mesh_transfer import build_mesh_transfer_operator  # noqa: E402
 from prismo.pipeline import (  # noqa: E402
     _CT_MESH_MOUNT,
+    DOPING_LOG10_SPAN,
+    DOPING_REFERENCE_CM3,
     PipelineComponents,
     _build_design_epsilon,
     _container_mesh_ref,
@@ -23,6 +25,7 @@ from prismo.pipeline import (  # noqa: E402
     build_default_components,
     build_design_transfer,
     build_gyptis_components,
+    doping_from_theta,
     init_tesseract_containers,
     pipeline,
     read_gyptis_design_cell_centroids,
@@ -36,6 +39,78 @@ RNG = np.random.default_rng(0)
 def _components_with(**overrides) -> PipelineComponents:
     """Default in-process components with specific components replaced."""
     return replace(build_default_components(), **overrides)
+
+
+_DOPING_CEILING = DOPING_REFERENCE_CM3 * (10.0**DOPING_LOG10_SPAN - 1.0)
+
+
+class TestDopingFromTheta:
+    """Signed, zero-referenced net-doping map ``N(theta)`` (ticket 02)."""
+
+    def test_zero_referenced(self):
+        """theta=0 is the junction: net-intrinsic (zero net doping)."""
+        assert float(doping_from_theta(jnp.asarray(0.0))) == 0.0
+
+    def test_antisymmetric_no_counterdoping(self):
+        """N(-theta) = -N(theta), and sign(N) follows sign(theta) everywhere."""
+        theta = jnp.linspace(-1.0, 1.0, 21)
+        doping = doping_from_theta(theta)
+        np.testing.assert_allclose(
+            np.asarray(doping), -np.asarray(doping_from_theta(-theta)), rtol=1e-6
+        )
+        np.testing.assert_array_equal(
+            np.sign(np.asarray(doping)), np.sign(np.asarray(theta))
+        )
+
+    def test_ceiling_within_physical_window(self):
+        """|theta|=1 saturates at ~1e19 cm^-3 (below solid solubility)."""
+        ceiling = float(doping_from_theta(jnp.asarray(1.0)))
+        assert 9e18 <= ceiling <= 1e20
+        assert float(doping_from_theta(jnp.asarray(-1.0))) == -ceiling
+
+    def test_monotonic_in_theta(self):
+        """More positive theta always dopes more n-type; no folding."""
+        doping = np.asarray(doping_from_theta(jnp.linspace(-1.0, 1.0, 101)))
+        assert np.all(np.diff(doping) > 0)
+
+    def test_grad_finite_across_zero(self):
+        """jax.grad stays finite for a field straddling the theta=0 junction."""
+        theta = jnp.asarray([-1.0, -0.4, -1e-9, 0.0, 1e-9, 0.4, 1.0])
+        grad = jax.grad(lambda t: jnp.sum(doping_from_theta(t)))(theta)
+        assert jnp.all(jnp.isfinite(grad))
+
+    def test_grad_correct_at_junction(self):
+        """At theta=0 (the junction) grad equals the C^1 slope, not zero.
+
+        The map is differentiable through zero with slope 1e14*ln10*span; a naive
+        sign*abs autodiff collapses it to 0, so the custom JVP is what makes the
+        crossing the optimizer moves honest.
+        """
+        expected = DOPING_REFERENCE_CM3 * np.log(10.0) * DOPING_LOG10_SPAN
+        got = float(jax.grad(doping_from_theta)(jnp.asarray(0.0)))
+        np.testing.assert_allclose(got, expected, rtol=1e-6)
+
+    def test_grad_matches_analytic_away_from_kink(self):
+        """dN/dtheta = 1e14 * ln10 * span * 10^(span*|theta|) off the crossing."""
+        for t in (-1.0, -0.4, 0.4, 1.0):
+            expected = (
+                DOPING_REFERENCE_CM3
+                * np.log(10.0)
+                * DOPING_LOG10_SPAN
+                * 10.0 ** (DOPING_LOG10_SPAN * abs(t))
+            )
+            got = float(jax.grad(doping_from_theta)(jnp.asarray(t)))
+            np.testing.assert_allclose(got, expected, rtol=1e-6)
+
+    def test_moving_zero_crossing_moves_junction(self):
+        """The net-doping sign flip tracks the theta zero-crossing (one junction)."""
+        x = jnp.linspace(0.0, 1.0, 101)
+        step = float(x[1] - x[0])
+        for crossing in (0.305, 0.695):
+            doping = np.asarray(doping_from_theta(x - crossing))
+            flips = np.where(np.diff(np.sign(doping)) != 0)[0]
+            assert flips.size == 1
+            assert abs(float(x[flips[0]]) - crossing) <= step + 1e-9
 
 
 def test_pipeline_enables_float64() -> None:
@@ -207,8 +282,12 @@ class TestPipelineStub:
         np.testing.assert_allclose(float(result), exp_result, rtol=1e-6)
         assert float(result) > 0.0
 
-    def test_polarity_forms_mixed_sign_pn_doping(self):
-        """Container pipeline supplies a fixed P/N polarity per mesh node."""
+    def test_signed_theta_forms_pn_junction_doping(self):
+        """Sign(theta) is the free polarity: theta<0 p-type, theta>0 n-type.
+
+        No fixed polarity mask is plumbed anymore -- the mixed-sign net doping
+        fed to ChargeTransport comes straight from the signed design field.
+        """
         received: list[np.ndarray] = []
 
         def fake_ct(doping, bias_voltage, mesh_ref=None):
@@ -221,13 +300,12 @@ class TestPipelineStub:
             return carriers, carriers
 
         result = pipeline(
-            jnp.asarray([0.0, 1.0]),
-            polarity=jnp.asarray([-1.0, 1.0]),
+            jnp.asarray([-1.0, 1.0]),
             components=_components_with(chargetransport=fake_ct),
         )
 
-        np.testing.assert_allclose(received[0], [-1e14, 1e21])
-        np.testing.assert_allclose(received[1], [-1e14, 1e21])
+        np.testing.assert_allclose(received[0], [-_DOPING_CEILING, _DOPING_CEILING])
+        np.testing.assert_allclose(received[1], [-_DOPING_CEILING, _DOPING_CEILING])
         assert float(result) > 0.0
 
     def test_effective_index_objective_is_positive_for_either_shift_direction(
@@ -737,20 +815,20 @@ class TestPipelineWithFilter:
 
 
 class TestPipelineDopingMapping:
-    """The doping mapping N = 10^(14 + 7*rho) produces sane values."""
+    """The signed doping map N(theta) = sign(theta)*1e14*(10^(5|theta|)-1)."""
 
     def test_range(self):
         n_nodes = 10
-        rho = jnp.linspace(0.0, 1.0, n_nodes)
-        result = pipeline(rho)
+        theta = jnp.linspace(-1.0, 1.0, n_nodes)
+        result = pipeline(theta)
         assert jnp.isfinite(result)
         assert result.ndim == 0
 
     def test_edge_cases_finite(self):
-        for val in [0.0, 0.001, 0.5, 0.999, 1.0]:
-            rho = jnp.array([val])
-            result = pipeline(rho)
-            assert jnp.isfinite(result), f"Non-finite at rho={val}"
+        for val in [-1.0, -0.5, 0.0, 0.001, 0.5, 0.999, 1.0]:
+            theta = jnp.array([val])
+            result = pipeline(theta)
+            assert jnp.isfinite(result), f"Non-finite at theta={val}"
 
     def test_gradient_exists_for_nonuniform_rho(self):
         n_nodes = 10
@@ -843,15 +921,12 @@ class TestPipelineShapeValidation:
         return jnp.asarray(RNG.random(self.N_NODES), dtype=jnp.float64)
 
     def test_doping_range(self, rho):
-
-        doping = jnp.power(
-            jnp.asarray(10.0, dtype=rho.dtype),
-            jnp.asarray(14.0, dtype=rho.dtype)
-            + jnp.asarray(7.0, dtype=rho.dtype) * rho,
-        )
-        assert doping.shape == rho.shape
-        assert jnp.all(doping >= 1e14)
-        assert jnp.all(doping <= 1e21)
+        theta = jnp.linspace(-1.0, 1.0, rho.shape[0], dtype=rho.dtype)
+        doping = doping_from_theta(theta)
+        assert doping.shape == theta.shape
+        assert jnp.all(jnp.abs(doping) <= _DOPING_CEILING + 1.0)
+        # zero-referenced and antisymmetric
+        assert float(doping_from_theta(jnp.asarray(0.0, dtype=rho.dtype))) == 0.0
 
     def test_sb_output_shapes(self, rho):
         from prismo.pipeline import _sb_jax

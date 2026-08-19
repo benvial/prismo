@@ -92,7 +92,11 @@ def _run_pipeline(
     from prismo.density_filter import assemble_filter_matrix
     from prismo.optimizer import OptimizationCancelled, optimize_doping
     from prismo.outputs import generate_outputs, plot_live_doping_field
-    from prismo.pipeline import build_design_transfer, doping_from_rho
+    from prismo.pipeline import (
+        build_design_transfer,
+        doping_from_theta,
+        seed_signed_junction,
+    )
     from prismo.pipeline import pipeline as pipeline_fn
     from prismo.waveguide_mesh import (
         RibWaveguideGeometry,
@@ -143,13 +147,12 @@ def _run_pipeline(
     H_sparse = assemble_filter_matrix(coords, r_min=r_min)
     H_dense = jnp.asarray(H_sparse.toarray())
     H_sum = jnp.sum(H_dense, axis=1)
-    polarity = None
+    # Seed a signed lateral P/N junction in every run path (sign(theta) is a free
+    # design variable, so the optimizer can move or dissolve it).
+    theta_init = seed_signed_junction(coords)
+
     design_transfer = None
     if use_containers:
-        # Preserve a P/N junction while MMA optimizes only the dopant magnitude.
-        midpoint = np.median(coords[:, 0])
-        polarity = jnp.where(coords[:, 0] <= midpoint, -1.0, 1.0)
-
         # Carry the full nodal permittivity field onto the gyptis design cells
         # instead of the identity fallback, so a fixed-mean topology change moves
         # neff through the real eigenmode solve (ticket 08). The transfer is
@@ -166,26 +169,27 @@ def _run_pipeline(
     typer.echo("[3/4] Running NLopt MMA optimization...")
     try:
         optimization_max_iter = max(max_iter, 5) if use_containers else max_iter
-        optimization_ftol_rel = 0.0 if use_containers else ftol_rel
+        optimization_ftol_rel = ftol_rel
         on_iteration = None
         if use_containers:
-            live_plot_path = Path(output_dir) / "doping_field_live.png"
-            typer.echo(f"      Updating {live_plot_path} each solver evaluation")
 
-            def on_iteration(iteration: int, rho: np.ndarray) -> None:
+            def on_iteration(iteration: int, theta: np.ndarray) -> None:
+
+                name = f"doping_field_{iteration}"
                 plot_live_doping_field(
-                    np.asarray(doping_from_rho(rho, polarity)),
+                    np.asarray(doping_from_theta(theta)),
                     coords,
                     iteration,
                     geometry=geometry,
                     output_dir=output_dir,
+                    name=name,
                 )
 
         rho_opt, history = optimize_doping(
+            initial_rho=np.asarray(theta_init, dtype=float),
             n_nodes=n_nodes,
             H=H_dense,
             H_sum=H_sum,
-            polarity=polarity,
             max_iter=optimization_max_iter,
             ftol_rel=optimization_ftol_rel,
             min_mma_evaluations=5 if use_containers else 0,
@@ -203,11 +207,6 @@ def _run_pipeline(
         return
 
     if use_containers:
-        if len(history) < 5:
-            raise RuntimeError(
-                f"Container pipeline completed only {len(history)} iterations; "
-                "expected at least 5"
-            )
         invalid = [
             entry
             for entry in history
@@ -223,7 +222,7 @@ def _run_pipeline(
             )
 
     typer.echo("[4/4] Generating outputs...")
-    rho_initial = np.full(n_nodes, 0.25, dtype=float)
+    rho_initial = np.asarray(theta_init, dtype=float)
     plot_paths = generate_outputs(
         rho_initial=rho_initial,
         rho_opt=rho_opt,
@@ -232,7 +231,6 @@ def _run_pipeline(
         geometry=geometry,
         pipeline_fn=partial(
             pipeline_fn,
-            polarity=polarity,
             design_transfer=design_transfer,
             components=components,
         ),

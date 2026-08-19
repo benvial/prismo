@@ -90,11 +90,11 @@ def test_cli_run_synthetic() -> None:
     assert "Done" in result.stdout
 
 
-def test_container_run_passes_fixed_pn_polarity_to_optimization(
+def test_container_run_seeds_signed_junction_for_optimization(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Container execution keeps the same mixed-sign PN field throughout MMA."""
+    """The run seeds a signed lateral P/N junction as the initial design field."""
     import prismo.main as main_module
     import prismo.optimizer as optimizer_module
     import prismo.outputs as outputs_module
@@ -152,7 +152,8 @@ def test_container_run_passes_fixed_pn_polarity_to_optimization(
         components=_container_components([[0.5, 0.0], [1.5, 0.0]]),
     )
 
-    np.testing.assert_array_equal(captured["polarity"], [-1.0, -1.0, 1.0])
+    # median x is 1.0; nodes at x<=1 seed p-type (-0.3), x>1 seed n-type (+0.3).
+    np.testing.assert_allclose(captured["initial_rho"], [-0.3, -0.3, 0.3])
     assert captured["min_mma_evaluations"] == 5
     assert callable(captured["on_iteration"])
     # The container setup feeds the assembled mesh-transfer matrix to the solve.
@@ -165,7 +166,7 @@ def test_container_run_passes_fixed_pn_polarity_to_optimization(
     )
     np.testing.assert_allclose(
         output_captured["gradient_validation_rho"],
-        np.full(3, 0.25),
+        [-0.3, -0.3, 0.3],
     )
 
 

@@ -116,29 +116,32 @@ class TestGradientValidationPlot:
             assert Path(path).exists()
             assert Path(path).suffix == ".pdf"
 
-    def test_keeps_finite_differences_inside_density_bounds(self):
+    def test_keeps_finite_differences_inside_design_bounds(self):
         import jax
         import jax.numpy as jnp
 
         received: list[np.ndarray] = []
 
-        def bounded_pipeline(rho):
-            if not isinstance(rho, jax.core.Tracer):
-                received.append(np.asarray(rho))
-            return jnp.sum(rho**2)
+        def bounded_pipeline(theta):
+            if not isinstance(theta, jax.core.Tracer):
+                received.append(np.asarray(theta))
+            return jnp.sum(theta**2)
 
-        rho = jnp.asarray([0.001, 0.5])
+        # A node near the signed lower bound -1 must not be stepped below it.
+        theta = jnp.asarray([-0.999, 0.5])
         direction = jnp.asarray([-1.0, 0.0])
         with tempfile.TemporaryDirectory() as tmp:
             plot_gradient_validation(
                 bounded_pipeline,
-                rho,
+                theta,
                 directions=[direction],
                 step_sizes=np.asarray([1e-4, 1e-3, 1e-2]),
                 output_dir=tmp,
             )
 
-        assert all(np.all(values >= 0.0) and np.all(values <= 1.0) for values in received)
+        assert all(
+            np.all(values >= -1.0) and np.all(values <= 1.0) for values in received
+        )
 
     def test_rejects_gradient_validation_without_feasible_steps(self):
         import jax.numpy as jnp
@@ -146,8 +149,10 @@ class TestGradientValidationPlot:
         with tempfile.TemporaryDirectory() as tmp:
             with pytest.raises(ValueError, match="no feasible"):
                 plot_gradient_validation(
-                    lambda rho: jnp.sum(rho**2),
-                    jnp.asarray([0.0, 0.5]),
+                    lambda theta: jnp.sum(theta**2),
+                    # A node pinned at the signed lower bound -1 with a
+                    # downward direction leaves no feasible step.
+                    jnp.asarray([-1.0, 0.5]),
                     directions=[jnp.asarray([-1.0, 0.0])],
                     output_dir=tmp,
                 )

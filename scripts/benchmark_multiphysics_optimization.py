@@ -26,8 +26,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -200,15 +198,17 @@ def _prepare_full_pipeline(
             f"({n_nodes} nodes)"
         )
 
+    from prismo.pipeline import seed_signed_junction
+
     H = jnp.asarray(assemble_filter_matrix(coords, r_min=args.r_min).toarray())
     H_sum = jnp.sum(H, axis=1)
-    polarity = None
+    # Seed the signed design field with a lateral P/N junction, matching
+    # ``prismo run``.
+    theta_init = seed_signed_junction(coords)
     design_transfer = None
     if args.mode == "containers":
-        midpoint = float(np.median(coords[:, 0]))
-        polarity = jnp.where(coords[:, 0] <= midpoint, -1.0, 1.0)
         design_transfer = build_design_transfer(components, coords, mesh_path)
-    return H, H_sum, polarity, design_transfer, n_nodes
+    return H, H_sum, theta_init, design_transfer, n_nodes
 
 
 def main() -> None:
@@ -234,16 +234,15 @@ def main() -> None:
     )
 
     try:
-        H, H_sum, polarity, design_transfer, n_nodes = _prepare_full_pipeline(
+        H, H_sum, theta_init, design_transfer, n_nodes = _prepare_full_pipeline(
             args, components
         )
 
-        def objective(rho: Any) -> Any:
+        def objective(theta: Any) -> Any:
             return pipeline(
-                rho,
+                theta,
                 H=H,
                 H_sum=H_sum,
-                polarity=polarity,
                 design_transfer=design_transfer,
                 components=components,
             )
@@ -251,7 +250,7 @@ def main() -> None:
         callback = jax.value_and_grad(objective)
         if not args.no_jit:
             callback = jax.jit(callback)
-        initial_rho = jnp.full((n_nodes,), 0.25, dtype=jnp.float64)
+        initial_rho = jnp.asarray(theta_init, dtype=jnp.float64)
         direction = jnp.linspace(-1.0, 1.0, n_nodes, dtype=jnp.float64)
         direction = direction / jnp.linalg.norm(direction)
         measurements: list[dict[str, object]] = []
