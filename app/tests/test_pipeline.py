@@ -12,12 +12,14 @@ jax = pytest.importorskip("jax")
 import jax.numpy as jnp  # noqa: E402
 from prismo.density_filter import assemble_filter_matrix  # noqa: E402
 from prismo.differentiable_component import DifferentiableComponent  # noqa: E402
+from prismo.mesh_transfer import build_mesh_transfer_operator  # noqa: E402
 from prismo.pipeline import (  # noqa: E402
     PipelineComponents,
     _build_design_epsilon,
     _sb_jax,
     build_chargetransport_component,
     build_default_components,
+    build_design_transfer,
     build_gyptis_components,
     pipeline,
     read_gyptis_design_cell_centroids,
@@ -298,9 +300,7 @@ class TestPipelineStub:
         def fake_ct(doping, bias_voltage, mesh_ref=None):
             # Carriers deplete under bias in proportion to the local doping, so
             # a non-uniform rho produces a spatially-varying permittivity field.
-            carriers = jnp.where(
-                bias_voltage == 0.0, doping, jnp.zeros_like(doping)
-            )
+            carriers = jnp.where(bias_voltage == 0.0, doping, jnp.zeros_like(doping))
             return carriers, carriers
 
         # gyptis stub sensitive to spatial structure: neff_sq = sum(eps^2), whose
@@ -484,6 +484,132 @@ class TestContainerPipeline:
         assert float(pipeline(rho, components=depleting)) == pytest.approx(
             result_depleting
         )
+
+    def test_wired_design_transfer_drives_spatial_gradient_through_gyptis(self):
+        """Ticket 08 payoff, exercised through the container gyptis path.
+
+        The ``design_transfer`` matrix built by ``build_mesh_transfer_operator``
+        carries a spatially varying, fixed-mean perturbation onto the gyptis
+        design cells, so a real (container-routed) eigenmode solve yields a
+        spatially non-constant design gradient while the background solve still
+        sees a uniform field. Unlike ``test_pipeline_gradient_is_spatially_
+        resolved`` -- which uses the JAX gyptis stub -- this drives the container
+        forward/VJP built by ``build_gyptis_components`` and the transfer wiring
+        ticket 08 adds.
+        """
+        # Shared mesh: a unit square split into two silicon triangles.
+        coords = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=float)
+        silicon_triangles = np.array([[0, 1, 2], [1, 3, 2]], dtype=np.intp)
+        # Two design cells, one interior to each triangle (distinct node mixes).
+        design_centroids = np.array([[0.25, 0.25], [0.75, 0.75]], dtype=float)
+        design_transfer = jnp.asarray(
+            build_mesh_transfer_operator(
+                coords, silicon_triangles, design_centroids
+            ).dense()
+        )
+        assert design_transfer.shape == (2, 4)  # design cells <- shared-mesh nodes
+
+        applied_fields: list[np.ndarray] = []
+
+        class StructureSensitiveGyptis:
+            """A gyptis backend whose neff_sq responds to spatial structure."""
+
+            def apply(self, inputs):
+                eps = np.asarray(inputs["design_epsilon"], dtype=float)
+                applied_fields.append(eps)
+                return {"neff_sq": float(np.sum(eps**2))}
+
+            def vector_jacobian_product(
+                self, inputs, inputs_to_diff, outputs, cotangents
+            ):
+                eps = np.asarray(inputs["design_epsilon"], dtype=float)
+                cot = float(cotangents["neff_sq"])
+                return {"design_epsilon": (2.0 * cot * eps).tolist()}
+
+        def fake_ct(doping, bias_voltage, mesh_ref=None):
+            # Carriers deplete under bias in proportion to the local doping, so a
+            # spatially varying rho makes a spatially varying permittivity field.
+            carriers = jnp.where(bias_voltage == 0.0, doping, jnp.zeros_like(doping))
+            return carriers, carriers
+
+        perturbed, background = build_gyptis_components(
+            container=StructureSensitiveGyptis()
+        )
+        components = PipelineComponents(
+            chargetransport=fake_ct, gyptis=perturbed, gyptis_background=background
+        )
+
+        def run(rho: jax.Array) -> jax.Array:
+            return pipeline(rho, design_transfer=design_transfer, components=components)
+
+        # Fixed-mean but spatially varying design vector.
+        rho = jnp.asarray([0.2, 0.8, 0.6, 0.4])
+        grad = jax.grad(run)(rho)
+        assert jnp.all(jnp.isfinite(grad))
+        # The design gradient is spatially resolved, not collapsed to a scalar.
+        assert float(jnp.std(grad)) > 0.0
+
+        # Every solve saw a field of exactly the design-cell count (not the node
+        # count) -- the length the real forward's size guard enforces.
+        assert applied_fields
+        assert all(eps.shape == (2,) for eps in applied_fields)
+        # The perturbed solve saw a structured field; the background a uniform one.
+        assert any(float(np.std(eps)) > 0.0 for eps in applied_fields)
+        assert any(float(np.std(eps)) == 0.0 for eps in applied_fields)
+
+        # The background component contributes an exact zero design gradient
+        # regardless of its field, preserving the rho-independence argument.
+        bg_cotangent = background.vjp(np.full(2, 12.0), np.asarray(1.0))
+        np.testing.assert_array_equal(bg_cotangent, np.zeros(2))
+
+        # Payoff: a fixed-mean redistribution (a permutation of rho) moves neff --
+        # the retired mean-collapse path could not have distinguished them.
+        permuted = jnp.asarray([0.8, 0.2, 0.4, 0.6])
+        np.testing.assert_allclose(float(jnp.mean(permuted)), float(jnp.mean(rho)))
+        assert float(run(rho)) != pytest.approx(float(run(permuted)))
+
+
+class TestBuildDesignTransfer:
+    """The container setup assembles the real mesh-transfer matrix (ticket 08)."""
+
+    def test_assembles_real_operator_from_centroids_and_triangulation(
+        self, monkeypatch
+    ):
+        """The production helper drives the real ``build_mesh_transfer_operator``.
+
+        Both static inputs come from live sources -- centroids through the
+        component seam, the silicon triangulation from the mesh reader -- so
+        this covers the real assembly the container run performs (only the
+        gmsh-dependent triangulation read is stubbed).
+        """
+        import prismo.waveguide_mesh as mesh_module
+
+        coords = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=float)
+        triangles = np.array([[0, 1, 2], [1, 3, 2]], dtype=np.intp)
+        monkeypatch.setattr(
+            mesh_module, "read_mesh_silicon_triangulation", lambda _: triangles
+        )
+        components = PipelineComponents(
+            chargetransport=None,
+            gyptis=None,
+            gyptis_background=None,
+            design_cell_centroids=lambda: np.array([[0.25, 0.25], [0.75, 0.75]]),
+        )
+
+        transfer = build_design_transfer(components, coords, "unused.msh")
+
+        assert transfer.shape == (2, 4)  # design cells <- shared-mesh nodes
+        # Partition of unity: each design cell's weights sum to one, so a uniform
+        # nodal field maps to a uniform design field (keyed to the shared mesh).
+        np.testing.assert_allclose(np.asarray(transfer).sum(axis=1), 1.0)
+
+    def test_requires_a_centroid_reader(self):
+        """Without a gyptis backend there is no design geometry to key against."""
+        components = PipelineComponents(
+            chargetransport=None, gyptis=None, gyptis_background=None
+        )
+        with pytest.raises(RuntimeError, match="design-cell centroids"):
+            build_design_transfer(components, np.zeros((3, 2)), "unused.msh")
 
 
 class TestComponentTiming:

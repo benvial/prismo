@@ -90,6 +90,7 @@ def _run_pipeline(
     from prismo.density_filter import assemble_filter_matrix
     from prismo.optimizer import OptimizationCancelled, optimize_doping
     from prismo.outputs import generate_outputs
+    from prismo.pipeline import build_design_transfer
     from prismo.pipeline import pipeline as pipeline_fn
     from prismo.waveguide_mesh import (
         RibWaveguideGeometry,
@@ -129,10 +130,23 @@ def _run_pipeline(
     H_dense = jnp.asarray(H_sparse.toarray())
     H_sum = jnp.sum(H_dense, axis=1)
     polarity = None
+    design_transfer = None
     if use_containers:
         # Preserve a P/N junction while MMA optimizes only the dopant magnitude.
         midpoint = np.median(coords[:, 0])
         polarity = jnp.where(coords[:, 0] <= midpoint, -1.0, 1.0)
+
+        # Carry the full nodal permittivity field onto the gyptis design cells
+        # instead of the identity fallback, so a fixed-mean topology change moves
+        # neff through the real eigenmode solve (ticket 08). The transfer is
+        # assembled from live sources keyed to the shared mesh's nodes.
+        if components is None:
+            raise RuntimeError("Container pipeline requires live components")
+        design_transfer = build_design_transfer(components, coords, actual_mesh)
+        typer.echo(
+            f"      Mesh-transfer operator: {design_transfer.shape[0]} design cells "
+            f"<- {n_nodes} nodes"
+        )
     typer.echo(f"      Filter radius: {r_min * 1e9:.0f} nm")
 
     typer.echo("[3/4] Running NLopt MMA optimization...")
@@ -148,6 +162,7 @@ def _run_pipeline(
             ftol_rel=optimization_ftol_rel,
             min_mma_evaluations=5 if use_containers else 0,
             use_jit=not no_jit,
+            design_transfer=design_transfer,
             components=components,
         )
         typer.echo(f"      Optimization complete: {len(history)} iterations")
@@ -185,12 +200,15 @@ def _run_pipeline(
         history=history,
         mesh_coords=coords,
         geometry=geometry,
-        pipeline_fn=partial(pipeline_fn, polarity=polarity, components=components),
+        pipeline_fn=partial(
+            pipeline_fn,
+            polarity=polarity,
+            design_transfer=design_transfer,
+            components=components,
+        ),
         ftol_rel=optimization_ftol_rel,
         gradient_validation_directions=1 if use_containers else 3,
-        gradient_validation_steps=(
-            np.logspace(-4, -2, 3) if use_containers else None
-        ),
+        gradient_validation_steps=(np.logspace(-4, -2, 3) if use_containers else None),
         gradient_validation_rho=rho_initial if use_containers else None,
         output_dir=output_dir,
     )

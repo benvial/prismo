@@ -1,14 +1,60 @@
 """Tests for the main application module."""
 
+import types
 from importlib import import_module
 from pathlib import Path
 
 import numpy as np
-
 import pytest
 from typer.testing import CliRunner
 
 runner = CliRunner()
+
+
+def _container_components(centroids: np.ndarray):
+    """A minimal bundle exposing the design-cell centroid seam.
+
+    The container pipeline reads centroids through
+    ``PipelineComponents.design_cell_centroids`` to build the mesh-transfer
+    operator; the solve components are unused when ``optimize_doping`` is
+    stubbed, so they can be ``None``.
+    """
+    from prismo.pipeline import PipelineComponents
+
+    return PipelineComponents(
+        chargetransport=None,
+        gyptis=None,
+        gyptis_background=None,
+        design_cell_centroids=lambda: np.asarray(centroids, dtype=float),
+    )
+
+
+def _stub_mesh_transfer(
+    monkeypatch: pytest.MonkeyPatch, n_nodes: int, n_design: int
+) -> None:
+    """Stub the silicon-triangulation read and transfer build for a fake mesh.
+
+    The container tests drive degenerate coordinate sets (colinear or a single
+    edge) that cannot triangulate, so the transfer machinery is replaced with a
+    fixed ``(n_design, n_nodes)`` operator; the assembly wiring is covered end
+    to end in ``test_pipeline``.
+    """
+    import prismo.mesh_transfer as mesh_transfer_module
+    import prismo.waveguide_mesh as mesh_module
+
+    monkeypatch.setattr(
+        mesh_module,
+        "read_mesh_silicon_triangulation",
+        lambda _: np.empty((0, 3), dtype=np.intp),
+    )
+    monkeypatch.setattr(
+        mesh_transfer_module,
+        "build_mesh_transfer_operator",
+        lambda *args, **kwargs: types.SimpleNamespace(
+            dense=lambda: np.zeros((n_design, n_nodes)),
+            shape=(n_design, n_nodes),
+        ),
+    )
 
 
 def test_import() -> None:
@@ -45,7 +91,8 @@ def test_cli_run_synthetic() -> None:
 
 
 def test_container_run_passes_fixed_pn_polarity_to_optimization(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Container execution keeps the same mixed-sign PN field throughout MMA."""
     import prismo.main as main_module
@@ -67,7 +114,9 @@ def test_container_run_passes_fixed_pn_polarity_to_optimization(
         for index in range(1, 6)
     ]
 
-    monkeypatch.setattr(mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh")
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
     monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
 
     def fake_optimize(**kwargs):
@@ -80,11 +129,17 @@ def test_container_run_passes_fixed_pn_polarity_to_optimization(
         "generate_outputs",
         lambda **kwargs: (
             output_captured.update(kwargs)
-            or [tmp_path / name for name in (
-                "convergence.pdf", "doping_field.pdf", "gradient_validation.pdf",
-            )]
+            or [
+                tmp_path / name
+                for name in (
+                    "convergence.pdf",
+                    "doping_field.pdf",
+                    "gradient_validation.pdf",
+                )
+            ]
         ),
     )
+    _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
 
     main_module._run_pipeline(
         r_min=50e-9,
@@ -94,21 +149,28 @@ def test_container_run_passes_fixed_pn_polarity_to_optimization(
         output_dir=str(tmp_path),
         no_jit=True,
         use_containers=True,
+        components=_container_components([[0.5, 0.0], [1.5, 0.0]]),
     )
 
     np.testing.assert_array_equal(captured["polarity"], [-1.0, -1.0, 1.0])
     assert captured["min_mma_evaluations"] == 5
+    # The container setup feeds the assembled mesh-transfer matrix to the solve.
+    assert captured["design_transfer"] is not None
+    assert np.asarray(captured["design_transfer"]).shape == (2, coords.shape[0])
     assert output_captured["gradient_validation_directions"] == 1
     np.testing.assert_allclose(
-        output_captured["gradient_validation_steps"], [1e-4, 1e-3, 1e-2],
+        output_captured["gradient_validation_steps"],
+        [1e-4, 1e-3, 1e-2],
     )
     np.testing.assert_allclose(
-        output_captured["gradient_validation_rho"], np.full(3, 0.25),
+        output_captured["gradient_validation_rho"],
+        np.full(3, 0.25),
     )
 
 
 def test_container_run_rejects_near_zero_objective(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """The positive smoothing floor cannot pass a zero-physics container run."""
     import prismo.main as main_module
@@ -126,13 +188,16 @@ def test_container_run_rejects_near_zero_objective(
         }
         for index in range(1, 6)
     ]
-    monkeypatch.setattr(mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh")
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
     monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
     monkeypatch.setattr(
         optimizer_module,
         "optimize_doping",
         lambda **_: (np.full(2, 0.25), history),
     )
+    _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=1)
 
     with pytest.raises(RuntimeError, match="invalid optimization signal"):
         main_module._run_pipeline(
@@ -143,4 +208,5 @@ def test_container_run_rejects_near_zero_objective(
             output_dir=str(tmp_path),
             no_jit=True,
             use_containers=True,
+            components=_container_components([[0.5, 0.0]]),
         )

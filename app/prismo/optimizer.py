@@ -47,6 +47,7 @@ def optimize_doping(
     ftol_rel: float = 1e-5,
     min_mma_evaluations: int = 0,
     use_jit: bool = True,
+    design_transfer: jax.Array | None = None,
     components: PipelineComponents | None = None,
 ) -> tuple[np.ndarray, list[_HistoryEntry]]:
     """Run the NLopt MMA optimization loop.
@@ -71,6 +72,9 @@ def optimize_doping(
         min_mma_evaluations: Minimum objective evaluations completed by MMA
             before falling back to CCSAQ after a roundoff-limited solve.
         use_jit: JIT-compile combined objective and gradient computation.
+        design_transfer: Dense ``(n_design_cells, n_nodes)`` mesh-transfer
+            matrix carrying the nodal perturbation onto the gyptis design
+            cells. ``None`` maps the perturbation node-for-node (identity).
         components: Live pipeline components to compose. Defaults to the
             in-process components (see ``pipeline``).
 
@@ -106,7 +110,14 @@ def optimize_doping(
         components = default_components()
 
     def _pipe(rho: jax.Array) -> jax.Array:
-        return pipeline(rho, H=H, H_sum=H_sum, polarity=polarity, components=components)
+        return pipeline(
+            rho,
+            H=H,
+            H_sum=H_sum,
+            polarity=polarity,
+            design_transfer=design_transfer,
+            components=components,
+        )
 
     value_and_grad_fn = jax.value_and_grad(_pipe)
     if use_jit:

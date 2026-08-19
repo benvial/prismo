@@ -13,6 +13,7 @@ import importlib.util
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -177,6 +178,9 @@ def init_tesseract_containers() -> PipelineComponents:
         chargetransport=chargetransport,
         gyptis=gyptis,
         gyptis_background=gyptis_background,
+        design_cell_centroids=partial(
+            read_gyptis_design_cell_centroids, container=gyptis_tesseract
+        ),
         closers=tuple(closers),
     )
 
@@ -214,6 +218,35 @@ def read_gyptis_design_cell_centroids(
     if centroids.ndim != 2 or centroids.shape[1] != 2:
         raise ValueError("gyptis design-cell centroids must have shape (n_design, 2)")
     return centroids
+
+
+def build_design_transfer(
+    components: PipelineComponents,
+    node_coords: np.ndarray,
+    mesh_path: str | Path,
+) -> jax.Array:
+    """Assemble the dense mesh-transfer matrix for the container gyptis path.
+
+    Reads the two static inputs the mesh-transfer operator (ticket 04) needs
+    from live sources -- the design-cell centroids from the gyptis backend (in
+    ``design_epsilon`` order) and the shared mesh's silicon triangulation --
+    and returns the ``(n_design_cells, n_nodes)`` matrix that carries a nodal
+    perturbation onto the gyptis design cells. Both inputs are keyed to
+    ``node_coords``, so the result feeds ``pipeline(design_transfer=...)``
+    directly instead of the identity fallback.
+    """
+    from prismo.mesh_transfer import build_mesh_transfer_operator
+    from prismo.waveguide_mesh import read_mesh_silicon_triangulation
+
+    if components.design_cell_centroids is None:
+        raise RuntimeError(
+            "Container pipeline requires a gyptis backend exposing design-cell "
+            "centroids to build the mesh-transfer operator"
+        )
+    centroids = components.design_cell_centroids()
+    silicon_triangles = read_mesh_silicon_triangulation(mesh_path)
+    operator = build_mesh_transfer_operator(node_coords, silicon_triangles, centroids)
+    return jnp.asarray(operator.dense())
 
 
 def _shaped_like(arr: jax.Array) -> jax.ShapeDtypeStruct:
@@ -451,9 +484,7 @@ def build_gyptis_components(
     phase timer, so their combined boundary timings read from one place. The
     backend is captured here, not read from module globals.
     """
-    background_cache: dict[
-        tuple[tuple[int, ...], str, bytes, float], np.ndarray
-    ] = {}
+    background_cache: dict[tuple[tuple[int, ...], str, bytes, float], np.ndarray] = {}
     cache_lock = RLock()
     timer = PhaseTimer()
 
@@ -628,11 +659,19 @@ class PipelineComponents:
     the per-lifecycle background eigenmode cache -- so ``pipeline()`` reads no
     module globals. The container lifecycle builds one on startup and releases
     it via ``close()``.
+
+    ``design_cell_centroids`` is the static geometry query bound to the same
+    gyptis backend as the solve components: a zero-arg reader returning the
+    ``(n_design, 2)`` centroids in ``design_epsilon`` order, so the pipeline
+    setup can build the mesh-transfer operator (ticket 08) through the seam
+    without reaching for a raw container handle. ``None`` when no gyptis
+    backend is bound.
     """
 
     chargetransport: Callable[..., Any]
     gyptis: Callable[..., Any]
     gyptis_background: Callable[..., Any]
+    design_cell_centroids: Callable[[], np.ndarray] | None = None
     closers: tuple[Callable[[], None], ...] = field(default=())
 
     def close(self) -> None:
@@ -678,10 +717,16 @@ def build_default_components() -> PipelineComponents:
     shutdown_worker = getattr(ct_api, "shutdown", None)
     if callable(shutdown_worker):
         closers.append(shutdown_worker)
+    design_cell_centroids = (
+        partial(read_gyptis_design_cell_centroids, local_api=gyptis_api)
+        if gyptis_api is not None
+        else None
+    )
     return PipelineComponents(
         chargetransport=chargetransport,
         gyptis=gyptis,
         gyptis_background=gyptis_background,
+        design_cell_centroids=design_cell_centroids,
         closers=tuple(closers),
     )
 
