@@ -10,6 +10,7 @@ from prismo.waveguide_mesh import (
     RibWaveguideGeometry,
     build_rib_waveguide_mesh,
     build_rib_waveguide_mesh_via_gmsh,
+    read_mesh_silicon_triangulation,
 )
 
 
@@ -250,3 +251,67 @@ class TestMeshRefCompat:
         ref = MeshRef(path=str(mesh_path))
         ref.n_nodes = 42
         assert ref.n_nodes > 0
+
+
+class TestSiliconTriangulation:
+    """Public mesh-reader seam for the shared silicon design region."""
+
+    @pytest.fixture
+    def gmsh(self):
+        pytest.importorskip("gmsh")
+        import gmsh  # type: ignore[import-untyped]
+
+        gmsh.initialize()
+        yield gmsh
+        gmsh.finalize()
+
+    @pytest.fixture
+    def output_path(self):
+        with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
+            path = f.name
+        yield path
+        Path(path).unlink(missing_ok=True)
+
+    def test_reader_returns_only_silicon_triangles(self, gmsh, output_path):
+        build_rib_waveguide_mesh_via_gmsh(output_path, RibWaveguideGeometry())
+        triangles = read_mesh_silicon_triangulation(output_path)
+
+        gmsh.open(str(output_path))
+        silicon_tag = next(
+            tag
+            for dim, tag in gmsh.model.getPhysicalGroups(2)
+            if gmsh.model.getPhysicalName(dim, tag) == "silicon"
+        )
+        node_tags, _, _ = gmsh.model.mesh.getNodes()
+        index_by_tag = {int(tag): index for index, tag in enumerate(node_tags)}
+        expected_parts = []
+        for entity_tag in gmsh.model.getEntitiesForPhysicalGroup(2, silicon_tag):
+            element_types, _, element_nodes = gmsh.model.mesh.getElements(2, entity_tag)
+            for element_type, nodes in zip(element_types, element_nodes, strict=True):
+                if gmsh.model.mesh.getElementProperties(element_type)[3] != 3:
+                    continue
+                tags = np.asarray(nodes, dtype=np.int64).reshape(-1, 3)
+                expected_parts.append(
+                    np.asarray(
+                        [
+                            [index_by_tag[int(tag)] for tag in triangle]
+                            for triangle in tags
+                        ]
+                    )
+                )
+        gmsh.clear()
+        expected = np.concatenate(expected_parts)
+
+        assert triangles.shape == expected.shape
+        assert np.issubdtype(triangles.dtype, np.integer)
+        np.testing.assert_array_equal(triangles, expected)
+
+    def test_reader_returns_empty_triangles_without_gmsh(
+        self, monkeypatch, output_path
+    ):
+        import importlib.util
+
+        monkeypatch.setattr(importlib.util, "find_spec", lambda _: None)
+        triangles = read_mesh_silicon_triangulation(output_path)
+        assert triangles.shape == (0, 3)
+        assert np.issubdtype(triangles.dtype, np.integer)

@@ -20,6 +20,7 @@ from prismo.pipeline import (  # noqa: E402
     build_default_components,
     build_gyptis_components,
     pipeline,
+    read_gyptis_design_cell_centroids,
 )
 from prismo.soref_bennett import soref_bennett as _sb_numpy  # noqa: E402
 from prismo_shared.schemas import CarrierDensityField  # noqa: E402
@@ -355,6 +356,21 @@ class TestPipelineStub:
 
 
 class TestContainerPipeline:
+    def test_reads_design_centroids_from_gyptis_container(self):
+        class FakeGyptis:
+            def __init__(self):
+                self.inputs = None
+
+            def apply(self, inputs):
+                self.inputs = inputs
+                return {"design_cell_centroids": [[-0.1, 0.2], [0.1, 0.2]]}
+
+        gyptis = FakeGyptis()
+        centroids = read_gyptis_design_cell_centroids(container=gyptis)
+
+        assert gyptis.inputs == {"operation": "design_cell_centroids"}
+        np.testing.assert_allclose(centroids, [[-0.1, 0.2], [0.1, 0.2]])
+
     def test_background_eigenmode_is_cached_across_pipeline_calls(self):
         """Only the rho-independent background solve survives a callback."""
 

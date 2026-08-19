@@ -110,6 +110,14 @@ def test_apply_rejects_empty_field() -> None:
         apply(make_inputs(np.array([])))
 
 
+@pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
+def test_apply_inspection_returns_design_centroids_in_forward_order() -> None:
+    outputs = apply(InputSchema(operation="design_cell_centroids"))
+    np.testing.assert_allclose(
+        outputs.design_cell_centroids, _api.design_cell_centroids()
+    )
+
+
 # ---------------------------------------------------------------------------
 # vector_jacobian_product() contract
 # ---------------------------------------------------------------------------

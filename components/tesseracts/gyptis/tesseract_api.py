@@ -12,7 +12,7 @@
 # per-design-cell cotangent in one pass (decision 4). Falls back to an
 # effective-medium stub when gyptis/FEniCS is not installed.
 
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -58,6 +58,9 @@ class InputSchema(BaseModel):
     """Inputs to the gyptis field-epsilon eigenmode solve.
 
     Attributes:
+        operation: ``"solve"`` runs the eigenmode solve. ``"design_cell_centroids"``
+            returns the static design-cell geometry needed to construct a mesh
+            transfer operator.
         design_epsilon: Relative permittivity per design cell -- the modulated
             silicon on the embedded design region, one value per DG0 cell (order
             given by :func:`design_cell_centroids`). This is the only
@@ -68,7 +71,8 @@ class InputSchema(BaseModel):
         substrate_epsilon: Substrate (oxide) permittivity (constant).
     """
 
-    design_epsilon: Differentiable[Array[(None,), Float64]]
+    operation: Literal["solve", "design_cell_centroids"] = "solve"
+    design_epsilon: Differentiable[Array[(None,), Float64]] | None = None
     core_epsilon: float = DEFAULT_CORE_EPSILON
     clad_epsilon: float = DEFAULT_CLAD_EPSILON
     substrate_epsilon: float = DEFAULT_SUBSTRATE_EPSILON
@@ -81,9 +85,12 @@ class OutputSchema(BaseModel):
         neff_sq: Squared effective index of the tracked mode
             (neff_sq = kz^2 / k0^2, where kz is the propagation constant
             and k0 is the free-space wavenumber).
+        design_cell_centroids: Static design-cell centroids returned by the
+            inspection operation, in ``design_epsilon`` order.
     """
 
-    neff_sq: Differentiable[Array[(), Float64]]
+    neff_sq: Differentiable[Array[(), Float64]] | None = None
+    design_cell_centroids: Array[(None, 2), Float64] | None = None
 
 
 #
@@ -412,6 +419,19 @@ def apply(inputs: InputSchema) -> OutputSchema:
     Returns:
         Squared effective index of the tracked mode.
     """
+    if inputs.operation == "design_cell_centroids":
+        try:
+            centroids = design_cell_centroids(
+                inputs.core_epsilon, inputs.clad_epsilon, inputs.substrate_epsilon
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "design-cell centroids require a gyptis/FEniCS backend"
+            ) from exc
+        return OutputSchema(design_cell_centroids=centroids)
+
+    if inputs.design_epsilon is None:
+        raise ValueError("design_epsilon is required for a gyptis solve")
     design = np.asarray(inputs.design_epsilon, dtype=float)
     if design.ndim != 1 or design.size == 0:
         raise ValueError("design_epsilon must contain at least one design cell")

@@ -317,6 +317,73 @@ def read_mesh_node_coordinates(mesh_path: str | Path) -> np.ndarray:
             gmsh.finalize()
 
 
+def read_mesh_silicon_triangulation(mesh_path: str | Path) -> np.ndarray:
+    """Extract zero-based silicon triangle node indices from a Gmsh mesh.
+
+    The returned indices address the coordinate rows from
+    :func:`read_mesh_node_coordinates`. Only dim-2, three-node triangle
+    elements in the ``silicon`` physical group are included. As with the node
+    coordinate reader, an environment without Gmsh returns an empty array so
+    no-backend code paths remain importable.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("gmsh") is None:
+        return np.empty((0, 3), dtype=np.intp)
+
+    import gmsh  # type: ignore[import-untyped]
+
+    mesh_path = Path(mesh_path)
+    if not mesh_path.exists():
+        raise FileNotFoundError(f"Mesh file not found: {mesh_path}")
+
+    was_initialized = gmsh.isInitialized()
+    if not was_initialized:
+        gmsh.initialize()
+
+    try:
+        gmsh.open(str(mesh_path))
+        node_tags, _, _ = gmsh.model.mesh.getNodes()
+        index_by_tag = {int(tag): index for index, tag in enumerate(node_tags)}
+        silicon_groups = [
+            tag
+            for dim, tag in gmsh.model.getPhysicalGroups(2)
+            if gmsh.model.getPhysicalName(dim, tag) == "silicon"
+        ]
+        triangles: list[np.ndarray] = []
+        for group_tag in silicon_groups:
+            for entity_tag in gmsh.model.getEntitiesForPhysicalGroup(2, group_tag):
+                element_types, _, element_nodes = gmsh.model.mesh.getElements(
+                    2, entity_tag
+                )
+                for element_type, node_tags_for_type in zip(
+                    element_types, element_nodes, strict=True
+                ):
+                    _, dim, _, n_nodes, _, _ = gmsh.model.mesh.getElementProperties(
+                        element_type
+                    )
+                    if dim != 2 or n_nodes != 3:
+                        continue
+                    tags = np.asarray(node_tags_for_type, dtype=np.int64).reshape(-1, 3)
+                    triangles.append(
+                        np.asarray(
+                            [
+                                [index_by_tag[int(tag)] for tag in triangle]
+                                for triangle in tags
+                            ],
+                            dtype=np.intp,
+                        )
+                    )
+        gmsh.clear()
+
+        if not triangles:
+            return np.empty((0, 3), dtype=np.intp)
+        return np.concatenate(triangles)
+    finally:
+        if not was_initialized:
+            gmsh.finalize()
+
+
 def _add_physical_group(gmsh: object, dim: int, tags: list[int], name: str) -> None:
     """Add a named physical group, handling empty tag lists silently."""
     if not tags:

@@ -186,6 +186,36 @@ def teardown_containers(components: PipelineComponents) -> None:
     components.close()
 
 
+def read_gyptis_design_cell_centroids(
+    *, container: Any | None = None, local_api: Any | None = None
+) -> np.ndarray:
+    """Read gyptis design-cell centroids in ``design_epsilon`` field order.
+
+    The Tesseract API's fixed endpoint set exposes this static geometry query
+    through ``apply(operation="design_cell_centroids")``. A live gyptis/FEniCS
+    backend is required; unlike a solve, there is no meaningful local stub for
+    its mesh-dependent cells.
+    """
+
+    def from_container(tess: Any) -> np.ndarray:
+        result = tess.apply({"operation": "design_cell_centroids"})
+        return np.asarray(result["design_cell_centroids"], dtype=float)
+
+    def from_local(api: Any) -> np.ndarray:
+        outputs = api.apply(api.InputSchema(operation="design_cell_centroids"))
+        return np.asarray(outputs.design_cell_centroids, dtype=float)
+
+    centroids = invoke_tesseract(
+        container,
+        local_api,
+        container_call=from_container,
+        local_call=from_local,
+    )
+    if centroids.ndim != 2 or centroids.shape[1] != 2:
+        raise ValueError("gyptis design-cell centroids must have shape (n_design, 2)")
+    return centroids
+
+
 def _shaped_like(arr: jax.Array) -> jax.ShapeDtypeStruct:
     return jax.ShapeDtypeStruct(arr.shape, arr.dtype)
 
