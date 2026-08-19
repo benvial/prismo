@@ -51,7 +51,6 @@ def _load_tesseract_api(name: str) -> Any | None:
 
 
 _DEFAULT_BACKGROUND_EPSILON: float = 3.4757**2
-_DEFAULT_DOMAIN_COUNT: int = 3
 _M3_TO_CM3: float = 1e-6
 _DEFAULT_COEFFS: SorefBennettCoefficients = SorefBennettCoefficients()
 
@@ -368,29 +367,47 @@ def build_chargetransport_component(
 # -- gyptis component ------------------------------------------------------------
 
 
-def _gyptis_out_struct(epsilon: jax.Array) -> jax.ShapeDtypeStruct:
-    return _scalar_like(epsilon)
+# The gyptis field-epsilon component takes the design-region permittivity field
+# as its differentiated input and the constant core background as a static arg
+# (so non-design core cells match the pipeline's background_epsilon).
 
 
-def _gyptis_stub_forward(epsilon: jax.Array) -> jax.Array:
-    return jnp.mean(epsilon)
+def _gyptis_out_struct(
+    design_epsilon: jax.Array, core_epsilon: float = _DEFAULT_BACKGROUND_EPSILON
+) -> jax.ShapeDtypeStruct:
+    return _scalar_like(design_epsilon)
 
 
-def _gyptis_stub_vjp(epsilon: jax.Array, g: jax.Array) -> jax.Array:
-    n = epsilon.shape[0]
-    return jnp.full_like(epsilon, g / n)
+def _gyptis_stub_forward(
+    design_epsilon: jax.Array, core_epsilon: float = _DEFAULT_BACKGROUND_EPSILON
+) -> jax.Array:
+    return jnp.mean(design_epsilon)
+
+
+def _gyptis_stub_vjp(
+    design_epsilon: jax.Array,
+    g: jax.Array,
+    core_epsilon: float = _DEFAULT_BACKGROUND_EPSILON,
+) -> jax.Array:
+    n = design_epsilon.shape[0]
+    return jnp.full_like(design_epsilon, g / n)
 
 
 def _gyptis_background_vjp_impl(
-    epsilon_np: np.ndarray,
+    design_epsilon_np: np.ndarray,
     cot_neff_sq: np.ndarray,
+    core_epsilon: float = _DEFAULT_BACKGROUND_EPSILON,
 ) -> np.ndarray:
     """Background permittivity is rho-independent: its cotangent is zero."""
-    return np.zeros_like(epsilon_np)
+    return np.zeros_like(design_epsilon_np)
 
 
-def _gyptis_background_stub_vjp(epsilon: jax.Array, g: jax.Array) -> jax.Array:
-    return jnp.zeros_like(epsilon)
+def _gyptis_background_stub_vjp(
+    design_epsilon: jax.Array,
+    g: jax.Array,
+    core_epsilon: float = _DEFAULT_BACKGROUND_EPSILON,
+) -> jax.Array:
+    return jnp.zeros_like(design_epsilon)
 
 
 def build_gyptis_components(
@@ -404,7 +421,9 @@ def build_gyptis_components(
     phase timer, so their combined boundary timings read from one place. The
     backend is captured here, not read from module globals.
     """
-    background_cache: dict[tuple[tuple[int, ...], str, bytes], np.ndarray] = {}
+    background_cache: dict[
+        tuple[tuple[int, ...], str, bytes, float], np.ndarray
+    ] = {}
     cache_lock = RLock()
     timer = PhaseTimer()
 
@@ -412,19 +431,29 @@ def build_gyptis_components(
         return has_backend(container, local_api)
 
     def forward(
-        epsilon_np: np.ndarray,
+        design_epsilon_np: np.ndarray,
+        core_epsilon: float = _DEFAULT_BACKGROUND_EPSILON,
         *,
         phase: str = "gyptis_perturbed_forward",
     ) -> np.ndarray:
-        out_dtype = epsilon_np.dtype
+        out_dtype = design_epsilon_np.dtype
         started_at = time.perf_counter()
 
         def from_container(tess: Any) -> np.ndarray:
-            result = tess.apply({"epsilon": epsilon_np.tolist()})
+            result = tess.apply(
+                {
+                    "design_epsilon": design_epsilon_np.tolist(),
+                    "core_epsilon": float(core_epsilon),
+                }
+            )
             return np.asarray(result["neff_sq"], dtype=out_dtype)
 
         def from_local(api: Any) -> np.ndarray:
-            outputs = api.apply(api.InputSchema(epsilon=epsilon_np))
+            outputs = api.apply(
+                api.InputSchema(
+                    design_epsilon=design_epsilon_np, core_epsilon=float(core_epsilon)
+                )
+            )
             return np.asarray(outputs.neff_sq, dtype=out_dtype)
 
         try:
@@ -437,8 +466,16 @@ def build_gyptis_components(
         finally:
             timer.record(phase, started_at)
 
-    def background_forward(epsilon_np: np.ndarray) -> np.ndarray:
-        key = (epsilon_np.shape, epsilon_np.dtype.str, epsilon_np.tobytes())
+    def background_forward(
+        design_epsilon_np: np.ndarray,
+        core_epsilon: float = _DEFAULT_BACKGROUND_EPSILON,
+    ) -> np.ndarray:
+        key = (
+            design_epsilon_np.shape,
+            design_epsilon_np.dtype.str,
+            design_epsilon_np.tobytes(),
+            float(core_epsilon),
+        )
         with cache_lock:
             cached = background_cache.get(key)
         if cached is not None:
@@ -446,32 +483,43 @@ def build_gyptis_components(
             timer.record("gyptis_background_cache", started_at)
             return cached.copy()
 
-        result = forward(epsilon_np, phase="gyptis_background_forward")
+        result = forward(
+            design_epsilon_np, core_epsilon, phase="gyptis_background_forward"
+        )
         with cache_lock:
             background_cache[key] = result.copy()
         return result
 
-    def vjp(epsilon_np: np.ndarray, cot_neff_sq: np.ndarray) -> np.ndarray:
-        out_dtype = epsilon_np.dtype
+    def vjp(
+        design_epsilon_np: np.ndarray,
+        cot_neff_sq: np.ndarray,
+        core_epsilon: float = _DEFAULT_BACKGROUND_EPSILON,
+    ) -> np.ndarray:
+        out_dtype = design_epsilon_np.dtype
         started_at = time.perf_counter()
 
         def from_container(tess: Any) -> np.ndarray:
             vjp_result = tess.vector_jacobian_product(
-                {"epsilon": epsilon_np.tolist()},
-                ["epsilon"],
+                {
+                    "design_epsilon": design_epsilon_np.tolist(),
+                    "core_epsilon": float(core_epsilon),
+                },
+                ["design_epsilon"],
                 ["neff_sq"],
                 {"neff_sq": float(cot_neff_sq)},
             )
-            return np.asarray(vjp_result["epsilon"], dtype=out_dtype)
+            return np.asarray(vjp_result["design_epsilon"], dtype=out_dtype)
 
         def from_local(api: Any) -> np.ndarray:
             vjp_result = api.vector_jacobian_product(
-                api.InputSchema(epsilon=epsilon_np),
-                {"epsilon"},
+                api.InputSchema(
+                    design_epsilon=design_epsilon_np, core_epsilon=float(core_epsilon)
+                ),
+                {"design_epsilon"},
                 {"neff_sq"},
                 {"neff_sq": np.asarray(cot_neff_sq)},
             )
-            return np.asarray(vjp_result["epsilon"], dtype=out_dtype)
+            return np.asarray(vjp_result["design_epsilon"], dtype=out_dtype)
 
         try:
             return invoke_tesseract(
@@ -503,23 +551,39 @@ def build_gyptis_components(
     return TimedComponent(perturbed, timer), TimedComponent(background, timer)
 
 
-def _build_domain_epsilon(
+def _build_design_epsilon(
     delta_eps: jax.Array,
     background_epsilon: jax.Array,
-    domain_count: int,
-    active_domains: tuple[int, ...] | None = None,
+    design_transfer: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """Map nodal silicon perturbation onto gyptis material domains."""
-    if domain_count < 1:
-        raise ValueError("domain_count must be positive")
-    if active_domains is None:
-        active_domains = (0,)
-    if any(index < 0 or index >= domain_count for index in active_domains):
-        raise ValueError("active_domains contains an invalid domain index")
+    """Build the gyptis background and perturbed design-region permittivity fields.
 
-    delta_mean = jnp.mean(delta_eps)
-    epsilon_bg = jnp.full((domain_count,), background_epsilon, dtype=delta_eps.dtype)
-    epsilon_pert = epsilon_bg.at[jnp.asarray(active_domains)].add(delta_mean)
+    The nodal permittivity perturbation is carried onto the gyptis design cells
+    by the mesh-transfer operator (ticket 04), preserving its spatial structure
+    rather than collapsing it to a per-domain scalar mean. The perturbed field is
+    ``background + transferred(delta_eps)``; the background field is a *uniform*
+    ``background`` of the same length, so the background solve stays
+    rho-independent and contributes an exact zero design gradient.
+
+    Args:
+        delta_eps: Nodal permittivity perturbation on the shared mesh.
+        background_epsilon: Background silicon permittivity (constant).
+        design_transfer: Dense ``(n_design_cells, n_nodes)`` mesh-transfer matrix
+            -- ``build_mesh_transfer_operator(...).dense()`` from
+            :mod:`prismo.mesh_transfer`. When ``None`` the transfer is the
+            identity, so the design cells are the shared-mesh nodes themselves.
+
+    Returns:
+        ``(epsilon_bg, epsilon_pert)`` fields over the design cells.
+    """
+    if design_transfer is None:
+        transferred = delta_eps
+    else:
+        transfer = jnp.asarray(design_transfer, dtype=delta_eps.dtype)
+        transferred = transfer @ delta_eps
+
+    epsilon_bg = jnp.full(transferred.shape, background_epsilon, dtype=delta_eps.dtype)
+    epsilon_pert = epsilon_bg + transferred
     return epsilon_bg, epsilon_pert
 
 
@@ -673,8 +737,7 @@ def pipeline(
     polarity: jax.Array | None = None,
     mesh_ref: MeshRef | None = None,
     background_epsilon: float | None = None,
-    domain_count: int = _DEFAULT_DOMAIN_COUNT,
-    active_domains: tuple[int, ...] | None = None,
+    design_transfer: jax.Array | None = None,
     components: PipelineComponents | None = None,
 ) -> jax.Array:
     """Rho -> Delta n_eff differentiable pipeline.
@@ -689,8 +752,9 @@ def pipeline(
         mesh_ref: ``MeshRef`` forwarded to ChargeTransport calls.
         background_epsilon: Background Si relative permittivity
             (default: ``n_si^2 = 3.4757^2``).
-        domain_count: Number of gyptis material domains.
-        active_domains: Zero-based gyptis domains receiving the perturbation.
+        design_transfer: Dense ``(n_design_cells, n_nodes)`` mesh-transfer matrix
+            carrying the nodal perturbation onto the gyptis design cells (ticket
+            04). ``None`` maps the perturbation node-for-node (identity).
         components: Live differentiable components to compose. Defaults to the
             in-process components built from the local tesseract apis.
 
@@ -738,19 +802,16 @@ def pipeline(
     # 5. Soref-Bennett coupling (equilibrium-subtracted)
     delta_eps, _ = _sb_jax(n1, p1, n0, p0)
 
-    # 6. gyptis eigenmode solves
+    # 6. gyptis eigenmode solves on the design-region permittivity field. The
+    # perturbation keeps its full spatial structure (no mean-collapse): a
+    # topology change that redistributes carriers at fixed mean now moves neff.
     bg = jnp.asarray(background_epsilon, dtype=delta_eps.dtype)
-    epsilon_bg, epsilon_pert = _build_domain_epsilon(
-        delta_eps,
-        bg,
-        domain_count,
-        active_domains,
-    )
+    epsilon_bg, epsilon_pert = _build_design_epsilon(delta_eps, bg, design_transfer)
 
     # Background epsilon does not depend on rho. Cache its eigenmode while
     # keeping the perturbed solve and eigen-adjoint live for every rho.
-    neff_sq_0 = components.gyptis_background(epsilon_bg)
-    neff_sq_1 = components.gyptis(epsilon_pert)
+    neff_sq_0 = components.gyptis_background(epsilon_bg, background_epsilon)
+    neff_sq_1 = components.gyptis(epsilon_pert, background_epsilon)
 
     neff_0 = jnp.sqrt(jnp.maximum(neff_sq_0, 0.0))
     neff_1 = jnp.sqrt(jnp.maximum(neff_sq_1, 0.0))

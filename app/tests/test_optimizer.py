@@ -188,7 +188,7 @@ class TestOptimizeDopingAnalytical:
                 self.vjp_calls = 0
 
             def apply(self, inputs):
-                return {"neff_sq": float(np.mean(inputs["epsilon"]))}
+                return {"neff_sq": float(np.mean(inputs["design_epsilon"]))}
 
             def vector_jacobian_product(
                 self,
@@ -198,11 +198,11 @@ class TestOptimizeDopingAnalytical:
                 cotangent,
             ):
                 self.vjp_calls += 1
-                epsilon = np.asarray(inputs["epsilon"], dtype=float)
+                design_epsilon = np.asarray(inputs["design_epsilon"], dtype=float)
                 return {
-                    "epsilon": np.full(
-                        epsilon.shape,
-                        cotangent["neff_sq"] / len(epsilon),
+                    "design_epsilon": np.full(
+                        design_epsilon.shape,
+                        cotangent["neff_sq"] / len(design_epsilon),
                     )
                 }
 

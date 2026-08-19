@@ -4,9 +4,13 @@
 # Tesseract API module for prismo_gyptis
 # Electromagnetic eigenmode component (gyptis / FEniCS).
 #
-# Real implementation: 2D waveguide eigenmode solve + Hellmann-Feynman
-# eigen-adjoint VJP, per tickets 03 and 10. Falls back to effective-medium
-# stub when gyptis/FEniCS is not installed.
+# Field-epsilon implementation (tickets 02/03): the design region carries a
+# spatially-varying permittivity -- one value per DG0 design cell -- injected as
+# a scalar dolfin.Function over an embedded, PML-inset patch of the silicon core.
+# The forward eigensolve and the field-valued Hellmann-Feynman adjoint share a
+# single two-sided SLEPc solve (spike 01 decision 3); the adjoint assembles a
+# per-design-cell cotangent in one pass (decision 4). Falls back to an
+# effective-medium stub when gyptis/FEniCS is not installed.
 
 from typing import Any
 
@@ -14,8 +18,36 @@ import numpy as np
 import numpy.typing as npt
 from prismo_shared.session import SolveSessionRegistry, array_identity
 from pydantic import BaseModel
-from collections import OrderedDict
 from tesseract_core.runtime import Array, Differentiable, Float64
+
+#
+# Geometry / physics constants (spike 01)
+#
+
+WAVELENGTH: float = 1.55  # free-space wavelength, micrometres
+
+# Silicon core in oxide; surroundings stay constant (spec: only the core is
+# modulated). Defaults double as the effective-medium stub's material stack.
+DEFAULT_CORE_EPSILON: float = 3.4757**2
+DEFAULT_CLAD_EPSILON: float = 2.10
+DEFAULT_SUBSTRATE_EPSILON: float = 2.10
+
+_WIDTH: float = 2.0
+_PML_WIDTH: tuple[float, float] = (0.5, 0.5)
+_LAYER_THICKNESS: dict[str, float] = {
+    "substrate": 0.35,
+    "core": 0.30,
+    "clad": 0.35,
+}
+# Refine the core so the fundamental guided mode (n_clad < neff < n_core) is
+# resolved rather than only the coarse-mesh leaky mode.
+_CORE_MESH_SIZE: float = 0.06
+
+# Embedded design region: interior cells of the core layer, inset from the
+# layer's x-extent (+/- _WIDTH/2) and its y-edges so it never touches a PML.
+_DESIGN_HALF_WIDTH: float = 0.6
+_DESIGN_Y_INSET: float = 0.05
+
 
 #
 # Schemas
@@ -23,22 +55,30 @@ from tesseract_core.runtime import Array, Differentiable, Float64
 
 
 class InputSchema(BaseModel):
-    """Inputs to the gyptis eigenmode solve.
+    """Inputs to the gyptis field-epsilon eigenmode solve.
 
     Attributes:
-        epsilon: Relative permittivity per subdomain. Each element
-            corresponds to one material region of the waveguide cross-section
-            (e.g. core, cladding, substrate).
+        design_epsilon: Relative permittivity per design cell -- the modulated
+            silicon on the embedded design region, one value per DG0 cell (order
+            given by :func:`design_cell_centroids`). This is the only
+            differentiated input.
+        core_epsilon: Background silicon permittivity for the core cells outside
+            the design region (constant).
+        clad_epsilon: Cladding (oxide) permittivity (constant).
+        substrate_epsilon: Substrate (oxide) permittivity (constant).
     """
 
-    epsilon: Differentiable[Array[(None,), Float64]]
+    design_epsilon: Differentiable[Array[(None,), Float64]]
+    core_epsilon: float = DEFAULT_CORE_EPSILON
+    clad_epsilon: float = DEFAULT_CLAD_EPSILON
+    substrate_epsilon: float = DEFAULT_SUBSTRATE_EPSILON
 
 
 class OutputSchema(BaseModel):
     """Outputs of the gyptis eigenmode solve.
 
     Attributes:
-        neff_sq: Squared effective index of the fundamental mode
+        neff_sq: Squared effective index of the tracked mode
             (neff_sq = kz^2 / k0^2, where kz is the propagation constant
             and k0 is the free-space wavenumber).
     """
@@ -50,10 +90,11 @@ class OutputSchema(BaseModel):
 # Module-level state
 #
 
-# The forward solve, behind the fixed apply/vjp endpoints. Its carried state
-# lets vector_jacobian_product() re-access geometry without re-solving; the
-# adjoint retrieves the session whose permittivity matches before using it.
-# No scope is passed, so the registry keeps only the most-recent forward.
+# The forward solve, behind the fixed apply/vjp endpoints. apply() runs the
+# single two-sided eigensolve and stores its whole eigenstate here; the adjoint
+# retrieves the session whose inputs match and assembles the field sensitivity
+# from that state without re-solving. No scope is passed, so the registry keeps
+# only the most-recent forward.
 _session_registry = SolveSessionRegistry()
 
 
@@ -76,45 +117,285 @@ def _ensure_gyptis() -> Any:
     return gyptis
 
 
+def _solve_identity(
+    design_epsilon: np.ndarray,
+    core_epsilon: float,
+    clad_epsilon: float,
+    substrate_epsilon: float,
+) -> tuple[Any, ...]:
+    """Hashable fingerprint of a forward solve's inputs (field + constants)."""
+    return (
+        *array_identity(design_epsilon),
+        float(core_epsilon),
+        float(clad_epsilon),
+        float(substrate_epsilon),
+    )
+
+
 def _build_waveguide(
-    epsilon: np.ndarray, wavelength: float = 1.55
-) -> tuple[Any, Any, Any, float]:
-    """Build a 2D waveguide simulation with layered geometry.
-
-    Creates a rectangular cross-section with horizontal layers via
-    LayeredBoxPML, one layer per epsilon element. Uses gyptis
-    Waveguide for the eigenmode formulation.
-
-    Args:
-        epsilon: Per-layer relative permittivity values.
-        wavelength: Free-space wavelength in meters (default 1.55 μm).
+    core_epsilon: float,
+    clad_epsilon: float,
+    substrate_epsilon: float,
+) -> tuple[Any, float]:
+    """Build the layered substrate/core/clad waveguide with a refined core.
 
     Returns:
-        Tuple of (simulation, geometry, n_domains, wavenumber_k0).
+        Tuple of (Waveguide simulation, free-space wavenumber k0).
     """
     gyptis = _ensure_gyptis()
     _ensure_dolfin()
 
-    n_domains = len(epsilon)
-    k0 = 2.0 * np.pi / wavelength
-
-    width = 2  # 2 μm cross-section width
-    height = 1  # 1 μm cross-section height
-    layer_thickness = height / n_domains
-    thicknesses = OrderedDict({"domain_" + str(i + 1): layer_thickness for i in range(n_domains)})
-
+    k0 = 2.0 * np.pi / WAVELENGTH
     geom = gyptis.geometry.LayeredBoxPML2D(
-        width, thicknesses=thicknesses, pml_width=(0.5, 0.5)
+        _WIDTH, thicknesses=dict(_LAYER_THICKNESS), pml_width=_PML_WIDTH
     )
+    geom.set_size("core", _CORE_MESH_SIZE)
     geom.build()
 
-    eps_dict: dict[str, float] = {}
-    for i, eps in enumerate(epsilon):
-        eps_dict["domain_" + str(i + 1)] = float(eps)
+    eps_bg = {
+        "substrate": float(substrate_epsilon),
+        "core": float(core_epsilon),
+        "clad": float(clad_epsilon),
+    }
+    simu = gyptis.Waveguide(geom, epsilon=eps_bg, wavenumber=k0)
+    return simu, k0
 
-    simu = gyptis.Waveguide(geom, epsilon=eps_dict, wavenumber=k0)
 
-    return simu, geom, n_domains, k0
+def _design_mask(simu: Any) -> tuple[Any, np.ndarray, np.ndarray]:
+    """Return (DG0 space, cell centroids, boolean design-cell mask).
+
+    Design cells are interior core cells whose centroid lies in the embedded,
+    PML-inset design box (spike 01 decision 1).
+    """
+    dolfin = _ensure_dolfin()
+    mesh = simu.formulation.function_space.mesh()
+    y0 = simu.geometry.y_position["core"]
+    y_lo, y_hi = y0, y0 + simu.geometry.thicknesses["core"]
+
+    dg0 = dolfin.FunctionSpace(mesh, "DG", 0)
+    coords = dg0.tabulate_dof_coordinates().reshape(-1, 2)
+    x, y = coords[:, 0], coords[:, 1]
+    mask = (
+        (np.abs(x) < _DESIGN_HALF_WIDTH)
+        & (y > y_lo + _DESIGN_Y_INSET)
+        & (y < y_hi - _DESIGN_Y_INSET)
+    )
+    return dg0, coords, mask
+
+
+def _make_core_field(
+    dg0: Any, mask: np.ndarray, core_background: float, design_values: np.ndarray
+) -> Any:
+    """Scalar DG0 Function: ``design_values`` on masked cells, background elsewhere."""
+    dolfin = _ensure_dolfin()
+    fn = dolfin.Function(dg0)
+    vals = np.full(dg0.dim(), float(core_background))
+    vals[mask] = design_values
+    fn.vector().set_local(vals)
+    fn.vector().apply("insert")
+    return fn
+
+
+def design_cell_centroids(
+    core_epsilon: float = DEFAULT_CORE_EPSILON,
+    clad_epsilon: float = DEFAULT_CLAD_EPSILON,
+    substrate_epsilon: float = DEFAULT_SUBSTRATE_EPSILON,
+) -> np.ndarray:
+    """Centroids ``(n_design, 2)`` of the design cells, in ``design_epsilon`` order.
+
+    The mask depends only on the fixed geometry, not on the permittivity values,
+    so the pipeline can call this once to size and build its mesh-transfer
+    operator (ticket 04). Requires gyptis/FEniCS.
+    """
+    simu, _k0 = _build_waveguide(core_epsilon, clad_epsilon, substrate_epsilon)
+    _dg0, coords, mask = _design_mask(simu)
+    return coords[mask]
+
+
+#
+# Two-sided eigensolve (shared by forward + adjoint; spike 01 decision 3)
+#
+
+
+def _assemble_AB(simu: Any, eps_core_field: Any) -> tuple[Any, Any]:
+    """Overwrite the core property with a DG0 field; assemble real A, B matrices."""
+    dolfin = _ensure_dolfin()
+    from gyptis.complex import Constant, dot
+
+    form = simu.formulation
+    # Rebuild the property dict from the scalar background first so the PMLs stay
+    # matched to the scalar core (spike 01 decision 2), then overwrite the core.
+    form._epsilon = form.epsilon.as_property(dim=3)
+    form._epsilon["core"] = eps_core_field
+
+    wf = form.weak
+    zero = Constant((0.0, 0.0, 0.0))
+    dv = dot(zero, form.test) * form.dx
+    dv = dv.real + dv.imag
+    bcs = form.build_boundary_conditions()
+
+    A_mat, B_mat = dolfin.PETScMatrix(), dolfin.PETScMatrix()
+    b = dolfin.PETScVector()
+    dolfin.assemble_system(wf[0], dv, bcs, A_tensor=A_mat, b_tensor=b)
+    dolfin.assemble_system(wf[1], dv, A_tensor=B_mat, b_tensor=b)
+    return A_mat.mat(), B_mat.mat()
+
+
+def _two_sided_solver(A: Any, B: Any, target: float, n: int = 12) -> tuple[Any, int]:
+    """Two-sided shift-invert SLEPc solve; returns (solver, n_converged)."""
+    from slepc4py import SLEPc
+
+    solver = SLEPc.EPS().create(A.getComm())
+    solver.setOperators(A, B)
+    solver.setProblemType(SLEPc.EPS.ProblemType.GNHEP)
+    solver.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
+    solver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_MAGNITUDE)
+    solver.setTarget(target)
+    st = solver.getST()
+    st.setType(SLEPc.ST.Type.SINVERT)
+    st.setShift(target)
+    solver.setDimensions(n)
+    solver.setTolerances(1e-7)
+    solver.setTwoSided(True)
+    solver.solve()
+    nconv = solver.getConverged()
+    if nconv == 0:
+        raise RuntimeError("two-sided SLEPc eigensolve did not converge")
+    return solver, nconv
+
+
+def _select_index(
+    solver: Any,
+    nconv: int,
+    k0: float,
+    core_epsilon: float,
+    clad_epsilon: float,
+    ref_lam: complex | None,
+) -> int:
+    """Index of the tracked eigenpair.
+
+    When ``ref_lam`` is given (adjoint / finite-difference re-solves) the mode is
+    tracked by nearest eigenvalue, so forward and adjoint validate one mode. On
+    the base forward solve the fundamental *guided* mode is selected: the
+    largest-neff eigenpair whose neff lies in the physical window
+    ``(sqrt(clad), sqrt(core))``. Falls back to nearest-target when the mesh
+    resolves no guided mode (a leaky mode; gradient correctness is unaffected).
+    """
+    if ref_lam is not None:
+        dists = [abs(solver.getEigenvalue(i) - ref_lam) for i in range(nconv)]
+        return int(np.argmin(dists))
+
+    n_core = np.sqrt(core_epsilon)
+    n_clad = np.sqrt(clad_epsilon)
+    best_idx, best_neff = None, -np.inf
+    for i in range(nconv):
+        neff = float(np.real(np.sqrt(solver.getEigenvalue(i))) / k0)
+        if n_clad < neff < n_core and neff > best_neff:
+            best_idx, best_neff = i, neff
+    if best_idx is not None:
+        return best_idx
+
+    target = complex(core_epsilon * k0 * k0, 0.0)
+    dists = [abs(solver.getEigenvalue(i) - target) for i in range(nconv)]
+    return int(np.argmin(dists))
+
+
+def _solve_state(
+    simu: Any,
+    eps_core_field: Any,
+    k0: float,
+    core_epsilon: float,
+    clad_epsilon: float,
+    ref_lam: complex | None = None,
+) -> dict[str, Any]:
+    """Assemble + two-sided solve; return the tracked eigenpair state."""
+    A, B = _assemble_AB(simu, eps_core_field)
+    target = core_epsilon * k0 * k0
+    solver, nconv = _two_sided_solver(A, B, target)
+    idx = _select_index(solver, nconv, k0, core_epsilon, clad_epsilon, ref_lam)
+
+    rx, cx = A.createVecRight(), A.createVecRight()
+    ry, cy = A.createVecRight(), A.createVecRight()
+    lam = solver.getEigenpair(idx, rx, cx)
+    solver.getLeftEigenvector(idx, ry, cy)
+    kz = np.sqrt(lam)
+    neff = float(np.real(kz / k0))
+    return {
+        "A": A, "B": B, "lam": lam, "kz": kz, "neff": neff,
+        "rx": rx, "cx": cx, "ry": ry, "cy": cy,
+    }
+
+
+def _lr_product(matrix: Any, state: dict[str, Any]) -> complex:
+    """y^H matrix x for the complex left/right eigenvectors of the real system."""
+    rx, cx, ry, cy = state["rx"], state["cx"], state["ry"], state["cy"]
+    m_rx, m_cx = matrix.createVecRight(), matrix.createVecRight()
+    matrix.mult(rx, m_rx)
+    matrix.mult(cx, m_cx)
+    return ry.dot(m_rx) + cy.dot(m_cx) + 1j * (ry.dot(m_cx) - cy.dot(m_rx))
+
+
+#
+# Single-pass field sensitivity (spike 01 decision 4; the ticket-03 kernel)
+#
+
+
+def _field_numerator(form: Any, dg0: Any, state: dict[str, Any]) -> np.ndarray:
+    """Per-cell complex numerator ``y^H (dA/deps - lam dB/deps) x`` in one pass.
+
+    Reproduces the matrix-level left/right product with a DG0 test function w
+    standing in for the per-cell epsilon direction. The eigenvector of the real
+    doubled system is complex ``(rx + i cx)``, so ``y^H M x`` is the 4-term
+    combination below; each term assembles the epsilon-derivative density against
+    ``w`` via ``assemble(.real) + assemble(.imag)``.
+    """
+    dolfin = _ensure_dolfin()
+    from gyptis.complex import Complex, Constant, inner, vector
+    from gyptis.utils.helpers import array2function
+
+    k0_sq = Constant((2.0 * np.pi / WAVELENGTH) ** 2)
+    fs = form.function_space
+    w = dolfin.TestFunction(dg0)
+
+    def phys(vec: Any) -> Any:
+        f = array2function(vec.getArray(), fs)
+        return vector(Complex([f[0], f[1], f[2]], [f[3], f[4], f[5]]))
+
+    Xr, Xc = phys(state["rx"]), phys(state["cx"])
+    Yr, Yc = phys(state["ry"]), phys(state["cy"])
+
+    def assemble_ri(cform: Any) -> np.ndarray:
+        re = np.asarray(dolfin.assemble(cform.real).get_local())
+        im = np.asarray(dolfin.assemble(cform.imag).get_local())
+        return re + im
+
+    def dens_A(P: Any, Q: Any) -> np.ndarray:
+        et_P = vector([P[0], P[1], 0.0])
+        et_Q = vector([Q[0], Q[1], 0.0])
+        return assemble_ri(-k0_sq * inner(et_P, et_Q) * w * form.dx)
+
+    def dens_B(P: Any, Q: Any) -> np.ndarray:
+        return assemble_ri(k0_sq * (P[2] * Q[2]) * w * form.dx)
+
+    def lrp_form(dens: Any) -> np.ndarray:
+        return (
+            dens(Xr, Yr) + dens(Xc, Yc) + 1j * (dens(Xc, Yr) - dens(Xr, Yc))
+        )
+
+    return lrp_form(dens_A) - state["lam"] * lrp_form(dens_B)
+
+
+def _field_sensitivity(
+    simu: Any, dg0: Any, k0: float, state: dict[str, Any]
+) -> np.ndarray:
+    """dneff_sq / d(eps_core) per DG0 cell (a field), in a single assembly pass."""
+    num_cell = _field_numerator(simu.formulation, dg0, state)
+    denom = _lr_product(state["B"], state)
+    if abs(denom) == 0.0:
+        raise RuntimeError("left/right eigenvectors have zero B-inner product")
+    dlam = num_cell / denom
+    dneff = np.real(dlam / (2.0 * k0 * state["kz"]))
+    return 2.0 * state["neff"] * dneff
 
 
 #
@@ -123,44 +404,52 @@ def _build_waveguide(
 
 
 def apply(inputs: InputSchema) -> OutputSchema:
-    """Forward eigenmode solve.
+    """Forward field-epsilon eigenmode solve.
 
     Args:
-        inputs: Relative permittivity per subdomain.
+        inputs: Design-region permittivity field plus constant surroundings.
 
     Returns:
-        Squared effective index of the fundamental guided mode.
+        Squared effective index of the tracked mode.
     """
-    epsilon = np.asarray(inputs.epsilon, dtype=float)
-    if epsilon.ndim != 1 or epsilon.size == 0:
-        raise ValueError("epsilon must contain at least one material domain")
+    design = np.asarray(inputs.design_epsilon, dtype=float)
+    if design.ndim != 1 or design.size == 0:
+        raise ValueError("design_epsilon must contain at least one design cell")
 
     try:
         _ensure_dolfin()
         _ensure_gyptis()
     except ImportError:
-        return OutputSchema(neff_sq=float(np.mean(epsilon)))
+        # Effective-medium fallback: scalar output shaped from the field input.
+        return OutputSchema(neff_sq=float(np.mean(design)))
 
-    simu, _geom, n_domains, k0 = _build_waveguide(epsilon)
+    simu, k0 = _build_waveguide(
+        inputs.core_epsilon, inputs.clad_epsilon, inputs.substrate_epsilon
+    )
+    dg0, _coords, mask = _design_mask(simu)
+    n_design = int(mask.sum())
+    if design.size != n_design:
+        raise ValueError(
+            f"design_epsilon has {design.size} values but the design region has "
+            f"{n_design} cells; size it with design_cell_centroids()"
+        )
 
-    _sol = simu.eigensolve(n_eig=4, target=k0)
-
-    j_fundamental = 0
-    ev_re, ev_im, _rx, _cx = simu.eigensolver.get_eigenpair(j_fundamental)
-    lam = ev_re + 1j * ev_im
-    kz = np.sqrt(lam)
-    neff = float(np.real(kz / k0))
-
-    _session_registry.open(
-        array_identity(epsilon),
-        state={
-            "simu": simu,
-            "n_domains": n_domains,
-            "k0": k0,
-            "eigen_index": j_fundamental,
-        },
+    field = _make_core_field(dg0, mask, inputs.core_epsilon, design)
+    state = _solve_state(
+        simu, field, k0, inputs.core_epsilon, inputs.clad_epsilon
     )
 
+    _session_registry.open(
+        _solve_identity(
+            design,
+            inputs.core_epsilon,
+            inputs.clad_epsilon,
+            inputs.substrate_epsilon,
+        ),
+        state={"simu": simu, "dg0": dg0, "mask": mask, "k0": k0, "eigen": state},
+    )
+
+    neff = state["neff"]
     return OutputSchema(neff_sq=neff * neff)
 
 
@@ -175,50 +464,47 @@ def vector_jacobian_product(
     vjp_outputs: set[str],
     cotangent_vector: dict[str, npt.ArrayLike],
 ) -> dict[str, npt.ArrayLike]:
-    """Adjoint gradient pass via Hellmann-Feynman eigen-adjoint.
+    """Field-valued Hellmann-Feynman adjoint.
 
-    For the non-Hermitian generalized eigenproblem A x = lambda B x where
-    lambda = kz^2, the eigenvalue sensitivity to subdomain permittivity
-    epsilon_d is:
-
-        d(lambda)/d(epsilon_d) = ( y^H (dA/d(eps_d) - lambda dB/d(eps_d)) x )
-                               / ( y^H B x )
-
-    where x and y are the right and left eigenvectors, respectively.
-
-    The result is chained through neff = sqrt(lambda)/k0.
+    Returns one cotangent per design cell: the sensitivity of neff_sq to the
+    design-region permittivity field, assembled in a single pass from the
+    eigenstate the preceding ``apply`` stored (no re-solve). Chained through
+    ``neff = sqrt(lambda) / k0``.
 
     Args:
         inputs: Same InputSchema as the preceding apply() call.
-        vjp_inputs: Input fields to compute cotangents for ({"epsilon"}).
-        vjp_outputs: Output fields the cotangent_vector was taken w.r.t.
-            ({"neff_sq"}).
-        cotangent_vector: Cotangent on output fields, e.g.
-            ``{"neff_sq": v}`` where v is a scalar dL/d(neff_sq).
+        vjp_inputs: Input fields to compute cotangents for ({"design_epsilon"}).
+        vjp_outputs: Output fields the cotangent was taken w.r.t. ({"neff_sq"}).
+        cotangent_vector: Cotangent on output fields, e.g. ``{"neff_sq": v}``.
 
     Returns:
-        Dict mapping requested input fields to their cotangents, e.g.
-        ``{"epsilon": dL/d(epsilon)}``.
+        ``{"design_epsilon": dL/d(design_epsilon)}`` when requested.
     """
     vjp: dict[str, npt.ArrayLike] = {}
-
-    if "epsilon" not in vjp_inputs or "neff_sq" not in vjp_outputs:
+    if "design_epsilon" not in vjp_inputs or "neff_sq" not in vjp_outputs:
         return vjp
 
     cotangent = float(np.asarray(cotangent_vector["neff_sq"]))
-    epsilon = np.asarray(inputs.epsilon, dtype=float)
-    if epsilon.ndim != 1 or epsilon.size == 0:
-        raise ValueError("epsilon must contain at least one material domain")
-    n = len(epsilon)
+    design = np.asarray(inputs.design_epsilon, dtype=float)
+    if design.ndim != 1 or design.size == 0:
+        raise ValueError("design_epsilon must contain at least one design cell")
 
     try:
-        dolfin = _ensure_dolfin()
+        _ensure_dolfin()
         _ensure_gyptis()
     except ImportError:
-        vjp["epsilon"] = np.full(n, cotangent / n)
+        n = design.size
+        vjp["design_epsilon"] = np.full(n, cotangent / n)
         return vjp
 
-    session = _session_registry.match(array_identity(epsilon))
+    session = _session_registry.match(
+        _solve_identity(
+            design,
+            inputs.core_epsilon,
+            inputs.clad_epsilon,
+            inputs.substrate_epsilon,
+        )
+    )
     if session is None:
         if _session_registry.has_any():
             raise RuntimeError(
@@ -231,137 +517,12 @@ def vector_jacobian_product(
         )
 
     simu = session.state["simu"]
+    dg0 = session.state["dg0"]
+    mask = session.state["mask"]
     k0 = session.state["k0"]
+    eigen = session.state["eigen"]
 
-    # Reassemble exactly as gyptis' eigensolve implementation does, then use
-    # slepc4py directly because DOLFIN does not expose left eigenvectors.
-    from gyptis.complex import Constant, dot, inner, vector
-    from gyptis.materials import Coefficient
-    from slepc4py import SLEPc
-
-    wf = simu.formulation.weak
-    zero = Constant((0.0, 0.0, 0.0))
-    dv = dot(zero, simu.formulation.test) * simu.formulation.dx
-    dv = dv.real + dv.imag
-
-    bcs = simu.formulation.build_boundary_conditions()
-
-    A_mat = dolfin.PETScMatrix()
-    B_mat = dolfin.PETScMatrix()
-    b = dolfin.PETScVector()
-    dolfin.assemble_system(wf[0], dv, bcs, A_tensor=A_mat, b_tensor=b)
-    dolfin.assemble_system(wf[1], dv, A_tensor=B_mat, b_tensor=b)
-    A = A_mat.mat()
-    B = B_mat.mat()
-
-    eigensolver = SLEPc.EPS().create(A.getComm())
-    eigensolver.setOperators(A, B)
-    eigensolver.setProblemType(SLEPc.EPS.ProblemType.GNHEP)
-    eigensolver.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
-    eigensolver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_MAGNITUDE)
-    eigensolver.setTarget(k0 * k0)
-    spectral_transform = eigensolver.getST()
-    spectral_transform.setType(SLEPc.ST.Type.SINVERT)
-    spectral_transform.setShift(k0 * k0)
-    eigensolver.setDimensions(8)
-    eigensolver.setTolerances(1e-6)
-    eigensolver.setTwoSided(True)
-    eigensolver.solve()
-    if eigensolver.getConverged() == 0:
-        raise RuntimeError("two-sided SLEPc eigensolve did not converge")
-
-    rx = A.createVecRight()
-    cx = A.createVecRight()
-    ry = A.createVecRight()
-    cy = A.createVecRight()
-    lam = eigensolver.getEigenpair(0, rx, cx)
-    eigensolver.getLeftEigenvector(0, ry, cy)
-    kz = np.sqrt(lam)
-    neff = float(np.real(kz / k0))
-
-    def left_right_product(matrix: Any) -> complex:
-        matrix_rx = matrix.createVecRight()
-        matrix_cx = matrix.createVecRight()
-        matrix.mult(rx, matrix_rx)
-        matrix.mult(cx, matrix_cx)
-        return (
-            ry.dot(matrix_rx)
-            + cy.dot(matrix_cx)
-            + 1j * (ry.dot(matrix_cx) - cy.dot(matrix_rx))
-        )
-
-    denominator = left_right_product(B)
-    if abs(denominator) == 0.0:
-        raise RuntimeError("left/right eigenvectors have zero B-inner product")
-
-    u = simu.formulation.trial
-    v = simu.formulation.test
-
-    et = vector([u[0], u[1], 0.0])
-    ez = u[2]
-    vt = vector([v[0], v[1], 0.0])
-    vz = v[2]
-    zhat = vector([0.0, 0.0, 1.0])
-    epsilon_coefficient = simu.formulation.epsilon
-    pml_domains = {pml.applied_domain for pml in epsilon_coefficient.pmls}
-    physical_domains = [
-        name for name in epsilon_coefficient.dict if name not in pml_domains
-    ]
-
-    dneff_sq_deps = np.zeros(len(np.asarray(inputs.epsilon)))
-
-    for d_idx in range(len(np.asarray(inputs.epsilon))):
-        domain_name = f"domain_{d_idx + 1}"
-        unit_materials = {
-            name: float(name == domain_name) for name in physical_domains
-        }
-        epsilon_derivative = Coefficient(
-            unit_materials,
-            geometry=epsilon_coefficient.geometry,
-            pmls=epsilon_coefficient.pmls,
-            dim=epsilon_coefficient.dim,
-            degree=epsilon_coefficient.degree,
-            element=epsilon_coefficient.element,
-        ).as_property(dim=3)
-        affected_domains = [
-            domain_name,
-            *[
-                pml.applied_domain
-                for pml in epsilon_coefficient.pmls
-                if pml.matched_domain == domain_name
-            ],
-        ]
-
-        # Each physical epsilon also controls its matched PML tensors.
-        # Boundary-condition contributions are parameter-independent.
-        dA_form = 0
-        dB_form = 0
-        for region in affected_domains:
-            dA_form += (
-                -Constant(k0 * k0)
-                * inner(epsilon_derivative[region] * et, vt)
-                * simu.dx(region)
-            )
-            dB_form += (
-                Constant(k0 * k0)
-                * inner(
-                    epsilon_derivative[region] * (ez * zhat),
-                    vz * zhat,
-                )
-                * simu.dx(region)
-            )
-
-        dA = dolfin.PETScMatrix()
-        dB = dolfin.PETScMatrix()
-        dolfin.assemble(dA_form.real + dA_form.imag, tensor=dA)
-        dolfin.assemble(dB_form.real + dB_form.imag, tensor=dB)
-
-        dlam_deps = (
-            left_right_product(dA.mat())
-            - lam * left_right_product(dB.mat())
-        ) / denominator
-        dneff_deps = np.real(dlam_deps / (2.0 * k0 * kz))
-        dneff_sq_deps[d_idx] = 2.0 * neff * dneff_deps
-
-    vjp["epsilon"] = cotangent * dneff_sq_deps
+    dneff_sq_cell = _field_sensitivity(simu, dg0, k0, eigen)
+    grad_design = dneff_sq_cell[mask]
+    vjp["design_epsilon"] = cotangent * grad_design
     return vjp

@@ -1,11 +1,13 @@
-"""Seam tests for the gyptis Tesseract component.
+"""Seam tests for the gyptis field-epsilon Tesseract component.
 
 Public interface under test: apply() + vector_jacobian_product() in
-tesseract_api.py (contract per ticket 01-research-tesseract-core-api).
+tesseract_api.py. The forward accepts a design-region permittivity *field*
+(one value per DG0 design cell) with constant surroundings, and the adjoint
+returns a per-design-cell cotangent (tickets 02/03).
 
-Covers schema validation, contract shapes, gradient consistency (VJP
-matches finite-difference approximation), and integration tests when
-gyptis/FEniCS is available in the environment.
+Covers schema validation, contract shapes, the effective-medium stub used when
+gyptis/FEniCS is absent, and gyptis-backed integration tests (guided mode,
+spatial response, single-pass field VJP vs finite differences).
 """
 
 import importlib.util
@@ -25,7 +27,7 @@ OutputSchema = _api.OutputSchema
 apply = _api.apply
 vector_jacobian_product = _api.vector_jacobian_product
 
-N_ELEMENTS = 4
+N_DESIGN = 8
 
 
 def _gyptis_available() -> bool:
@@ -43,10 +45,19 @@ def _gyptis_available() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def make_inputs(epsilon: np.ndarray | None = None) -> InputSchema:
-    if epsilon is None:
-        epsilon = np.full(N_ELEMENTS, 12.0)
-    return InputSchema(epsilon=epsilon)
+def make_inputs(design_epsilon: np.ndarray | None = None) -> InputSchema:
+    if design_epsilon is None:
+        design_epsilon = np.full(N_DESIGN, _api.DEFAULT_CORE_EPSILON)
+    return InputSchema(design_epsilon=design_epsilon)
+
+
+def _sized_design(rng_scale: float = 0.5) -> np.ndarray:
+    """A structured design field sized to the real gyptis design region."""
+    centroids = _api.design_cell_centroids()
+    n = centroids.shape[0]
+    pattern = np.random.RandomState(0).uniform(-1.0, 1.0, n)
+    pattern -= pattern.mean()
+    return _api.DEFAULT_CORE_EPSILON + rng_scale * pattern
 
 
 # ---------------------------------------------------------------------------
@@ -54,15 +65,21 @@ def make_inputs(epsilon: np.ndarray | None = None) -> InputSchema:
 # ---------------------------------------------------------------------------
 
 
-def test_input_schema_accepts_numpy_array() -> None:
-    epsilon = np.array([12.0, 2.0, 1.0, 3.0])
-    inp = InputSchema(epsilon=epsilon)
-    assert np.asarray(inp.epsilon).shape == (4,)
+def test_input_schema_accepts_numpy_field() -> None:
+    inp = InputSchema(design_epsilon=np.array([12.0, 2.0, 1.0, 3.0]))
+    assert np.asarray(inp.design_epsilon).shape == (4,)
 
 
 def test_input_schema_accepts_list() -> None:
-    inp = InputSchema(epsilon=[12.0, 2.0, 1.0, 3.0])
-    assert np.asarray(inp.epsilon).shape == (4,)
+    inp = InputSchema(design_epsilon=[12.0, 2.0, 1.0, 3.0])
+    assert np.asarray(inp.design_epsilon).shape == (4,)
+
+
+def test_input_schema_defaults_constant_surroundings() -> None:
+    inp = InputSchema(design_epsilon=[12.0, 12.0])
+    assert inp.core_epsilon == _api.DEFAULT_CORE_EPSILON
+    assert inp.clad_epsilon == _api.DEFAULT_CLAD_EPSILON
+    assert inp.substrate_epsilon == _api.DEFAULT_SUBSTRATE_EPSILON
 
 
 def test_output_schema_neff_sq_is_scalar() -> None:
@@ -76,32 +93,21 @@ def test_output_schema_neff_sq_is_scalar() -> None:
 
 
 def test_apply_returns_output_schema() -> None:
-    outputs = apply(make_inputs())
-    assert isinstance(outputs, OutputSchema)
+    assert isinstance(apply(make_inputs()), OutputSchema)
 
 
-def test_apply_returns_scalar_effective_index_squared() -> None:
-    outputs = apply(make_inputs())
-    assert np.asarray(outputs.neff_sq).shape == ()
+def test_apply_returns_scalar_neff_sq() -> None:
+    assert np.asarray(apply(make_inputs()).neff_sq).shape == ()
 
 
 def test_apply_returns_finite_neff_sq() -> None:
-    epsilon = np.array([12.0, 11.0, 1.0, 1.0])
-    outputs = apply(make_inputs(epsilon))
+    outputs = apply(make_inputs(np.array([12.0, 11.0, 12.5, 11.5])))
     assert np.isfinite(float(outputs.neff_sq))
 
 
-def test_apply_deterministic() -> None:
-    epsilon = np.array([12.0, 11.0, 1.0, 3.0])
-    out1 = apply(make_inputs(epsilon))
-    out2 = apply(make_inputs(epsilon))
-    np.testing.assert_allclose(out1.neff_sq, out2.neff_sq)
-
-
-def test_apply_effective_medium_stub_averages_permittivity() -> None:
-    epsilon = np.array([1.0, 2.0, 3.0, 4.0])
-    outputs = apply(make_inputs(epsilon))
-    np.testing.assert_allclose(outputs.neff_sq, 2.5)
+def test_apply_rejects_empty_field() -> None:
+    with pytest.raises(ValueError):
+        apply(make_inputs(np.array([])))
 
 
 # ---------------------------------------------------------------------------
@@ -109,79 +115,65 @@ def test_apply_effective_medium_stub_averages_permittivity() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_vjp_returns_cotangent_for_each_requested_input() -> None:
+def test_vjp_returns_cotangent_shaped_like_design_field() -> None:
     inputs = make_inputs()
-    result = vector_jacobian_product(inputs, {"epsilon"}, {"neff_sq"}, {"neff_sq": 1.0})
-    assert set(result.keys()) == {"epsilon"}
-    assert np.asarray(result["epsilon"]).shape == (N_ELEMENTS,)
+    apply(inputs)
+    result = vector_jacobian_product(
+        inputs, {"design_epsilon"}, {"neff_sq"}, {"neff_sq": 1.0}
+    )
+    assert set(result.keys()) == {"design_epsilon"}
+    assert np.asarray(result["design_epsilon"]).shape == (N_DESIGN,)
 
 
 def test_vjp_returns_finite_values() -> None:
     inputs = make_inputs()
+    apply(inputs)
     result = vector_jacobian_product(
-        inputs, {"epsilon"}, {"neff_sq"}, {"neff_sq": 1.0}
+        inputs, {"design_epsilon"}, {"neff_sq"}, {"neff_sq": 1.0}
     )
-    assert np.all(np.isfinite(result["epsilon"]))
+    assert np.all(np.isfinite(np.asarray(result["design_epsilon"])))
 
 
 def test_vjp_empty_when_input_not_requested() -> None:
     inputs = make_inputs()
-    result = vector_jacobian_product(
-        inputs, set(), {"neff_sq"}, {"neff_sq": 1.0}
-    )
+    result = vector_jacobian_product(inputs, set(), {"neff_sq"}, {"neff_sq": 1.0})
     assert result == {}
 
 
 def test_vjp_linear_in_cotangent() -> None:
-    """VJP must be linear in the cotangent vector."""
     inputs = make_inputs()
+    apply(inputs)
     r1 = vector_jacobian_product(
-        inputs, {"epsilon"}, {"neff_sq"}, {"neff_sq": 1.0}
+        inputs, {"design_epsilon"}, {"neff_sq"}, {"neff_sq": 1.0}
     )
+    apply(inputs)
     r2 = vector_jacobian_product(
-        inputs, {"epsilon"}, {"neff_sq"}, {"neff_sq": 3.0}
+        inputs, {"design_epsilon"}, {"neff_sq"}, {"neff_sq": 3.0}
     )
-    ratio = np.asarray(r2["epsilon"]) / np.asarray(r1["epsilon"])
+    ratio = np.asarray(r2["design_epsilon"]) / np.asarray(r1["design_epsilon"])
     np.testing.assert_allclose(ratio, 3.0, rtol=1e-10)
 
 
-def test_vjp_effective_medium_stub_spreads_evenly() -> None:
+# ---------------------------------------------------------------------------
+# Effective-medium stub (gyptis / FEniCS absent)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(_gyptis_available(), reason="exercises the no-gyptis stub")
+def test_apply_stub_averages_field() -> None:
+    outputs = apply(make_inputs(np.array([1.0, 2.0, 3.0, 4.0])))
+    np.testing.assert_allclose(outputs.neff_sq, 2.5)
+
+
+@pytest.mark.skipif(_gyptis_available(), reason="exercises the no-gyptis stub")
+def test_vjp_stub_spreads_field_cotangent_evenly() -> None:
     inputs = make_inputs()
     result = vector_jacobian_product(
-        inputs, {"epsilon"}, {"neff_sq"}, {"neff_sq": 1.0}
+        inputs, {"design_epsilon"}, {"neff_sq"}, {"neff_sq": 1.0}
     )
-    np.testing.assert_allclose(result["epsilon"], np.full(N_ELEMENTS, 1 / N_ELEMENTS))
-
-
-# ---------------------------------------------------------------------------
-# Gradient consistency (VJP ~= finite-difference)
-# ---------------------------------------------------------------------------
-
-
-def test_vjp_matches_finite_difference() -> None:
-    """VJP must approximate finite-difference gradient of the forward map.
-
-    For neff_sq = f(epsilon), the VJP computes v^T * df/d(epsilon).
-    The directional derivative must match:
-        (f(eps + h*v) - f(eps - h*v)) / (2h) ~= vjp * v
-    """
-    epsilon = np.array([12.0, 11.0, 1.0, 1.0], dtype=float)
-    perturbation = np.array([0.1, -0.3, 0.05, 0.2], dtype=float)
-    h = 1e-5
-
-    apply(make_inputs(epsilon))  # ensure apply runs
-
-    vjp_result = vector_jacobian_product(
-        make_inputs(epsilon), {"epsilon"}, {"neff_sq"}, {"neff_sq": 1.0}
+    np.testing.assert_allclose(
+        result["design_epsilon"], np.full(N_DESIGN, 1 / N_DESIGN)
     )
-    vjp = np.asarray(vjp_result["epsilon"])
-
-    f_plus = float(apply(make_inputs(epsilon + h * perturbation)).neff_sq)
-    f_minus = float(apply(make_inputs(epsilon - h * perturbation)).neff_sq)
-    fd_grad_dir = (f_plus - f_minus) / (2 * h)
-
-    vjp_dir = float(np.dot(vjp, perturbation))
-    np.testing.assert_allclose(vjp_dir, fd_grad_dir, rtol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -190,37 +182,50 @@ def test_vjp_matches_finite_difference() -> None:
 
 
 @pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
-def test_gyptis_apply_runs_eigen_solve() -> None:
-    """Real gyptis apply must return physically plausible neff."""
-    epsilon = np.array([12.0, 2.0, 1.0])
-
-    outputs = apply(make_inputs(epsilon))
-    neff_sq = float(outputs.neff_sq)
-    assert np.isfinite(neff_sq)
-    assert 1.0 < neff_sq < 20.0  # physically plausible range for silicon
+def test_design_cell_centroids_inside_pml_inset_box() -> None:
+    centroids = _api.design_cell_centroids()
+    assert centroids.ndim == 2 and centroids.shape[1] == 2
+    assert centroids.shape[0] > 0
+    # Provably clear of the PMLs beyond +/- _WIDTH/2.
+    assert np.abs(centroids[:, 0]).max() < _api._WIDTH / 2
 
 
 @pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
-def test_gyptis_vjp_matches_finite_difference() -> None:
-    """Real gyptis VJP must match finite-difference gradient of the eigen solve."""
-    n_domains = 4
-    epsilon = np.array([12.0, 11.0, 1.0, 1.0], dtype=float)
-    perturbation = np.random.RandomState(42).randn(n_domains) * 0.1
-    h = 1e-3
+def test_apply_lands_on_guided_mode() -> None:
+    neff_sq = float(apply(make_inputs(_sized_design(0.0))).neff_sq)
+    neff = neff_sq**0.5
+    assert _api.DEFAULT_CLAD_EPSILON**0.5 < neff < _api.DEFAULT_CORE_EPSILON**0.5
 
-    apply(make_inputs(epsilon))
-    vjp_result = vector_jacobian_product(
-        make_inputs(epsilon), {"epsilon"}, {"neff_sq"}, {"neff_sq": 1.0}
+
+@pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
+def test_apply_responds_to_spatial_pattern_at_fixed_mean() -> None:
+    structured = _sized_design(0.5)
+    uniform = np.full_like(structured, structured.mean())
+    neff_sq_structured = float(apply(make_inputs(structured)).neff_sq)
+    neff_sq_uniform = float(apply(make_inputs(uniform)).neff_sq)
+    assert abs(neff_sq_structured - neff_sq_uniform) > 1e-6
+
+
+@pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
+def test_vjp_field_matches_finite_difference() -> None:
+    design = _sized_design(0.5)
+    apply(make_inputs(design))
+    grad = np.asarray(
+        vector_jacobian_product(
+            make_inputs(design), {"design_epsilon"}, {"neff_sq"}, {"neff_sq": 1.0}
+        )["design_epsilon"]
     )
-    vjp = np.asarray(vjp_result["epsilon"])
-    assert vjp.shape == (n_domains,)
-    assert np.all(np.isfinite(vjp))
-    assert np.any(vjp != 0.0)
+    assert grad.shape == design.shape
+    assert grad.std() > 0.0  # spatially resolved, not a uniform gradient
 
-    f_plus = float(apply(make_inputs(epsilon + h * perturbation)).neff_sq)
-    f_minus = float(apply(make_inputs(epsilon - h * perturbation)).neff_sq)
-    fd_grad_dir = (f_plus - f_minus) / (2 * h)
-
-    vjp_dir = float(np.dot(vjp, perturbation))
-    rel_err = abs(vjp_dir - fd_grad_dir) / max(abs(fd_grad_dir), 1.0)
-    assert rel_err < 0.01, f"VJP-FD mismatch: {rel_err:.2e}"
+    h = 1e-4
+    for local in (0, design.size // 2, design.size - 1):
+        vp = design.copy()
+        vp[local] += h
+        vm = design.copy()
+        vm[local] -= h
+        fp = float(apply(make_inputs(vp)).neff_sq)
+        fm = float(apply(make_inputs(vm)).neff_sq)
+        fd = (fp - fm) / (2 * h)
+        rel = abs(fd - grad[local]) / max(abs(grad[local]), 1e-12)
+        assert rel < 1e-3, f"cell {local}: rel-err {rel:.2e}"

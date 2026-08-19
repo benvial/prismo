@@ -11,9 +11,10 @@ import pytest
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp  # noqa: E402
 from prismo.density_filter import assemble_filter_matrix  # noqa: E402
+from prismo.differentiable_component import DifferentiableComponent  # noqa: E402
 from prismo.pipeline import (  # noqa: E402
     PipelineComponents,
-    _build_domain_epsilon,
+    _build_design_epsilon,
     _sb_jax,
     build_chargetransport_component,
     build_default_components,
@@ -194,8 +195,9 @@ class TestPipelineStub:
         exp_dn = coeffs.A_e * dN**coeffs.B_e + coeffs.A_h * dN**coeffs.B_h
         exp_deps = 2.0 * coeffs.background_index * exp_dn
         bg = pl._DEFAULT_BACKGROUND_EPSILON
-        # Default domain mapping perturbs one of three equal domains.
-        exp_result = float(np.sqrt(bg + exp_deps / 3.0) - np.sqrt(bg))
+        # No mean-collapse: the uniform depletion perturbs the whole design
+        # field, and the effective-medium stub averages it back to bg + exp_deps.
+        exp_result = float(np.sqrt(bg + exp_deps) - np.sqrt(bg))
         np.testing.assert_allclose(float(result), exp_result, rtol=1e-6)
         assert float(result) > 0.0
 
@@ -253,24 +255,71 @@ class TestPipelineStub:
         grad = jax.grad(lambda r: pipeline(r, components=components))(rho)
         np.testing.assert_allclose(grad, 0.0, atol=1e-20)
 
-    def test_domain_epsilon_keeps_inactive_domains_at_background(self):
+    def test_design_epsilon_preserves_spatial_structure(self):
+        """No mean-collapse: each design cell keeps its own perturbation."""
         delta = jnp.asarray([1.0, 3.0, 5.0])
-        bg, pert = _build_domain_epsilon(delta, jnp.asarray(12.0), 3)
+        bg, pert = _build_design_epsilon(delta, jnp.asarray(12.0))
         np.testing.assert_array_equal(bg, [12.0, 12.0, 12.0])
-        np.testing.assert_allclose(pert, [15.0, 12.0, 12.0])
+        np.testing.assert_allclose(pert, [13.0, 15.0, 17.0])
 
-    def test_domain_epsilon_can_activate_multiple_domains(self):
-        _, pert = _build_domain_epsilon(
-            jnp.asarray([2.0, 4.0]),
-            jnp.asarray(10.0),
-            4,
-            (0, 2),
+    def test_design_epsilon_background_is_uniform(self):
+        """The background field stays uniform -> exact zero design gradient."""
+        bg, _ = _build_design_epsilon(jnp.asarray([1.0, -2.0, 0.5]), jnp.asarray(10.0))
+        np.testing.assert_array_equal(bg, [10.0, 10.0, 10.0])
+
+    def test_design_epsilon_applies_mesh_transfer(self):
+        """A transfer matrix maps the nodal perturbation onto the design cells."""
+        delta = jnp.asarray([1.0, 3.0])  # two shared-mesh nodes
+        transfer = jnp.asarray([[1.0, 0.0], [0.5, 0.5]])  # 2 design cells
+        _, pert = _build_design_epsilon(delta, jnp.asarray(10.0), transfer)
+        np.testing.assert_allclose(pert, [11.0, 12.0])
+
+    def test_design_epsilon_fixed_mean_pattern_is_not_averaged(self):
+        """Fixed-mean but varying perturbation stays spatially non-constant."""
+        varying = jnp.asarray([0.3, -0.3, 0.1, -0.1])  # mean 0, structured
+        uniform = jnp.zeros(4)  # same mean, no structure
+        _, pert_varying = _build_design_epsilon(varying, jnp.asarray(12.0))
+        _, pert_uniform = _build_design_epsilon(uniform, jnp.asarray(12.0))
+        assert float(jnp.std(pert_varying)) > 0.0
+        assert float(jnp.std(pert_uniform)) == 0.0
+        # A structure-sensitive solve distinguishes them at equal mean.
+        sq = lambda e: float(jnp.sum(e**2))
+        assert sq(pert_varying) != pytest.approx(sq(pert_uniform))
+
+    def test_pipeline_gradient_is_spatially_resolved(self):
+        """End to end: a structure-sensitive gyptis yields a non-constant grad.
+
+        With the mean-collapse removed, the per-cell design field reaches gyptis
+        and its per-cell sensitivity flows back to a spatially-varying rho
+        gradient -- the payoff the feature exists to enable (ticket 05).
+        """
+
+        def fake_ct(doping, bias_voltage, mesh_ref=None):
+            # Carriers deplete under bias in proportion to the local doping, so
+            # a non-uniform rho produces a spatially-varying permittivity field.
+            carriers = jnp.where(
+                bias_voltage == 0.0, doping, jnp.zeros_like(doping)
+            )
+            return carriers, carriers
+
+        # gyptis stub sensitive to spatial structure: neff_sq = sum(eps^2), whose
+        # exact per-cell VJP is 2*eps (non-constant for a structured field).
+        structure_sensitive = DifferentiableComponent(
+            forward=lambda *a: None,
+            vjp=lambda *a: None,
+            out_struct=lambda eps, *s: jax.ShapeDtypeStruct((), eps.dtype),
+            stub_forward=lambda eps, *s: jnp.sum(eps**2),
+            stub_vjp=lambda eps, g, *s: 2.0 * g * eps,
+            available=lambda: False,
         )
-        np.testing.assert_allclose(pert, [13.0, 10.0, 13.0, 10.0])
+        components = _components_with(
+            chargetransport=fake_ct, gyptis=structure_sensitive
+        )
 
-    def test_domain_epsilon_rejects_invalid_domain(self):
-        with pytest.raises(ValueError, match="invalid domain"):
-            _build_domain_epsilon(jnp.ones(2), jnp.asarray(1.0), 2, (2,))
+        rho = jnp.asarray([0.2, 0.5, 0.8, 0.4])
+        grad = jax.grad(lambda r: pipeline(r, components=components))(rho)
+        assert jnp.all(jnp.isfinite(grad))
+        assert float(jnp.std(grad)) > 0.0  # spatially resolved, not collapsed
 
     def test_forward_returns_zero_pre_container(self, rho):
         result = pipeline(rho)
@@ -323,7 +372,7 @@ class TestContainerPipeline:
                 self.epsilon_calls: list[np.ndarray] = []
 
             def apply(self, inputs):
-                epsilon = np.asarray(inputs["epsilon"], dtype=float)
+                epsilon = np.asarray(inputs["design_epsilon"], dtype=float)
                 self.epsilon_calls.append(epsilon)
                 return {"neff_sq": float(np.mean(epsilon))}
 
@@ -390,7 +439,7 @@ class TestContainerPipeline:
 
         class FakeGyptis:
             def apply(self, inputs):
-                return {"neff_sq": float(np.mean(inputs["epsilon"]))}
+                return {"neff_sq": float(np.mean(inputs["design_epsilon"]))}
 
         def make_bundle(carriers_0v: float) -> PipelineComponents:
             def fake_ct(doping, bias_voltage, mesh_ref=None):
@@ -464,8 +513,8 @@ class TestComponentTiming:
 
         class FakeGyptis:
             def apply(self, inputs):
-                gyptis_recorder.append(inputs["epsilon"])
-                return {"neff_sq": float(np.mean(inputs["epsilon"]))}
+                gyptis_recorder.append(inputs["design_epsilon"])
+                return {"neff_sq": float(np.mean(inputs["design_epsilon"]))}
 
         perturbed, background = build_gyptis_components(container=FakeGyptis())
         components = PipelineComponents(
