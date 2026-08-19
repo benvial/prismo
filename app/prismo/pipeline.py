@@ -162,13 +162,22 @@ def _close_all(
         close()
 
 
-def init_tesseract_containers() -> PipelineComponents:
+def init_tesseract_containers(
+    mesh_dir: str | Path | None = None,
+) -> PipelineComponents:
     """Start tesseract Docker containers and bundle the live components.
 
     Returns a :class:`PipelineComponents` the caller owns and passes to
     ``pipeline()``. Containers stay running until the bundle's ``close()`` is
     called (see ``teardown_containers``). Startup is all-or-nothing so a
     container run can never silently use local component stubs.
+
+    Args:
+        mesh_dir: Host directory holding the shared ``.msh`` file. It is
+            bind-mounted read-only into the ChargeTransport container at
+            :data:`_CT_MESH_MOUNT` so its Julia solver can load the real 2D
+            grid instead of the 1D fallback. The bind mount is live, so a mesh
+            written after the container starts is still visible.
     """
     try:
         from tesseract_core import Tesseract  # type: ignore[import-untyped]
@@ -177,9 +186,17 @@ def init_tesseract_containers() -> PipelineComponents:
             "tesseract_core is required for container pipeline runs"
         ) from exc
 
+    ct_volumes: list[str] | None = None
+    if mesh_dir is not None:
+        host_mesh_dir = Path(mesh_dir).resolve()
+        host_mesh_dir.mkdir(parents=True, exist_ok=True)
+        ct_volumes = [f"{host_mesh_dir}:{_CT_MESH_MOUNT}:ro"]
+
     closers: list[Callable[[], None]] = []
     try:
-        ct_tesseract = Tesseract.from_image("prismo_chargetransport:latest")
+        ct_tesseract = Tesseract.from_image(
+            "prismo_chargetransport:latest", volumes=ct_volumes
+        )
         ct_tesseract.serve()
         closers.append(ct_tesseract.teardown)
     except Exception as exc:
@@ -309,6 +326,20 @@ _filter_jax.defvjp(_filter_jax_fwd, _filter_jax_bwd)
 
 # -- ChargeTransport component ---------------------------------------------------
 
+# Read-only mountpoint where the shared mesh directory is bind-mounted into the
+# ChargeTransport container (see ``init_tesseract_containers``). The container
+# has no access to host paths, so a host ``mesh_ref.path`` is rewritten to this
+# mount before the request crosses the container boundary.
+_CT_MESH_MOUNT = "/tesseract/mesh"
+
+
+def _container_mesh_ref(mesh_ref: MeshRef | None) -> MeshRef | None:
+    """Rewrite a host ``mesh_ref`` path to its in-container mount location."""
+    if mesh_ref is None:
+        return None
+    container_path = f"{_CT_MESH_MOUNT}/{Path(mesh_ref.path).name}"
+    return mesh_ref.model_copy(update={"path": container_path})
+
 
 def _ct_container_inputs(
     doping_np: np.ndarray,
@@ -372,7 +403,11 @@ def build_chargetransport_component(
         phase = f"ct_forward_{bias_voltage:g}V"
 
         def from_container(tess: Any) -> tuple[np.ndarray, np.ndarray]:
-            result = tess.apply(_ct_container_inputs(doping_np, bias_voltage, mesh_ref))
+            result = tess.apply(
+                _ct_container_inputs(
+                    doping_np, bias_voltage, _container_mesh_ref(mesh_ref)
+                )
+            )
             return (
                 np.asarray(result["electrons"], dtype=doping_np.dtype),
                 np.asarray(result["holes"], dtype=doping_np.dtype),
@@ -410,7 +445,9 @@ def build_chargetransport_component(
 
         def from_container(tess: Any) -> np.ndarray:
             vjp_result = tess.vector_jacobian_product(
-                _ct_container_inputs(doping_np, bias_voltage, mesh_ref),
+                _ct_container_inputs(
+                    doping_np, bias_voltage, _container_mesh_ref(mesh_ref)
+                ),
                 ["doping"],
                 ["electrons", "holes"],
                 {"electrons": cot_n.tolist(), "holes": cot_p.tolist()},

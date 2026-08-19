@@ -14,18 +14,21 @@ from prismo.density_filter import assemble_filter_matrix  # noqa: E402
 from prismo.differentiable_component import DifferentiableComponent  # noqa: E402
 from prismo.mesh_transfer import build_mesh_transfer_operator  # noqa: E402
 from prismo.pipeline import (  # noqa: E402
+    _CT_MESH_MOUNT,
     PipelineComponents,
     _build_design_epsilon,
+    _container_mesh_ref,
     _sb_jax,
     build_chargetransport_component,
     build_default_components,
     build_design_transfer,
     build_gyptis_components,
+    init_tesseract_containers,
     pipeline,
     read_gyptis_design_cell_centroids,
 )
 from prismo.soref_bennett import soref_bennett as _sb_numpy  # noqa: E402
-from prismo_shared.schemas import CarrierDensityField  # noqa: E402
+from prismo_shared.schemas import CarrierDensityField, MeshRef  # noqa: E402
 
 RNG = np.random.default_rng(0)
 
@@ -426,7 +429,7 @@ class TestContainerPipeline:
 
         class FailingTesseract:
             @classmethod
-            def from_image(cls, image):
+            def from_image(cls, image, **kwargs):
                 raise RuntimeError(f"image unavailable: {image}")
 
         monkeypatch.setitem(
@@ -871,3 +874,98 @@ class TestPipelineShapeValidation:
         n_out, p_out = build_default_components().chargetransport(rho, 0.0)
         assert n_out.shape == rho.shape
         assert p_out.shape == rho.shape
+
+
+class TestChargeTransportMeshDelivery:
+    """The shared mesh must reach the ChargeTransport container.
+
+    The CT container has no access to host paths, so a host ``mesh_ref.path``
+    is useless inside it -- the worker silently falls back to its 1D device and
+    the gmsh-order lateral junction becomes a many-junction line the -5 V solve
+    cannot converge on. The fix is a read-only bind mount plus a rewritten path
+    (ticket 02). Ref: .scratch/chargetransport-mesh-node-ordering.
+    """
+
+    def test_container_mesh_ref_rewrites_path_to_mount(self):
+        ref = MeshRef(path="/host/outputs/waveguide.msh", n_nodes=62)
+        rewritten = _container_mesh_ref(ref)
+        assert rewritten.path == f"{_CT_MESH_MOUNT}/waveguide.msh"
+        # Only the path changes; the rest of the reference is preserved.
+        assert rewritten.n_nodes == 62
+        assert rewritten.node_ordering == ref.node_ordering
+        # The host reference is left untouched (no in-place mutation).
+        assert ref.path == "/host/outputs/waveguide.msh"
+
+    def test_container_mesh_ref_none_passthrough(self):
+        assert _container_mesh_ref(None) is None
+
+    def test_container_forward_sends_mount_path_not_host_path(self):
+        """The apply() request must carry the in-container mesh path."""
+
+        class RecordingTesseract:
+            def __init__(self):
+                self.inputs = None
+
+            def apply(self, inputs):
+                self.inputs = inputs
+                doping = np.asarray(inputs["doping"], dtype=float)
+                return {"electrons": doping, "holes": doping}
+
+        recorder = RecordingTesseract()
+        component = build_chargetransport_component(container=recorder)
+        host_ref = MeshRef(path="/host/outputs/waveguide.msh", n_nodes=3)
+
+        component.forward(np.array([1.0, 2.0, 3.0]), 0.0, host_ref)
+
+        assert recorder.inputs["mesh_ref"]["path"] == f"{_CT_MESH_MOUNT}/waveguide.msh"
+
+    def test_init_bind_mounts_mesh_dir_into_ct_container(self, monkeypatch, tmp_path):
+        """init_tesseract_containers mounts the mesh dir read-only into CT."""
+        import sys
+        import types
+
+        captured: dict[str, object] = {}
+
+        class FakeTesseract:
+            def __init__(self, image, volumes=None):
+                self.image = image
+                self.volumes = volumes
+
+            @classmethod
+            def from_image(cls, image, volumes=None):
+                if "chargetransport" in image:
+                    captured["ct_volumes"] = volumes
+                return cls(image, volumes)
+
+            def serve(self):
+                return None
+
+            def teardown(self):
+                return None
+
+        monkeypatch.setitem(
+            sys.modules,
+            "tesseract_core",
+            types.SimpleNamespace(Tesseract=FakeTesseract),
+        )
+        # Keep the component builders from touching the fake containers further.
+        monkeypatch.setattr(
+            "prismo.pipeline.build_chargetransport_component",
+            lambda container=None, local_api=None: (lambda *a, **k: None),
+        )
+        monkeypatch.setattr(
+            "prismo.pipeline.build_gyptis_components",
+            lambda container=None, local_api=None: (
+                (lambda *a, **k: None),
+                (lambda *a, **k: None),
+            ),
+        )
+
+        mesh_dir = tmp_path / "outputs"
+        init_tesseract_containers(mesh_dir=mesh_dir)
+
+        assert captured["ct_volumes"] == [
+            f"{mesh_dir.resolve()}:{_CT_MESH_MOUNT}:ro"
+        ]
+        # The mount directory is created so the bind mount always resolves.
+        assert mesh_dir.exists()

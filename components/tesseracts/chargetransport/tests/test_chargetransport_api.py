@@ -464,6 +464,51 @@ def test_apply_solves_smooth_mixed_sign_pn_profile(bias_voltage: float) -> None:
     assert not np.allclose(holes, doping)
 
 
+_FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def _shared_mesh_lateral_junction() -> tuple[Path, np.ndarray]:
+    """Real 2D waveguide mesh + a lateral +/-1e19 junction in gmsh node order.
+
+    The doping is contiguous in space (left half donors, right half acceptors)
+    but flips sign 16 times along the raw node index -- exactly the field that
+    scrambles into a many-junction line on the 1D fallback device.
+    """
+    mesh = _FIXTURES / "waveguide.msh"
+    doping = np.load(_FIXTURES / "lateral_junction_doping.npy")
+    return mesh, doping
+
+
+@pytest.mark.skipif(not _julia_available(), reason="Julia not installed")
+def test_reverse_bias_converges_on_shared_mesh() -> None:
+    """A lateral +/-1e19 junction converges at -5 V on the real 2D grid.
+
+    On the 1D fallback (no mesh_ref) the same gmsh-order field is a 16-junction
+    line the reverse-bias solve cannot converge on. Given the shared mesh, the
+    junction is spatially coherent and the solve converges with correct P/N
+    physics. Ref: .scratch/chargetransport-mesh-node-ordering/issues/03.
+    """
+    mesh, doping = _shared_mesh_lateral_junction()
+    mesh_ref = _make_mesh_ref(str(mesh), n_nodes=len(doping))
+
+    outputs = apply(InputSchema(doping=doping, bias_voltage=-5.0, mesh_ref=mesh_ref))
+    electrons = np.asarray(outputs.electrons)
+    holes = np.asarray(outputs.holes)
+
+    assert electrons.shape == doping.shape
+    assert np.all(np.isfinite(electrons))
+    assert np.all(np.isfinite(holes))
+
+    # Correct P/N physics: electrons accumulate on the n-side (donors,
+    # doping < 0), holes on the p-side (acceptors, doping > 0). A junction
+    # scrambled onto the wrong grid nodes would land carriers on the wrong
+    # spatial halves.
+    n_side = doping < 0
+    p_side = doping > 0
+    assert electrons[n_side].mean() > electrons[p_side].mean()
+    assert holes[p_side].mean() > holes[n_side].mean()
+
+
 @pytest.mark.parametrize("bias_voltage", [0.0, -5.0])
 @pytest.mark.skipif(not _julia_available(), reason="Julia not installed")
 def test_vjp_is_finite_for_smooth_mixed_sign_pn_profile(bias_voltage: float) -> None:

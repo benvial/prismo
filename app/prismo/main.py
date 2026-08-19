@@ -58,7 +58,7 @@ def run(
     components: PipelineComponents | None = None
     if use_containers:
         typer.echo("Starting tesseract Docker containers...")
-        components = init_tesseract_containers()
+        components = init_tesseract_containers(mesh_dir=Path(mesh_path).parent)
 
     try:
         _run_pipeline(
@@ -87,6 +87,8 @@ def _run_pipeline(
     use_containers: bool,
     components: Any | None = None,
 ) -> None:
+    from prismo_shared.schemas import MeshRef
+
     from prismo.density_filter import assemble_filter_matrix
     from prismo.optimizer import OptimizationCancelled, optimize_doping
     from prismo.outputs import generate_outputs, plot_live_doping_field
@@ -121,8 +123,20 @@ def _run_pipeline(
             indexing="xy",
         )
         coords = np.stack([xs.ravel(), ys.ravel()], axis=1)
+        real_mesh = False
+    else:
+        real_mesh = True
     n_nodes = coords.shape[0]
     typer.echo(f"      {n_nodes} nodes")
+
+    # Reference the real 2D grid so ChargeTransport solves on it instead of its
+    # 1D fallback device, where the gmsh-order lateral junction collapses into a
+    # many-junction line the reverse-bias solve cannot converge on.
+    mesh_ref = (
+        MeshRef(path=str(actual_mesh), n_nodes=n_nodes, node_ordering="gmsh")
+        if real_mesh
+        else None
+    )
 
     import jax.numpy as jnp
 
@@ -178,6 +192,7 @@ def _run_pipeline(
             use_jit=not no_jit,
             on_iteration=on_iteration,
             design_transfer=design_transfer,
+            mesh_ref=mesh_ref,
             components=components,
         )
         typer.echo(f"      Optimization complete: {len(history)} iterations")

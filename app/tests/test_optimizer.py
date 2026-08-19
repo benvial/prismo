@@ -300,3 +300,64 @@ class TestOptimizeDopingWithFilter:
             max_iter=2,
         )
         assert rho_opt.shape == rho0.shape
+
+
+class TestOptimizeDopingThreadsMeshRef:
+    """The optimizer must forward the shared mesh to ChargeTransport.
+
+    Without it CT never receives the real geometry and solves on its 1D
+    fallback -- the crash the whole feature exists to fix. Ref:
+    .scratch/chargetransport-mesh-node-ordering/issues/02.
+    """
+
+    def test_mesh_ref_reaches_chargetransport_component(self):
+        from prismo.pipeline import (
+            _CT_MESH_MOUNT,
+            PipelineComponents,
+            build_chargetransport_component,
+            build_gyptis_components,
+        )
+        from prismo_shared.schemas import MeshRef
+
+        class RecordingChargeTransport:
+            def __init__(self):
+                self.mesh_paths: list[str | None] = []
+
+            def apply(self, inputs):
+                ref = inputs.get("mesh_ref")
+                self.mesh_paths.append(None if ref is None else ref["path"])
+                doping = np.asarray(inputs["doping"], dtype=float)
+                return {"electrons": doping, "holes": doping}
+
+            def vector_jacobian_product(self, inputs, *_args):
+                return {"doping": np.zeros_like(inputs["doping"], dtype=float)}
+
+        class FakeGyptis:
+            def apply(self, inputs):
+                return {"neff_sq": float(np.mean(inputs["design_epsilon"]))}
+
+            def vector_jacobian_product(self, inputs, *_args, cotangent=None):
+                design_epsilon = np.asarray(inputs["design_epsilon"], dtype=float)
+                return {"design_epsilon": np.zeros_like(design_epsilon)}
+
+        ct = RecordingChargeTransport()
+        perturbed, background = build_gyptis_components(container=FakeGyptis())
+        components = PipelineComponents(
+            chargetransport=build_chargetransport_component(container=ct),
+            gyptis=perturbed,
+            gyptis_background=background,
+        )
+
+        mesh_ref = MeshRef(path="/host/outputs/waveguide.msh", n_nodes=4)
+        optimize_doping(
+            initial_rho=np.full(4, 0.25, dtype=float),
+            max_iter=1,
+            use_jit=False,
+            mesh_ref=mesh_ref,
+            components=components,
+        )
+
+        # Every CT forward received the mesh (rewritten to the container mount),
+        # never None.
+        assert ct.mesh_paths, "ChargeTransport was never called"
+        assert all(p == f"{_CT_MESH_MOUNT}/waveguide.msh" for p in ct.mesh_paths)

@@ -8,10 +8,10 @@ Ref: ticket 15.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 import json
 import signal
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 import nlopt
 import numpy as np
+from prismo_shared.schemas import MeshRef
 
 from prismo.density_filter import assemble_filter_matrix
 from prismo.pipeline import (
@@ -50,6 +51,7 @@ def optimize_doping(
     use_jit: bool = True,
     on_iteration: Callable[[int, np.ndarray], None] | None = None,
     design_transfer: jax.Array | None = None,
+    mesh_ref: MeshRef | None = None,
     components: PipelineComponents | None = None,
 ) -> tuple[np.ndarray, list[_HistoryEntry]]:
     """Run the NLopt MMA optimization loop.
@@ -79,6 +81,9 @@ def optimize_doping(
         design_transfer: Dense ``(n_design_cells, n_nodes)`` mesh-transfer
             matrix carrying the nodal perturbation onto the gyptis design
             cells. ``None`` maps the perturbation node-for-node (identity).
+        mesh_ref: Shared-mesh reference forwarded to the ChargeTransport
+            solves so they run on the real 2D grid. ``None`` leaves CT on its
+            1D fallback device.
         components: Live pipeline components to compose. Defaults to the
             in-process components (see ``pipeline``).
 
@@ -119,6 +124,7 @@ def optimize_doping(
             H=H,
             H_sum=H_sum,
             polarity=polarity,
+            mesh_ref=mesh_ref,
             design_transfer=design_transfer,
             components=components,
         )
