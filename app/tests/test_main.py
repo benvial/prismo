@@ -154,6 +154,7 @@ def test_container_run_passes_fixed_pn_polarity_to_optimization(
 
     np.testing.assert_array_equal(captured["polarity"], [-1.0, -1.0, 1.0])
     assert captured["min_mma_evaluations"] == 5
+    assert callable(captured["on_iteration"])
     # The container setup feeds the assembled mesh-transfer matrix to the solve.
     assert captured["design_transfer"] is not None
     assert np.asarray(captured["design_transfer"]).shape == (2, coords.shape[0])

@@ -33,6 +33,28 @@ jax.config.update("jax_enable_x64", True)
 
 _COMPONENTS_DIR = Path(__file__).resolve().parents[2] / "components" / "tesseracts"
 
+# Doping mapping N(rho) = 10^(DOPING_LOG10_MIN + DOPING_LOG10_SPAN * rho) [cm^-3].
+# rho=0 -> 10^14 (intrinsic Si); rho=1 -> 10^21 (solid-solubility limit). See
+# CONTEXT.md.
+DOPING_LOG10_MIN = 14.0
+DOPING_LOG10_SPAN = 7.0
+
+
+def doping_from_rho(
+    rho: jax.Array,
+    polarity: jax.Array | None = None,
+) -> jax.Array:
+    """Map normalized density to signed net doping in ``cm^-3``."""
+    rho = jnp.asarray(rho)
+    doping = jnp.power(
+        jnp.asarray(10.0, dtype=rho.dtype),
+        jnp.asarray(DOPING_LOG10_MIN, dtype=rho.dtype)
+        + jnp.asarray(DOPING_LOG10_SPAN, dtype=rho.dtype) * rho,
+    )
+    if polarity is not None:
+        doping = doping * jnp.asarray(polarity, dtype=rho.dtype)
+    return doping
+
 
 def _load_tesseract_api(name: str) -> Any | None:
     api_path = _COMPONENTS_DIR / name / "tesseract_api.py"
@@ -841,8 +863,6 @@ def pipeline(
     if components is None:
         components = _DEFAULT_COMPONENTS
 
-    rho = jnp.asarray(rho)
-
     # 1. Density filter: rho -> rho_tilde
     if H is not None:
         if H_sum is None:
@@ -852,13 +872,7 @@ def pipeline(
         rho_tilde = rho
 
     # 2. Doping mapping: rho_tilde -> N = 10^(14 + 7*rho_tilde) [cm^-3]
-    dtype = rho_tilde.dtype
-    doping = jnp.power(
-        jnp.asarray(10.0, dtype=dtype),
-        jnp.asarray(14.0, dtype=dtype) + jnp.asarray(7.0, dtype=dtype) * rho_tilde,
-    )
-    if polarity is not None:
-        doping = doping * jnp.asarray(polarity, dtype=dtype)
+    doping = doping_from_rho(rho_tilde, polarity)
 
     # 3. ChargeTransport at equilibrium (0 V)
     n0, p0 = components.chargetransport(doping, 0.0, mesh_ref)

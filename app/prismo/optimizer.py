@@ -8,6 +8,7 @@ Ref: ticket 15.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 import signal
 import time
@@ -47,6 +48,7 @@ def optimize_doping(
     ftol_rel: float = 1e-5,
     min_mma_evaluations: int = 0,
     use_jit: bool = True,
+    on_iteration: Callable[[int, np.ndarray], None] | None = None,
     design_transfer: jax.Array | None = None,
     components: PipelineComponents | None = None,
 ) -> tuple[np.ndarray, list[_HistoryEntry]]:
@@ -72,6 +74,8 @@ def optimize_doping(
         min_mma_evaluations: Minimum objective evaluations completed by MMA
             before falling back to CCSAQ after a roundoff-limited solve.
         use_jit: JIT-compile combined objective and gradient computation.
+        on_iteration: Optional callback receiving an iteration number and its
+            candidate density field immediately before its solver evaluation.
         design_transfer: Dense ``(n_design_cells, n_nodes)`` mesh-transfer
             matrix carrying the nodal perturbation onto the gyptis design
             cells. ``None`` maps the perturbation node-for-node (identity).
@@ -145,6 +149,9 @@ def optimize_doping(
 
             callback_started_at = time.perf_counter()
             try:
+                iter_count = len(history) + 1
+                if on_iteration is not None:
+                    on_iteration(iter_count, rho_np.copy())
                 rho = jnp.asarray(rho_np)
                 value, grad = value_and_grad_fn(rho)
 
@@ -154,7 +161,6 @@ def optimize_doping(
                 phase_timing = components.collect_phase_timing()
             callback_time = time.perf_counter() - callback_started_at
 
-            iter_count = len(history) + 1
             delta = 0.0
             if prev_rho is not None:
                 delta = float(np.linalg.norm(rho_np - prev_rho))

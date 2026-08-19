@@ -78,6 +78,20 @@ class TestOptimizeDopingStub:
         _, history = optimize_doping(rho0, max_iter=5)
         assert len(history) <= 5
 
+    def test_iteration_callback_receives_each_solver_candidate(self, rho0):
+        received: list[tuple[int, np.ndarray]] = []
+
+        _, history = optimize_doping(
+            rho0,
+            max_iter=3,
+            on_iteration=lambda iteration, rho: received.append((iteration, rho)),
+        )
+
+        assert [iteration for iteration, _ in received] == list(
+            range(1, len(history) + 1)
+        )
+        assert all(rho.shape == rho0.shape for _, rho in received)
+
 
 class TestOptimizeDopingAnalytical:
     """Optimizer with a simple concave analytical pipeline.

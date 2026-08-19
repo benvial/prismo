@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import SymLogNorm
 
 matplotlib.use("Agg")
 plt.rcParams.update({
@@ -150,6 +151,52 @@ def plot_doping_field(
     path = out / "doping_field.pdf"
     fig.savefig(path)
     plt.close(fig)
+    return path
+
+
+def plot_live_doping_field(
+    doping: np.ndarray,
+    mesh_coords: np.ndarray,
+    iteration: int,
+    geometry: object | None = None,
+    output_dir: str | Path | None = None,
+) -> Path:
+    """Update the optimizer's current signed doping-field image.
+
+    The image is atomically replaced at every optimizer callback, so it can be
+    opened while a long container-backed solve is still running.
+    """
+    out = _ensure_output_dir(output_dir)
+    doping = np.asarray(doping, dtype=float)
+    x, y = mesh_coords[:, 0] * 1e6, mesh_coords[:, 1] * 1e6
+    limit = float(np.max(np.abs(doping))) if doping.size else 1.0
+    limit = max(limit, 1e14)
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    scatter = ax.scatter(
+        x,
+        y,
+        c=doping,
+        s=2,
+        marker="s",
+        edgecolors="none",
+        cmap="RdBu_r",
+        norm=SymLogNorm(linthresh=1e14, vmin=-limit, vmax=limit, base=10),
+    )
+    ax.set_title(f"Net doping — optimizer iteration {iteration}")
+    ax.set_xlabel("x [µm]")
+    ax.set_ylabel("y [µm]")
+    ax.set_aspect("equal")
+    if geometry is not None:
+        _overlay_geometry(ax, geometry)
+    fig.colorbar(scatter, ax=ax, label=r"Net doping [cm$^{-3}$]")
+    fig.tight_layout()
+
+    path = out / "doping_field_live.png"
+    temporary_path = out / ".doping_field_live.tmp.png"
+    fig.savefig(temporary_path)
+    plt.close(fig)
+    temporary_path.replace(path)
     return path
 
 

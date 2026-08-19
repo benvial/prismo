@@ -14,6 +14,7 @@ from prismo.outputs import (
     plot_delta_neff_breakdown,
     plot_doping_field,
     plot_gradient_validation,
+    plot_live_doping_field,
 )
 from prismo.pipeline import pipeline
 
@@ -67,6 +68,16 @@ class TestDopingFieldPlot:
             path = plot_doping_field(rho_initial, rho_opt, coords, output_dir=tmp)
             assert Path(path).exists()
             assert Path(path).suffix == ".pdf"
+
+    def test_live_plot_replaces_previous_image(self):
+        coords = _make_coords()
+        doping = np.linspace(-1e18, 1e18, N_NODES)
+        with tempfile.TemporaryDirectory() as tmp:
+            first = plot_live_doping_field(doping, coords, iteration=1, output_dir=tmp)
+            second = plot_live_doping_field(doping * 0.5, coords, iteration=2, output_dir=tmp)
+            assert first == second
+            assert first.name == "doping_field_live.png"
+            assert first.exists()
 
     def test_with_geometry(self):
         from prismo.waveguide_mesh import RibWaveguideGeometry

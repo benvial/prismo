@@ -89,8 +89,8 @@ def _run_pipeline(
 ) -> None:
     from prismo.density_filter import assemble_filter_matrix
     from prismo.optimizer import OptimizationCancelled, optimize_doping
-    from prismo.outputs import generate_outputs
-    from prismo.pipeline import build_design_transfer
+    from prismo.outputs import generate_outputs, plot_live_doping_field
+    from prismo.pipeline import build_design_transfer, doping_from_rho
     from prismo.pipeline import pipeline as pipeline_fn
     from prismo.waveguide_mesh import (
         RibWaveguideGeometry,
@@ -153,6 +153,20 @@ def _run_pipeline(
     try:
         optimization_max_iter = max(max_iter, 5) if use_containers else max_iter
         optimization_ftol_rel = 0.0 if use_containers else ftol_rel
+        on_iteration = None
+        if use_containers:
+            live_plot_path = Path(output_dir) / "doping_field_live.png"
+            typer.echo(f"      Updating {live_plot_path} each solver evaluation")
+
+            def on_iteration(iteration: int, rho: np.ndarray) -> None:
+                plot_live_doping_field(
+                    np.asarray(doping_from_rho(rho, polarity)),
+                    coords,
+                    iteration,
+                    geometry=geometry,
+                    output_dir=output_dir,
+                )
+
         rho_opt, history = optimize_doping(
             n_nodes=n_nodes,
             H=H_dense,
@@ -162,6 +176,7 @@ def _run_pipeline(
             ftol_rel=optimization_ftol_rel,
             min_mma_evaluations=5 if use_containers else 0,
             use_jit=not no_jit,
+            on_iteration=on_iteration,
             design_transfer=design_transfer,
             components=components,
         )
