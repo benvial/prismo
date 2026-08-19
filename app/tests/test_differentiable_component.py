@@ -12,7 +12,6 @@ import pytest
 
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp  # noqa: E402
-
 from prismo.differentiable_component import DifferentiableComponent  # noqa: E402
 
 jax.config.update("jax_enable_x64", True)

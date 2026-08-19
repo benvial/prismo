@@ -2,8 +2,10 @@
 
 Run with ``make benchmark``. Pass command options through
 ``BENCHMARK_ARGS``, for example ``make benchmark BENCHMARK_ARGS='--iterations 8'``.
-The default container mode measures the deployed Tesseract boundary. Use
-``--mode in-process`` only in an environment with both solver dependencies.
+The default container mode measures the deployed Tesseract boundary and uses
+the same mesh, fixed P/N polarity, and mesh-transfer setup as ``prismo run
+--use-containers``. Use ``--mode in-process`` only in an environment with
+both solver dependencies.
 
 ``--component chargetransport`` or ``--component gyptis`` benchmark one
 Tesseract component in isolation (its own public ``apply``/
@@ -24,11 +26,20 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--n-nodes", type=int, default=62)
+    parser.add_argument(
+        "--mesh-path",
+        type=Path,
+        default=Path("outputs/waveguide.msh"),
+        help="Shared waveguide mesh; generated when absent.",
+    )
+    parser.add_argument("--r-min", type=float, default=50e-9)
     parser.add_argument(
         "--mode",
         choices=("containers", "in-process"),
@@ -163,6 +174,43 @@ def _run_component_benchmark(args: argparse.Namespace) -> dict[str, object]:
     return result
 
 
+def _prepare_full_pipeline(
+    args: argparse.Namespace, components: Any
+) -> tuple[Any, Any, Any, Any, int]:
+    """Build the full-callback inputs exactly as the container CLI does."""
+    import jax.numpy as jnp
+    from prismo.density_filter import assemble_filter_matrix
+    from prismo.pipeline import build_design_transfer
+    from prismo.waveguide_mesh import (
+        RibWaveguideGeometry,
+        build_rib_waveguide_mesh,
+        read_mesh_node_coordinates,
+    )
+
+    mesh_path = build_rib_waveguide_mesh(
+        mesh_path=args.mesh_path, geometry=RibWaveguideGeometry()
+    )
+    coords = read_mesh_node_coordinates(mesh_path)
+    if coords.shape[0] == 0:
+        raise RuntimeError("waveguide mesh has no nodes; install gmsh and retry")
+    n_nodes = int(coords.shape[0])
+    if args.n_nodes != n_nodes:
+        raise ValueError(
+            f"--n-nodes={args.n_nodes} does not match the generated mesh "
+            f"({n_nodes} nodes)"
+        )
+
+    H = jnp.asarray(assemble_filter_matrix(coords, r_min=args.r_min).toarray())
+    H_sum = jnp.sum(H, axis=1)
+    polarity = None
+    design_transfer = None
+    if args.mode == "containers":
+        midpoint = float(np.median(coords[:, 0]))
+        polarity = jnp.where(coords[:, 0] <= midpoint, -1.0, 1.0)
+        design_transfer = build_design_transfer(components, coords, mesh_path)
+    return H, H_sum, polarity, design_transfer, n_nodes
+
+
 def main() -> None:
     """Run one cold callback and requested warm callbacks, then save JSON."""
     args = _parse_args()
@@ -177,37 +225,45 @@ def main() -> None:
 
     import jax
     import jax.numpy as jnp
-    from prismo.pipeline import (
-        begin_pipeline_callback_timing,
-        clear_pipeline_runtime_state,
-        finish_pipeline_callback_timing,
-        init_tesseract_containers,
-        pipeline,
-        teardown_containers,
+    from prismo.pipeline import default_components, init_tesseract_containers, pipeline
+
+    components = (
+        init_tesseract_containers()
+        if args.mode == "containers"
+        else default_components()
     )
 
-    clear_pipeline_runtime_state()
-    if args.mode == "containers":
-        init_tesseract_containers()
-
     try:
-        callback = jax.value_and_grad(pipeline)
+        H, H_sum, polarity, design_transfer, n_nodes = _prepare_full_pipeline(
+            args, components
+        )
+
+        def objective(rho: Any) -> Any:
+            return pipeline(
+                rho,
+                H=H,
+                H_sum=H_sum,
+                polarity=polarity,
+                design_transfer=design_transfer,
+                components=components,
+            )
+
+        callback = jax.value_and_grad(objective)
         if not args.no_jit:
             callback = jax.jit(callback)
-        initial_rho = jnp.full((args.n_nodes,), 0.25, dtype=jnp.float64)
-        direction = jnp.linspace(-1.0, 1.0, args.n_nodes, dtype=jnp.float64)
+        initial_rho = jnp.full((n_nodes,), 0.25, dtype=jnp.float64)
+        direction = jnp.linspace(-1.0, 1.0, n_nodes, dtype=jnp.float64)
         direction = direction / jnp.linalg.norm(direction)
         measurements: list[dict[str, object]] = []
         for iteration in range(args.iterations):
             rho = initial_rho + iteration * 1e-4 * direction
             started_at = time.perf_counter()
-            begin_pipeline_callback_timing()
             try:
                 value, gradient = callback(rho)
                 value_float = float(value)
                 gradient_norm = float(jnp.linalg.norm(gradient))
             finally:
-                phase_timing = finish_pipeline_callback_timing()
+                phase_timing = components.collect_phase_timing()
             measurements.append(
                 {
                     "kind": "cold" if iteration == 0 else "warm",
@@ -220,12 +276,12 @@ def main() -> None:
             )
     finally:
         if args.mode == "containers":
-            teardown_containers()
+            components.close()
 
     result = {
         "metadata": {
             "mode": args.mode,
-            "n_nodes": args.n_nodes,
+            "n_nodes": n_nodes,
             "jit": not args.no_jit,
             "python": sys.version,
             "platform": platform.platform(),

@@ -48,10 +48,15 @@ def main() -> None:
         raise RuntimeError("Unable to load gyptis tesseract API for warmup")
     api = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(api)
-    api.apply(api.InputSchema(epsilon=epsilon))
+    design_epsilon = [
+        api.DEFAULT_CORE_EPSILON
+        for _ in api.design_cell_centroids()
+    ]
+    inputs = api.InputSchema(design_epsilon=design_epsilon)
+    api.apply(inputs)
     api.vector_jacobian_product(
-        api.InputSchema(epsilon=epsilon),
-        {"epsilon"},
+        inputs,
+        {"design_epsilon"},
         {"neff_sq"},
         {"neff_sq": 1.0},
     )
