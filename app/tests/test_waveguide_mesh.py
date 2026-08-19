@@ -10,6 +10,7 @@ from prismo.waveguide_mesh import (
     RibWaveguideGeometry,
     build_rib_waveguide_mesh,
     build_rib_waveguide_mesh_via_gmsh,
+    read_mesh_node_coordinates,
     read_mesh_silicon_triangulation,
 )
 
@@ -228,7 +229,7 @@ class TestMeshRefCompat:
         gmsh.initialize()
         yield gmsh
         gmsh.finalize()
-        
+
     @pytest.fixture
     def output_path(self):
         with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
@@ -251,6 +252,24 @@ class TestMeshRefCompat:
         ref = MeshRef(path=str(mesh_path))
         ref.n_nodes = 42
         assert ref.n_nodes > 0
+
+    def test_mesh_is_conforming_no_duplicate_nodes(self, gmsh, output_path):
+        """Adjacent rib patches must share nodes, not duplicate them.
+
+        A non-conforming mesh (coincident nodes on internal interfaces) gives
+        ChargeTransport's finite-volume operator a null space and its adjoint
+        solve raises SingularException -- the `make run-containers` crash. The
+        generator merges duplicate CAD entities, so every node coordinate is
+        unique. Ref: .scratch/chargetransport-mesh-node-ordering.
+        """
+        build_rib_waveguide_mesh(output_path)
+        coords = read_mesh_node_coordinates(output_path)
+
+        unique = np.unique(np.round(coords, 15), axis=0)
+        assert unique.shape[0] == coords.shape[0], (
+            f"{coords.shape[0] - unique.shape[0]} duplicate-coordinate nodes: "
+            "mesh is non-conforming"
+        )
 
 
 class TestSiliconTriangulation:

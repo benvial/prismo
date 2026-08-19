@@ -254,6 +254,15 @@ def _build_mesh_rectangles(
     oxide_surfs.append(_rect(rib_l, y3, rib_r, y4, core_sz))
     oxide_surfs.append(_rect(rib_r, y3, hw, y4, bulk_sz))
 
+    # The rib is assembled from independently-added rectangles that abut along
+    # shared edges. Each ``_rect`` adds its own points and lines, so those
+    # shared edges start out as coincident-but-distinct geometry. Without this
+    # merge the generated mesh is non-conforming: duplicate nodes sit on every
+    # internal interface (~2x the node count), the finite-volume operator gains
+    # a null space across the split, and ChargeTransport's adjoint solve hits a
+    # SingularException. Merging the duplicate CAD entities makes neighbouring
+    # surfaces share real curves, so the triangulation is conforming.
+    gmsh.model.geo.removeAllDuplicates()
     gmsh.model.geo.synchronize()
 
     # Contacts are dim-1 physical groups on the top edge of the contact

@@ -509,6 +509,35 @@ def test_reverse_bias_converges_on_shared_mesh() -> None:
     assert holes[p_side].mean() > holes[n_side].mean()
 
 
+@pytest.mark.skipif(not _julia_available(), reason="Julia not installed")
+def test_reverse_bias_adjoint_is_nonsingular_on_shared_mesh() -> None:
+    """The -5 V adjoint solve must not be singular on the shared 2D mesh.
+
+    A non-conforming mesh (duplicate nodes on internal interfaces) gives the
+    finite-volume operator a null space: the forward solve limps through via
+    continuation, but the adjoint's direct linear solve raises
+    SingularException -- the failure that crashed `make run-containers`. The
+    mesh is now generated conforming, so the adjoint returns finite gradients.
+    Ref: .scratch/chargetransport-mesh-node-ordering/issues/03.
+    """
+    mesh, doping = _shared_mesh_lateral_junction()
+    mesh_ref = _make_mesh_ref(str(mesh), n_nodes=len(doping))
+    inputs = InputSchema(doping=doping, bias_voltage=-5.0, mesh_ref=mesh_ref)
+
+    apply(inputs)
+    result = vector_jacobian_product(
+        inputs,
+        {"doping"},
+        {"electrons", "holes"},
+        {"electrons": np.ones_like(doping), "holes": np.ones_like(doping)},
+    )
+    vjp = np.asarray(result["doping"])
+
+    assert vjp.shape == doping.shape
+    assert np.all(np.isfinite(vjp))
+    assert not np.allclose(vjp, 0.0)
+
+
 @pytest.mark.parametrize("bias_voltage", [0.0, -5.0])
 @pytest.mark.skipif(not _julia_available(), reason="Julia not installed")
 def test_vjp_is_finite_for_smooth_mixed_sign_pn_profile(bias_voltage: float) -> None:
