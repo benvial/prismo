@@ -1,4 +1,4 @@
-.PHONY: help new build test gen-tests data run run-containers benchmark clean
+.PHONY: help new build test gen-tests data run run-containers validate-gradient validate-gradient-containers benchmark clean
 
 PYTHON ?= python
 
@@ -12,6 +12,8 @@ help:
 	@echo "  data                          - Pull example data"
 	@echo "  run                           - Run app end-to-end"
 	@echo "  run-containers                - Run app with both Docker containers"
+	@echo "  validate-gradient             - Validate the composed gradient (adjoint vs finite differences)"
+	@echo "  validate-gradient-containers  - Validate the gradient across the real CT + gyptis boundary"
 	@echo "  benchmark                     - Record cold/warm multiphysics callback timings"
 	@echo "  clean                         - Remove build artifacts, caches, and temp files"
 
@@ -168,11 +170,19 @@ data:
 
 run:
 	@echo "Running app..."
-	@PYTHONPATH=app:components/shared_code:$${PYTHONPATH} $(PYTHON) -m prismo.main $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
+	@PYTHONPATH=app:components/shared_code:$${PYTHONPATH} $(PYTHON) -m prismo.main run $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
 
 run-containers:
 	@echo "Running app with Docker containers..."
-	@PYTHONPATH=app:components/shared_code:$${PYTHONPATH} $(PYTHON) -m prismo.main --use-containers $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
+	@PYTHONPATH=app:components/shared_code:$${PYTHONPATH} $(PYTHON) -m prismo.main run --use-containers $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
+
+validate-gradient:
+	@echo "Validating composed gradient (adjoint vs finite differences)..."
+	@PYTHONPATH=app:components/shared_code:$${PYTHONPATH} $(PYTHON) -m prismo.main validate-gradient $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
+
+validate-gradient-containers:
+	@echo "Validating composed gradient across the real CT + gyptis boundary..."
+	@PYTHONPATH=app:components/shared_code:$${PYTHONPATH} $(PYTHON) -m prismo.main validate-gradient --use-containers $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
 
 benchmark:
 	@echo "Benchmarking multiphysics optimization callbacks..."

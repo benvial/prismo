@@ -8,6 +8,7 @@ submission.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import jax
@@ -315,6 +316,161 @@ def plot_delta_neff_breakdown(
     return path
 
 
+# Default acceptance bar for the composed cross-boundary gradient (ticket 06).
+# Central differences of a smooth pipeline are O(h^2), but the *composed* adjoint
+# is limited by the least-exact link in the chain: the CT discrete adjoint reads
+# carrier density back through an internal 1e-8 finite difference (audit #7) and
+# the gyptis eigen-adjoint carries its solver tolerance. 1% relative agreement at
+# the best step is the "gradients do real work" bar -- tight enough to catch a
+# sign error, a missing adjoint term, or a unit mismatch across the boundary,
+# loose enough not to chase the CT readout's own FD floor.
+GRADIENT_VALIDATION_TOLERANCE = 1e-2
+
+
+@dataclass(frozen=True)
+class GradientValidationResult:
+    """Outcome of an adjoint-vs-finite-difference gradient check (ticket 06).
+
+    ``best_rel_errors[i]`` is the smallest relative error over the feasible
+    finite-difference steps for direction ``i`` -- the point where central FD is
+    closest to the adjoint's directional derivative before rounding or the CT
+    readout's own FD floor takes over. ``worst_rel_error`` is the largest of
+    those per-direction minima; the gradient passes when it stays at or below
+    ``tolerance``.
+    """
+
+    n_directions: int
+    best_rel_errors: list[float]
+    worst_rel_error: float
+    tolerance: float
+    passed: bool
+    figure_path: Path
+
+
+def _sample_directions(
+    rho: jax.Array,
+    directions: list[jax.Array] | None,
+    n_directions: int,
+) -> list[jax.Array]:
+    if directions is not None:
+        return directions
+    rng = np.random.default_rng(0)
+    sampled = []
+    for _ in range(n_directions):
+        d = jnp.asarray(rng.standard_normal(rho.shape), dtype=rho.dtype)
+        d = d / jnp.linalg.norm(d)
+        sampled.append(d)
+    return sampled
+
+
+def _feasible_steps(
+    rho: jax.Array, direction: jax.Array, step_sizes: np.ndarray
+) -> np.ndarray:
+    """Steps that keep ``rho ± h·direction`` inside the signed box ``[-1, 1]``.
+
+    The central stencil probes *both* sides, so a component ``i`` needs
+    ``rho_i + h·d_i <= 1`` and ``rho_i - h·d_i >= -1`` (and the mirror pair for a
+    negative ``d_i``). Both collapse to ``h·|d_i| <= 1 - |rho_i|``, so the whole
+    box constraint is ``h <= min_i (1 - |rho_i|) / |d_i|`` over the nonzero
+    components -- one symmetric bound instead of the per-sign upper-only check.
+    """
+    rho_np = np.asarray(rho)
+    dir_np = np.asarray(direction)
+    nonzero = dir_np != 0.0
+    max_step = np.min(
+        (1.0 - np.abs(rho_np[nonzero])) / np.abs(dir_np[nonzero]), initial=np.inf
+    )
+    return step_sizes[step_sizes < max_step]
+
+
+def _gradient_validation_curves(
+    pipeline_fn: Callable[..., jax.Array],
+    rho: jax.Array,
+    directions: list[jax.Array],
+    step_sizes: np.ndarray,
+) -> list[tuple[int, np.ndarray, list[float]]]:
+    """Central-FD relative-error curve per direction against the JAX adjoint.
+
+    Returns ``(index, feasible_steps, errors)`` for every direction that has at
+    least one feasible step. The adjoint's directional derivative is
+    ``grad · direction``; the finite-difference estimate is the central
+    difference at each step.
+    """
+    grad_exact = jax.grad(pipeline_fn)(rho)
+    curves: list[tuple[int, np.ndarray, list[float]]] = []
+    for i, direction in enumerate(directions):
+        feasible_steps = _feasible_steps(rho, direction, step_sizes)
+        if len(feasible_steps) == 0:
+            continue
+        exact_val = jnp.dot(grad_exact, direction)
+        denom = max(float(abs(exact_val)), 1e-30)
+        errors = []
+        for h in feasible_steps:
+            f_plus = pipeline_fn(rho + h * direction)
+            f_minus = pipeline_fn(rho - h * direction)
+            fd_val = (f_plus - f_minus) / (2.0 * h)
+            errors.append(float(abs(fd_val - exact_val)) / denom)
+        curves.append((i, feasible_steps, errors))
+    return curves
+
+
+def _render_gradient_validation(
+    curves: list[tuple[int, np.ndarray, list[float]]],
+    step_sizes: np.ndarray,
+    n_directions: int,
+    tolerance: float | None,
+    out: Path,
+) -> Path:
+    fig, ax = plt.subplots(figsize=(6, 4))
+    for i, feasible_steps, errors in curves:
+        label = f"direction {i+1}" if n_directions > 1 else "FD"
+        ax.loglog(feasible_steps, errors, "o-", markersize=3, label=label)
+
+    ax.plot(step_sizes, step_sizes, "k--", alpha=0.4, label=r"$O(h)$")
+    if tolerance is not None:
+        ax.axhline(
+            tolerance, color="crimson", ls=":", lw=1.5, label=f"tol = {tolerance:g}"
+        )
+    ax.set_xlabel("Step size h")
+    ax.set_ylabel("Relative error")
+    ax.set_title("Gradient Validation (central FD)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    path = out / "gradient_validation.pdf"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def _gradient_validation_setup(
+    pipeline_fn: Callable[..., jax.Array],
+    rho: jax.Array,
+    directions: list[jax.Array] | None,
+    n_directions: int,
+    step_sizes: np.ndarray | None,
+    output_dir: str | Path | None,
+) -> tuple[Path, list[tuple[int, np.ndarray, list[float]]], np.ndarray, int]:
+    """Shared setup for the plotting and pass/fail entry points.
+
+    Resolves the output dir, samples directions, defaults the steps, and computes
+    the per-direction relative-error curves, raising if no direction has a
+    feasible step. Returns ``(out, curves, step_sizes, n_directions)``.
+    """
+    out = _ensure_output_dir(output_dir)
+    rho = jnp.asarray(rho)
+    directions = _sample_directions(rho, directions, n_directions)
+    n_directions = len(directions)
+    if step_sizes is None:
+        step_sizes = np.logspace(-6, -1, 20)
+
+    curves = _gradient_validation_curves(pipeline_fn, rho, directions, step_sizes)
+    if not curves:
+        raise ValueError("Gradient validation has no feasible finite-difference steps")
+    return out, curves, step_sizes, n_directions
+
+
 def plot_gradient_validation(
     pipeline_fn: Callable[..., jax.Array],
     rho: jax.Array,
@@ -322,6 +478,7 @@ def plot_gradient_validation(
     n_directions: int = 3,
     step_sizes: np.ndarray | None = None,
     output_dir: str | Path | None = None,
+    tolerance: float | None = None,
 ) -> Path:
     """Gradient validation: relative error vs FD step size.
 
@@ -335,67 +492,70 @@ def plot_gradient_validation(
         step_sizes: Central-difference steps. Defaults to 20 logarithmic
             steps from ``1e-6`` to ``1e-1``.
         output_dir: Directory to write ``gradient_validation.pdf``.
+        tolerance: If given, draw the acceptance bar as a horizontal line on
+            the figure. Use :func:`validate_gradient` for the pass/fail result.
 
     Returns:
         Path to the saved figure.
     """
-    out = _ensure_output_dir(output_dir)
-    rho = jnp.asarray(rho)
-    grad_exact = jax.grad(pipeline_fn)(rho)
+    out, curves, step_sizes, n_directions = _gradient_validation_setup(
+        pipeline_fn, rho, directions, n_directions, step_sizes, output_dir
+    )
+    return _render_gradient_validation(
+        curves, step_sizes, n_directions, tolerance, out
+    )
 
-    if directions is None:
-        rng = np.random.default_rng(0)
-        directions = []
-        for _ in range(n_directions):
-            d = jnp.asarray(rng.standard_normal(rho.shape), dtype=rho.dtype)
-            d = d / jnp.linalg.norm(d)
-            directions.append(d)
-        n_directions = len(directions)
 
-    if step_sizes is None:
-        step_sizes = np.logspace(-6, -1, 20)
+def validate_gradient(
+    pipeline_fn: Callable[..., jax.Array],
+    rho: jax.Array,
+    directions: list[jax.Array] | None = None,
+    n_directions: int = 3,
+    step_sizes: np.ndarray | None = None,
+    tolerance: float = GRADIENT_VALIDATION_TOLERANCE,
+    output_dir: str | Path | None = None,
+) -> GradientValidationResult:
+    """Check the adjoint against central FD and gate on a stated tolerance.
 
-    fig, ax = plt.subplots(figsize=(6, 4))
+    The proof behind ticket 06's headline: the composed ``rho -> Delta n_eff``
+    gradient is exercised through whatever ``pipeline_fn`` closes over -- pass a
+    ``pipeline`` bound to the live ChargeTransport and gyptis components to prove
+    the cross-boundary adjoint (CT included, audit #7), not a stub. The figure is
+    always written; ``passed`` records whether the worst per-direction best error
+    stayed at or below ``tolerance`` (it does not raise, so a failing check still
+    produces the diagnostic figure).
 
-    for i, direction in enumerate(directions):
-        positive = np.asarray(direction) > 0.0
-        negative = np.asarray(direction) < 0.0
-        rho_np = np.asarray(rho)
-        # Keep the perturbed field inside the signed design bounds [-1, 1] so
-        # every FD sample stays feasible for the optimizer's box.
-        max_step = min(
-            np.min((1.0 - rho_np[positive]) / np.asarray(direction)[positive], initial=np.inf),
-            np.min((rho_np[negative] + 1.0) / -np.asarray(direction)[negative], initial=np.inf),
-        )
-        feasible_steps = step_sizes[step_sizes < max_step]
-        if len(feasible_steps) == 0:
-            continue
-        errors = []
-        for h in feasible_steps:
-            f_plus = pipeline_fn(rho + h * direction)
-            f_minus = pipeline_fn(rho - h * direction)
-            fd_val = (f_plus - f_minus) / (2.0 * h)
-            exact_val = jnp.dot(grad_exact, direction)
-            denom = max(float(abs(exact_val)), 1e-30)
-            errors.append(float(abs(fd_val - exact_val)) / denom)
-        label = f"direction {i+1}" if n_directions > 1 else "FD"
-        ax.loglog(feasible_steps, errors, "o-", markersize=3, label=label)
+    Args:
+        pipeline_fn: Callable ``(rho) -> scalar`` differentiable by JAX.
+        rho: Reference design vector to validate the gradient at.
+        directions: Perturbation directions. Random unit vectors if ``None``.
+        n_directions: Number of random directions (ignored if ``directions``).
+        step_sizes: Central-difference steps. Defaults to 20 logarithmic steps
+            from ``1e-6`` to ``1e-1``.
+        tolerance: Acceptance bar on the worst per-direction best relative error.
+        output_dir: Directory to write ``gradient_validation.pdf``.
 
-    if not ax.lines:
-        raise ValueError("Gradient validation has no feasible finite-difference steps")
+    Returns:
+        A :class:`GradientValidationResult` with the per-direction best errors,
+        the worst of them, the pass/fail verdict, and the figure path.
+    """
+    out, curves, step_sizes, n_directions = _gradient_validation_setup(
+        pipeline_fn, rho, directions, n_directions, step_sizes, output_dir
+    )
 
-    ax.plot(step_sizes, step_sizes, "k--", alpha=0.4, label=r"$O(h)$")
-    ax.set_xlabel("Step size h")
-    ax.set_ylabel("Relative error")
-    ax.set_title("Gradient Validation (central FD)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-
-    path = out / "gradient_validation.pdf"
-    fig.savefig(path)
-    plt.close(fig)
-    return path
+    best_rel_errors = [min(errors) for _, _, errors in curves]
+    worst_rel_error = max(best_rel_errors)
+    path = _render_gradient_validation(
+        curves, step_sizes, n_directions, tolerance, out
+    )
+    return GradientValidationResult(
+        n_directions=len(curves),
+        best_rel_errors=best_rel_errors,
+        worst_rel_error=worst_rel_error,
+        tolerance=tolerance,
+        passed=worst_rel_error <= tolerance,
+        figure_path=path,
+    )
 
 
 def generate_outputs(

@@ -88,6 +88,49 @@ def test_cli_run_help() -> None:
     assert "Run the PRISMO" in result.stdout
 
 
+def test_cli_validate_gradient_help() -> None:
+    """The ticket 06 deliverable is exposed as its own subcommand."""
+    main_module = import_module("prismo.main")
+    result = runner.invoke(main_module.app, ["validate-gradient", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "--use-containers" in result.stdout
+    assert "--tolerance" in result.stdout
+
+
+def test_run_gradient_validation_passes_for_real_gradient(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The composed adjoint agrees with central FD under the stated tolerance.
+
+    The shared identity-carrier / mean-neff doubles are smooth in θ, so the
+    gradient is real (not a stub short-circuit) and central FD tracks it.
+    """
+    import prismo.main as main_module
+    import prismo.waveguide_mesh as mesh_module
+    from _doubles import stub_components
+
+    coords = np.asarray(
+        [[0.0, 0.0], [1e-6, 0.0], [2e-6, 0.0], [3e-6, 0.0]], dtype=float
+    )
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+
+    result = main_module._run_gradient_validation(
+        r_min=0.05,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        tolerance=1e-2,
+        n_directions=2,
+        use_containers=False,
+        components=stub_components(),
+    )
+    assert result.passed is True
+    assert result.worst_rel_error <= 1e-2
+    assert (tmp_path / "gradient_validation.pdf").exists()
+
+
 @pytest.mark.slow
 def test_cli_run_without_backend_errors() -> None:
     """Ticket 04: a no-backend `prismo run` fails loudly, never fabricating a result.
@@ -99,7 +142,7 @@ def test_cli_run_without_backend_errors() -> None:
     main_module = import_module("prismo.main")
     result = runner.invoke(
         main_module.app,
-        ["--max-iter", "3", "--no-jit"],
+        ["run", "--max-iter", "3", "--no-jit"],
     )
     assert result.exit_code != 0
     assert result.exception is not None

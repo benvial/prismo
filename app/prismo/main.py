@@ -7,12 +7,16 @@ paper-ready plots.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import typer
+
+if TYPE_CHECKING:
+    from prismo.outputs import GradientValidationResult
 
 app = typer.Typer(name="prismo")
 
@@ -77,28 +81,122 @@ def run(
             teardown_containers(components)
 
 
-def _run_pipeline(
-    r_min: float,
-    max_iter: int,
-    ftol_rel: float,
-    mesh_path: str,
-    output_dir: str,
-    no_jit: bool,
-    use_containers: bool,
-    components: Any | None = None,
+# Acceptance bar mirrors ``outputs.GRADIENT_VALIDATION_TOLERANCE`` (kept as a
+# literal here so the CLI's ``--help`` never eagerly imports jax/matplotlib).
+_DEFAULT_GRADIENT_TOLERANCE = 1e-2
+
+
+@app.command(name="validate-gradient")
+def validate_gradient(
+    r_min: float = typer.Option(0.05, help="Density filter radius [µm]"),
+    tolerance: float = typer.Option(
+        _DEFAULT_GRADIENT_TOLERANCE,
+        help="Acceptance bar on the worst per-direction relative error",
+    ),
+    n_directions: int = typer.Option(3, help="Number of sampled θ directions"),
+    n_steps: int = typer.Option(
+        12,
+        help="Central-difference steps, log-spaced over 1e-4..1e-1 "
+        "(below 1e-4 the CT readout's own 1e-8 FD floor dominates)",
+    ),
+    mesh_path: str = typer.Option(
+        str(_DEFAULT_MESH), help="Path to waveguide .msh file"
+    ),
+    output_dir: str = typer.Option(
+        str(_DEFAULT_OUTPUT_DIR), help="Directory for the validation figure"
+    ),
+    use_containers: bool = typer.Option(
+        False,
+        "--use-containers",
+        help="Run tesseract components via Docker containers",
+    ),
 ) -> None:
+    """Validate the composed ∂(Δneff)/∂θ gradient against central FD (ticket 06).
+
+    The hackathon's "gradients do real work" proof: checks the adjoint against
+    central finite differences on sampled θ directions at the seeded junction and
+    writes ``gradient_validation.pdf``. Run with ``--use-containers`` to exercise
+    the real ChargeTransport + gyptis boundary (CT included, audit #7); exits
+    non-zero if the worst relative error exceeds the tolerance.
+    """
+    from prismo.pipeline import (
+        PipelineComponents,
+        init_tesseract_containers,
+        teardown_containers,
+    )
+
+    # Central FD across the real CT+gyptis boundary is expensive (two CT Newton
+    # solves per pipeline evaluation), so restrict the sweep to the band where
+    # central differences actually resolve the gradient before the CT state
+    # readout's internal 1e-8 finite difference sets the floor.
+    step_sizes = np.logspace(-4, -1, n_steps)
+
+    components: PipelineComponents | None = None
+    if use_containers:
+        typer.echo("Starting tesseract Docker containers...")
+        components = init_tesseract_containers(mesh_dir=Path(mesh_path).parent)
+
+    try:
+        result = _run_gradient_validation(
+            r_min=r_min,
+            mesh_path=mesh_path,
+            output_dir=output_dir,
+            tolerance=tolerance,
+            n_directions=n_directions,
+            step_sizes=step_sizes,
+            use_containers=use_containers,
+            components=components,
+        )
+    finally:
+        if use_containers and components is not None:
+            typer.echo("Stopping tesseract containers...")
+            teardown_containers(components)
+
+    if not result.passed:
+        raise typer.Exit(code=1)
+
+
+@dataclass
+class _PipelineInputs:
+    """Everything ``pipeline()`` needs at a fixed design, shared by run/validate.
+
+    Assembled once from the mesh: the node coordinates, the signed-junction seed
+    ``theta_init``, the density-filter matrix ``(H_dense, H_sum)``, the
+    ``mesh_ref`` that routes ChargeTransport onto the real 2D grid, and the
+    ``design_transfer`` that carries the nodal field onto the gyptis design cells.
+    """
+
+    geometry: Any
+    coords: np.ndarray
+    n_nodes: int
+    real_mesh: bool
+    actual_mesh: Path
+    mesh_ref: Any | None
+    H_dense: Any
+    H_sum: Any
+    theta_init: Any
+    design_transfer: Any | None
+
+
+def _build_pipeline_inputs(
+    r_min: float,
+    mesh_path: str,
+    use_containers: bool,
+    components: Any | None,
+) -> _PipelineInputs:
+    """Author the shared mesh and assemble the fixed pipeline inputs.
+
+    Both ``prismo run`` (optimization) and ``prismo validate-gradient`` (the
+    ticket 06 deliverable) start here so they solve on exactly the same mesh,
+    filter, transfer, and seed. Container runs author the mesh via gyptis
+    ``write_mesh`` and require live components; the in-process path builds the
+    rib mesh locally.
+    """
+    import jax.numpy as jnp
     from prismo_shared.schemas import MeshRef
 
     from prismo.density_filter import assemble_filter_matrix
-    from prismo.optimizer import OptimizationCancelled, optimize_doping
-    from prismo.outputs import generate_outputs, plot_live_doping_field
-    from prismo.pipeline import (
-        build_design_transfer,
-        doping_from_theta,
-        seed_signed_junction,
-        vpi_lpi_v_cm,
-    )
-    from prismo.pipeline import pipeline as pipeline_fn
+    from prismo.pipeline import build_design_transfer, seed_signed_junction
     from prismo.waveguide_mesh import (
         RibWaveguideGeometry,
         build_rib_waveguide_mesh,
@@ -107,10 +205,7 @@ def _run_pipeline(
 
     mesh_path_obj = Path(mesh_path)
 
-    typer.echo("=== PRISMO Pipeline ===")
-    typer.echo()
-
-    typer.echo("[1/4] Generating waveguide mesh...")
+    typer.echo("Generating waveguide mesh...")
     geometry = RibWaveguideGeometry()
     if use_containers:
         if components is None or components.write_mesh is None:
@@ -122,7 +217,6 @@ def _run_pipeline(
         design_vertices = None
     typer.echo(f"      Mesh written to {actual_mesh}")
 
-    typer.echo("[2/4] Building density filter matrix...")
     coords = read_mesh_node_coordinates(actual_mesh)
     if coords.shape[0] == 0:
         typer.echo(
@@ -150,8 +244,7 @@ def _run_pipeline(
         else None
     )
 
-    import jax.numpy as jnp
-
+    typer.echo("Building density filter matrix...")
     H_sparse = assemble_filter_matrix(coords, r_min=r_min)
     H_dense = jnp.asarray(H_sparse.toarray())
     H_sum = jnp.sum(H_dense, axis=1)
@@ -178,7 +271,50 @@ def _run_pipeline(
         )
     typer.echo(f"      Filter radius: {r_min:.3g} µm")
 
-    typer.echo("[3/4] Running NLopt MMA optimization...")
+    return _PipelineInputs(
+        geometry=geometry,
+        coords=coords,
+        n_nodes=n_nodes,
+        real_mesh=real_mesh,
+        actual_mesh=actual_mesh,
+        mesh_ref=mesh_ref,
+        H_dense=H_dense,
+        H_sum=H_sum,
+        theta_init=theta_init,
+        design_transfer=design_transfer,
+    )
+
+
+def _run_pipeline(
+    r_min: float,
+    max_iter: int,
+    ftol_rel: float,
+    mesh_path: str,
+    output_dir: str,
+    no_jit: bool,
+    use_containers: bool,
+    components: Any | None = None,
+) -> None:
+    from prismo.optimizer import OptimizationCancelled, optimize_doping
+    from prismo.outputs import generate_outputs, plot_live_doping_field
+    from prismo.pipeline import doping_from_theta, vpi_lpi_v_cm
+    from prismo.pipeline import pipeline as pipeline_fn
+
+    typer.echo("=== PRISMO Pipeline ===")
+    typer.echo()
+
+    typer.echo("[1/3] Preparing pipeline inputs...")
+    inputs = _build_pipeline_inputs(r_min, mesh_path, use_containers, components)
+    geometry = inputs.geometry
+    coords = inputs.coords
+    n_nodes = inputs.n_nodes
+    mesh_ref = inputs.mesh_ref
+    H_dense = inputs.H_dense
+    H_sum = inputs.H_sum
+    theta_init = inputs.theta_init
+    design_transfer = inputs.design_transfer
+
+    typer.echo("[2/3] Running NLopt MMA optimization...")
     try:
         optimization_max_iter = max(max_iter, 5) if use_containers else max_iter
         optimization_ftol_rel = ftol_rel
@@ -239,7 +375,7 @@ def _run_pipeline(
                 f"{len(invalid)} iteration(s)"
             )
 
-    typer.echo("[4/4] Generating outputs...")
+    typer.echo("[3/3] Generating outputs...")
     rho_initial = np.asarray(theta_init, dtype=float)
     plot_paths = generate_outputs(
         rho_initial=rho_initial,
@@ -263,6 +399,64 @@ def _run_pipeline(
 
     typer.echo()
     typer.echo("=== Done ===")
+
+
+def _run_gradient_validation(
+    r_min: float,
+    mesh_path: str,
+    output_dir: str,
+    tolerance: float,
+    n_directions: int,
+    use_containers: bool,
+    components: Any | None = None,
+    step_sizes: np.ndarray | None = None,
+) -> GradientValidationResult:
+    """Check the composed gradient at the seeded design and write the figure.
+
+    Unlike the optimization run, this binds the *full* pipeline -- filter,
+    ``mesh_ref`` (so ChargeTransport solves on the shared 2D grid, not its 1D
+    fallback), and design transfer -- into the function the finite-difference
+    sweep probes, so the CT adjoint is the thing being proven (audit #7).
+    """
+    from prismo.outputs import validate_gradient as validate_gradient_fn
+    from prismo.pipeline import pipeline as pipeline_fn
+
+    typer.echo("=== PRISMO Gradient Validation ===")
+    typer.echo()
+
+    typer.echo("[1/2] Preparing pipeline inputs...")
+    inputs = _build_pipeline_inputs(r_min, mesh_path, use_containers, components)
+
+    typer.echo("[2/2] Checking adjoint against central finite differences...")
+    bound_pipeline = partial(
+        pipeline_fn,
+        H=inputs.H_dense,
+        H_sum=inputs.H_sum,
+        mesh_ref=inputs.mesh_ref,
+        design_transfer=inputs.design_transfer,
+        components=components,
+    )
+    result = validate_gradient_fn(
+        bound_pipeline,
+        inputs.theta_init,
+        n_directions=n_directions,
+        step_sizes=step_sizes,
+        tolerance=tolerance,
+        output_dir=output_dir,
+    )
+
+    verdict = "PASS" if result.passed else "FAIL"
+    typer.echo(
+        f"      {verdict}: worst relative error {result.worst_rel_error:.3e} "
+        f"(tolerance {result.tolerance:.3e})"
+    )
+    for i, err in enumerate(result.best_rel_errors):
+        typer.echo(f"        direction {i+1}: best relative error {err:.3e}")
+    typer.echo(f"      Figure: {result.figure_path}")
+
+    typer.echo()
+    typer.echo("=== Done ===")
+    return result
 
 
 def entrypoint() -> None:
