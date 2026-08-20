@@ -168,8 +168,9 @@ def test_container_run_seeds_signed_junction_for_optimization(
         components=_container_components([[0.5, 0.0], [1.5, 0.0]]),
     )
 
-    # median x is 1.0; nodes at x<=1 seed p-type (-0.3), x>1 seed n-type (+0.3).
-    np.testing.assert_allclose(captured["initial_rho"], [-0.3, -0.3, 0.3])
+    # Reverse bias is applied to the right cathode: left nodes seed n-type and
+    # right nodes p-type so -5 V widens, rather than forward-biases, junction.
+    np.testing.assert_allclose(captured["initial_rho"], [0.3, 0.3, -0.3])
     assert captured["min_mma_evaluations"] == 5
     assert callable(captured["on_iteration"])
     # The container setup feeds the assembled mesh-transfer matrix to the solve.
@@ -182,7 +183,7 @@ def test_container_run_seeds_signed_junction_for_optimization(
     )
     np.testing.assert_allclose(
         output_captured["gradient_validation_rho"],
-        [-0.3, -0.3, 0.3],
+        [0.3, 0.3, -0.3],
     )
 
 

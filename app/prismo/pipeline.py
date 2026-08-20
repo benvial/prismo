@@ -94,13 +94,14 @@ _JUNCTION_SEED_THETA = 0.3
 def seed_signed_junction(coords: np.ndarray) -> jax.Array:
     """Seed a signed lateral P/N junction across the mesh in every run path.
 
-    Nodes left of the median x seed p-type (``-0.3``), nodes to the right seed
-    n-type (``+0.3``). sign(theta) is a free design variable, so the optimizer
-    can move or dissolve this junction rather than being handed a fixed polarity.
+    Nodes left of the median x seed n-type (``+0.3``), nodes to the right seed
+    p-type (``-0.3``). With the cathode on the right at -5 V, this is the
+    reverse-bias orientation. sign(theta) remains free, so the optimizer can
+    move, dissolve, or reverse this junction.
     """
     midpoint = np.median(coords[:, 0])
     return jnp.where(
-        coords[:, 0] <= midpoint, -_JUNCTION_SEED_THETA, _JUNCTION_SEED_THETA
+        coords[:, 0] <= midpoint, _JUNCTION_SEED_THETA, -_JUNCTION_SEED_THETA
     )
 
 
