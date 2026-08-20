@@ -13,9 +13,33 @@ using Gmsh
 # (SolverControl, System, ...). All VoronoiFVM access stays qualified.
 import VoronoiFVM
 
-# gyptis authors the shared Gmsh mesh in micrometres. ChargeTransport uses
-# centimetres, as does the 1D fallback (1e-4 cm = 1 µm).
-const MICROMETRES_TO_CENTIMETRES = 1e-4
+# ChargeTransport.jl is SI throughout: its ``constants.ε_0`` is in C/(V*m) and
+# its own examples spell material data as ``1e17 / cm^3`` (= 1e23 m^-3) and
+# ``1350 * cm^2 / (V*s)`` (= 0.135 m^2/(V*s)) -- the unit factors convert *into*
+# metres. Every length, density and mobility below is therefore SI, and the
+# gyptis-authored shared mesh (micrometres) is scaled into metres on load.
+const MICROMETRES_TO_METRES = 1e-6
+
+# PRISMO's design field is net doping in cm^-3, donor-positive: theta > 0 means
+# n-type (the chargetransport tesseract InputSchema, and ``doping_from_theta``
+# in pipeline.py). Two conventions separate it from what ``ParamsNodal.doping``
+# wants:
+#
+#   * units -- SI, so cm^-3 -> m^-3 is a factor 1e6;
+#   * sign  -- ChargeTransport's Poisson source is
+#     ``-q*λ1*(Σ_α z_α n_α - doping)`` with ``z_n = -1, z_p = +1``, so charge
+#     neutrality reads ``p - n = doping``: a positive entry is *p-type*. Its
+#     ``Ex102_PIN_nodal_doping`` example confirms this, assigning ``+NDoping``
+#     across the region it names ``regionAcceptor``.
+#
+# Both are folded into one constant, applied at the single point where doping
+# is written into the system, and undone on the VJP (``ct_adjoint.jl``).
+const PRISMO_DOPING_TO_CT = -1.0e6
+
+# Carrier densities come back out of ChargeTransport in m^-3; the tesseract
+# reports them in cm^-3 (OutputSchema), which is also what the Soref-Bennett
+# coefficients expect.
+const CT_DENSITY_TO_CM3 = 1.0e-6
 
 # ExtendableSparse is a transitive dep (via VoronoiFVM), not in Project.toml,
 # so it can only be reached through qualified access.
@@ -25,7 +49,7 @@ include(joinpath(@__DIR__, "contacts.jl"))
 
 # Fallback 1D device (length 1 µm) used when no Gmsh mesh is supplied.
 function generate_1d_mesh(n_nodes)
-    L = 1e-4
+    L = 1e-6
     coord = collect(range(0.0, L, n_nodes))
     grid = simplexgrid(coord)
     cellmask!(grid, 0.0, L, 1)
@@ -51,6 +75,23 @@ function region_ids(mesh_path, dim)
 end
 
 edgekey(a, b) = a < b ? (a, b) : (b, a)
+
+"""Smallest boundary-region index that is not one of the contacts.
+
+The reconstructed silicon perimeter is a no-flux interface, so it needs a region
+of its own. Filling it with a literal 1 is only safe while `contact_anode` is not
+the first dim-1 physical group in the mesh -- on a mesh where it is, every
+exterior face would be tagged as the anode and the whole rib would be solved as
+one shorted ohmic contact. Picking the first free index instead keeps the three
+regions distinct whatever order the mesh lists its physical groups in.
+"""
+function interface_bregion(anode_breg, cathode_breg)
+    region = 1
+    while region == anode_breg || region == cathode_breg
+        region += 1
+    end
+    return region
+end
 
 """Restrict a full optical mesh to silicon and reconstruct its exterior faces."""
 function silicon_grid(full, silicon_ids, anode_breg, cathode_breg)
@@ -86,7 +127,7 @@ function silicon_grid(full, silicon_ids, anode_breg, cathode_breg)
     end
     exterior = sort!([key for (key, count) in face_counts if count == 1])
     bfaces = reduce(hcat, (Int64[key[1], key[2]] for key in exterior))
-    bfaceregions = ones(Int64, length(exterior))
+    bfaceregions = fill(interface_bregion(anode_breg, cathode_breg), length(exterior))
     for (i, local_edge) in enumerate(exterior)
         parent_nodes = node_parents[[local_edge[1], local_edge[2]]]
         xy = full[Coordinates][:, parent_nodes]
@@ -135,7 +176,7 @@ function build_ct_system(doping, mesh_path)
         anode_breg = bface_ids["contact_anode"]
         cathode_breg = bface_ids["contact_cathode"]
         grid = silicon_grid(full, silicon_ids, anode_breg, cathode_breg)
-        grid[Coordinates] .*= MICROMETRES_TO_CENTIMETRES
+        grid[Coordinates] .*= MICROMETRES_TO_METRES
         node_parents = Int.(grid[NodeParents])
     else
         grid = generate_1d_mesh(n_nodes)
@@ -167,13 +208,16 @@ function build_ct_system(doping, mesh_path)
     n_regions = grid[NumCellRegions]
     params = Params(n_regions, n_bregions, 2)
 
+    # Silicon at 300 K, in SI base units (see MICROMETRES_TO_METRES above):
+    # Nc = 2.8e19 cm^-3, Nv = 1.04e19 cm^-3, mu_n = 1350 cm^2/(V*s),
+    # mu_p = 450 cm^2/(V*s).
     T = 300.0
     eps_si = 11.7 * constants.ε_0
-    Nc = 2.8e19
-    Nv = 1.04e19
+    Nc = 2.8e25
+    Nv = 1.04e25
     Eg = 1.12 * constants.q
-    mu_n = 1350.0
-    mu_p = 450.0
+    mu_n = 0.135
+    mu_p = 0.045
 
     params.temperature = T
     params.chargeNumbers[1] = -1
@@ -191,19 +235,21 @@ function build_ct_system(doping, mesh_path)
     data.params = params
 
     paramsnodal = ParamsNodal(grid, 2)
-    for i in 1:grid_nnodes
-        paramsnodal.doping[i] = silicon_doping[i]
-    end
     data.paramsnodal = paramsnodal
+    set_doping!(data, silicon_doping)
 
     ctsys = System(grid, data, unknown_storage = :dense)
     return ctsys, data, cathode_breg, n_bregions, node_parents
 end
 
 # Update a reusable system without rebuilding its mesh/material data.
+#
+# ``doping`` is in PRISMO's convention (cm^-3, donor-positive). This is the only
+# place doping is written into a ChargeTransport system, so it is the only place
+# that needs to know about ``PRISMO_DOPING_TO_CT``.
 function set_doping!(data, doping)
     for i in eachindex(doping)
-        data.paramsnodal.doping[i] = doping[i]
+        data.paramsnodal.doping[i] = PRISMO_DOPING_TO_CT * doping[i]
     end
     return nothing
 end
@@ -291,9 +337,7 @@ function solve_equilibrium(ctsys, data, doping, control)
 
     sol = VoronoiFVM.unknowns(fvmsys, inival = 0.0)
     for s in scales
-        for i in 1:length(doping)
-            data.paramsnodal.doping[i] = doping[i] * s
-        end
+        set_doping!(data, doping .* s)
         sol = VoronoiFVM.solve(fvmsys, inival = sol, control = control)
     end
 

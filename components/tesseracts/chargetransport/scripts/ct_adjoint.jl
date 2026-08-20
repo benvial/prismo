@@ -235,5 +235,9 @@ function compute_doping_vjp(
     equilibrium_contact_path!(
         gradient, ctsys, data, jacobian, state_gradient, free, adjoint,
     )
-    return gradient
+    # ``gradient`` is dJ/d(ParamsNodal.doping), in ChargeTransport's SI,
+    # acceptor-positive convention. The caller differentiates w.r.t. PRISMO's
+    # cm^-3 donor-positive field, so undo the affine change of variable
+    # ``set_doping!`` applies (ct_common.jl).
+    return gradient .* PRISMO_DOPING_TO_CT
 end

@@ -128,12 +128,16 @@ function forward_solution!(state, doping, mesh_path, mesh_key, profile_key, bias
     return sol, profile_changed, used_warm_start
 end
 
+# Scatter the silicon-subgrid carrier densities back over the full mesh, in the
+# cm^-3 the tesseract OutputSchema reports (ChargeTransport solves in m^-3).
 function carrier_fields(sol, data, node_parents, n_nodes)
     electrons = zeros(Float64, n_nodes)
     holes = zeros(Float64, n_nodes)
     for (silicon_node, full_node) in enumerate(node_parents)
-        electrons[full_node] = get_density(sol, data, 1, 1; inode = silicon_node)
-        holes[full_node] = get_density(sol, data, 2, 1; inode = silicon_node)
+        electrons[full_node] =
+            CT_DENSITY_TO_CM3 * get_density(sol, data, 1, 1; inode = silicon_node)
+        holes[full_node] =
+            CT_DENSITY_TO_CM3 * get_density(sol, data, 2, 1; inode = silicon_node)
     end
     return electrons, holes
 end
@@ -182,6 +186,8 @@ function process_vjp!(state, request)
     cot_p = read_vector(String(request["cotangent_holes_path"]))
     length(cot_n) == length(doping) || error("electron cotangent length mismatch")
     length(cot_p) == length(doping) || error("hole cotangent length mismatch")
+    # The cotangents are w.r.t. the cm^-3 densities ``carrier_fields`` reported;
+    # the adjoint linearises the m^-3 state, so carry the same factor across.
     silicon_vjp = compute_doping_vjp(
         state.ctsys,
         state.data,
@@ -189,8 +195,8 @@ function process_vjp!(state, request)
         bias_voltage,
         state.cathode_breg,
         state.n_bregions,
-        cot_n[state.node_parents],
-        cot_p[state.node_parents],
+        CT_DENSITY_TO_CM3 .* cot_n[state.node_parents],
+        CT_DENSITY_TO_CM3 .* cot_p[state.node_parents],
     )
     vjp = zeros(Float64, length(doping))
     vjp[state.node_parents] = silicon_vjp
