@@ -139,6 +139,15 @@ class OutputSchema(BaseModel):
 # only the most-recent forward.
 _session_registry = SolveSessionRegistry()
 
+# Eigenvalue of the last accepted forward solve, keyed by the geometry it was
+# solved on. Successive solves within one optimization or finite-difference
+# sweep differ only by a small design perturbation, so tracking the branch by
+# nearest eigenvalue keeps every call on the same physical mode. "Largest neff
+# in the guided window" cannot: near-degenerate modes swap rank under
+# perturbations far smaller than their spacing, so neff_sq jumps between
+# neighbouring inputs and no finite-difference reference survives (ticket 13).
+_tracked_lam: dict[tuple[float, float, float], complex] = {}
+
 
 #
 # Internal helpers
@@ -467,8 +476,23 @@ def _assemble_AB(simu: Any, eps_core_field: Any) -> tuple[Any, Any]:
     return A, B
 
 
-def _two_sided_solver(A: Any, B: Any, target: float, n: int = 12) -> tuple[Any, int]:
-    """Two-sided shift-invert SLEPc solve; returns (solver, n_converged)."""
+# Relative nudges applied to the shift-invert shift, tried in order. The first
+# is the unperturbed shift, so a healthy solve pays nothing.
+#
+# Shift-invert factorises ``A - sigma*B``. When sigma lands on (or numerically
+# near) an eigenvalue that factorisation is singular and SLEPc aborts out of
+# ``solver.solve()`` -- as ``petsc4py.PETSc.Error`` code 76 (PETSC_ERR_LIB), or,
+# when the error escapes through the cython wrapper without being converted, as
+# a bare ``SystemError``. Moving the shift off the offending eigenvalue recovers
+# it: the spectrum does not depend on sigma, only the spectral transform used to
+# reach it, so a retry returns the same eigenpairs rather than a different
+# answer. Retrying is what makes a degenerate design input a slower solve
+# instead of a 500 (ticket 13).
+_SHIFT_RETRY_OFFSETS = (0.0, 1e-6, -1e-6, 1e-4, -1e-4, 1e-2)
+
+
+def _attempt_two_sided_solve(A: Any, B: Any, shift: float, n: int) -> tuple[Any, int]:
+    """One two-sided shift-invert SLEPc solve at a given shift."""
     from slepc4py import SLEPc
 
     solver = SLEPc.EPS().create(A.getComm())
@@ -476,18 +500,43 @@ def _two_sided_solver(A: Any, B: Any, target: float, n: int = 12) -> tuple[Any, 
     solver.setProblemType(SLEPc.EPS.ProblemType.GNHEP)
     solver.setType(SLEPc.EPS.Type.KRYLOVSCHUR)
     solver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_MAGNITUDE)
-    solver.setTarget(target)
+    solver.setTarget(shift)
     st = solver.getST()
     st.setType(SLEPc.ST.Type.SINVERT)
-    st.setShift(target)
+    st.setShift(shift)
     solver.setDimensions(n)
     solver.setTolerances(1e-7)
     solver.setTwoSided(True)
     solver.solve()
-    nconv = solver.getConverged()
-    if nconv == 0:
-        raise RuntimeError("two-sided SLEPc eigensolve did not converge")
-    return solver, nconv
+    return solver, solver.getConverged()
+
+
+def _two_sided_solver(A: Any, B: Any, target: float, n: int = 12) -> tuple[Any, int]:
+    """Two-sided shift-invert SLEPc solve; returns (solver, n_converged).
+
+    The shift is retried along ``_SHIFT_RETRY_OFFSETS`` when the factorisation
+    fails or nothing converges. ``target`` is kept as the eigenvalue the caller
+    selects around, so a retry changes only how the spectrum is reached.
+    """
+    failures = []
+    for offset in _SHIFT_RETRY_OFFSETS:
+        shift = target * (1.0 + offset)
+        try:
+            solver, nconv = _attempt_two_sided_solve(A, B, shift, n)
+        except Exception as exc:
+            # Deliberately broad: the failure arrives as petsc4py.PETSc.Error,
+            # or as a SystemError raised when that error escapes the cython
+            # wrapper unconverted. Both mean the same thing here -- this shift
+            # did not work -- and both are re-raised below if no shift does.
+            failures.append(f"shift {shift:.6g}: {type(exc).__name__}: {exc}")
+            continue
+        if nconv > 0:
+            return solver, nconv
+        failures.append(f"shift {shift:.6g}: converged 0 eigenpairs")
+    raise RuntimeError(
+        "two-sided SLEPc eigensolve failed at every retried shift around "
+        f"{target:.6g}: " + "; ".join(failures)
+    )
 
 
 def _select_index(
@@ -500,12 +549,13 @@ def _select_index(
 ) -> int:
     """Index of the tracked eigenpair.
 
-    When ``ref_lam`` is given (adjoint / finite-difference re-solves) the mode is
-    tracked by nearest eigenvalue, so forward and adjoint validate one mode. On
-    the base forward solve the fundamental *guided* mode is selected: the
-    largest-neff eigenpair whose neff lies in the physical window
-    ``(sqrt(clad), sqrt(core))``. Falls back to nearest-target when the mesh
-    resolves no guided mode (a leaky mode; gradient correctness is unaffected).
+    When ``ref_lam`` is given -- the eigenvalue this geometry was last solved on
+    -- the mode is tracked by nearest eigenvalue, so every solve after the first
+    stays on one branch. On the first solve of a geometry there is nothing to
+    track, so the fundamental *guided* mode is selected: the largest-neff
+    eigenpair whose neff lies in the physical window ``(sqrt(clad), sqrt(core))``.
+    Falls back to nearest-target when the mesh resolves no guided mode (a leaky
+    mode; gradient correctness is unaffected).
     """
     if ref_lam is not None:
         dists = [abs(solver.getEigenvalue(i) - ref_lam) for i in range(nconv)]
@@ -688,9 +738,24 @@ def apply(inputs: InputSchema) -> OutputSchema:
         )
 
     field = _make_rib_field(dg0, mask, inputs.core_epsilon, design)
-    state = _solve_state(
-        simu, field, k0, inputs.core_epsilon, inputs.clad_epsilon
+    # Track the branch this geometry was last solved on, so neighbouring design
+    # inputs -- an optimizer step, or the two sides of a finite difference --
+    # return the same mode rather than whichever near-degenerate mode currently
+    # ranks highest in the guided window (ticket 13).
+    geometry = (
+        float(inputs.core_epsilon),
+        float(inputs.clad_epsilon),
+        float(inputs.substrate_epsilon),
     )
+    state = _solve_state(
+        simu,
+        field,
+        k0,
+        inputs.core_epsilon,
+        inputs.clad_epsilon,
+        ref_lam=_tracked_lam.get(geometry),
+    )
+    _tracked_lam[geometry] = state["lam"]
 
     _session_registry.open(
         _solve_identity(
