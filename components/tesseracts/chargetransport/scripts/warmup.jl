@@ -4,7 +4,7 @@
 #
 # Executed once during the base-image build via
 #   create_sysimage(...; precompile_execution_file = "warmup.jl")
-# so the runtime scripts (forward.jl / adjoint.jl) start with all solver
+# so worker.jl starts with all solver
 # machinery already compiled to native code. Without this, the first
 # equilibrium_solve! pays ~22 s of JIT compilation, blowing the 30 s
 # apply() budget.

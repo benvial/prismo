@@ -24,7 +24,6 @@ New to Tesseract? Start with the [Tesseract Core docs](https://docs.pasteurlabs.
 ├── ruff.toml
 # 🔧 Pipeline code
 ├── app
-│   ├── chain.ipynb                  # Pipeline notebook (Tesseract composition, stubs)
 │   ├── pyproject.toml
 │   ├── requirements.txt             # tesseract-core
 │   ├── prismo
@@ -57,7 +56,7 @@ New to Tesseract? Start with the [Tesseract Core docs](https://docs.pasteurlabs.
 │           ├── tesseract_api.py
 │           ├── tesseract_config.yaml
 │           ├── tesseract_requirements.txt
-│           ├── scripts/             # forward.jl, contacts.jl
+│           ├── scripts/             # worker.jl, ct_adjoint.jl, ct_common.jl, contacts.jl
 │           ├── tests/
 │           └── test_cases/
 # 🛠️ Scripts

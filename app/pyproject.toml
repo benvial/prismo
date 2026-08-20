@@ -21,7 +21,7 @@ dev = [
     "pytest>=7.0",
     "jax>=0.4.0",
     "scipy>=1.8.0",
-    # For running app/chain.ipynb
+    # Interactive development tools
     "jupyter",
     "matplotlib",
     "numpy",

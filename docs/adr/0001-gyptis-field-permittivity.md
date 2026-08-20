@@ -54,5 +54,5 @@ approximation is retired.
   background solve receives a uniform field and contributes an exact zero design
   gradient (its ρ-independence is preserved).
 
-Ref: `.scratch/gyptis-field-permittivity/` (spec + tickets 01–06),
+Ref: `.scratch/archive/gyptis-field-permittivity/` (spec + tickets 01–06),
 `scripts/prototype_gyptis_eigen_adjoint.py`.

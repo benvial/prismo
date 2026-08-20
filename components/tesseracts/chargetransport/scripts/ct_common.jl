@@ -1,6 +1,6 @@
 # Shared setup for the ChargeTransport drift-diffusion scripts.
 #
-# Included by forward.jl, adjoint.jl and warmup.jl. Keeping the system
+# Included by worker.jl and warmup.jl. Keeping the system
 # construction and the biased solve in one place means the PackageCompiler
 # warmup exercises exactly the same method specializations the runtime
 # scripts use (ticket 17).
