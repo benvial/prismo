@@ -241,10 +241,14 @@ function store_equilibrium_contact_data!(ctsys, data, sol)
         params.bψEQ[ibreg] = sol[ipsi, inode]
     end
 
-    bnode = grid[BFaceNodes]
     for icc in data.electricCarrierList
         for ibreg in grid[BFaceRegions]
-            inode = bnode[ibreg]
+            # Same representative boundary node as the bψEQ loop above.
+            # ``grid[BFaceNodes][ibreg]`` linear-indexes the (nodes-per-face x
+            # n_bfaces) matrix by region number, which picks an arbitrary node on
+            # a 2D mesh (it only coincides with the region's node in the 1D
+            # fallback), corrupting the contact reference density.
+            inode = equilibrium_bpsi_parent_node(grid, ibreg)
             Ncc = params.bDensityOfStates[icc, ibreg] +
                   paramsnodal.densityOfStates[icc, inode]
             Ecc = params.bBandEdgeEnergy[icc, ibreg] +

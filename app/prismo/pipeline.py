@@ -10,6 +10,7 @@ Ref: tickets 14 (pipeline composition), 15 (optimization loop).
 from __future__ import annotations
 
 import importlib.util
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -235,16 +236,25 @@ def init_tesseract_containers(
             "tesseract_core is required for container pipeline runs"
         ) from exc
 
-    ct_volumes: list[str] | None = None
+    ct_volumes: list[str] = []
     if mesh_dir is not None:
         host_mesh_dir = Path(mesh_dir).resolve()
         host_mesh_dir.mkdir(parents=True, exist_ok=True)
-        ct_volumes = [f"{host_mesh_dir}:{_CT_MESH_MOUNT}:ro"]
+        ct_volumes.append(f"{host_mesh_dir}:{_CT_MESH_MOUNT}:ro")
+
+    # Dev loop: bind-mount host Julia scripts over the image's baked
+    # ``/tesseract/scripts`` so a solver/adjoint edit can be validated without a
+    # ~15 min image rebuild. The sysimage still supplies the precompiled heavy
+    # packages; ``worker.jl`` is ``include``d at process start, so the mounted
+    # source takes effect (recompiling only the edited methods).
+    ct_scripts_dir = os.environ.get("PRISMO_CT_SCRIPTS_DIR")
+    if ct_scripts_dir:
+        ct_volumes.append(f"{Path(ct_scripts_dir).resolve()}:/tesseract/scripts:ro")
 
     closers: list[Callable[[], None]] = []
     try:
         ct_tesseract = Tesseract.from_image(
-            "prismo_chargetransport:latest", volumes=ct_volumes
+            "prismo_chargetransport:latest", volumes=ct_volumes or None
         )
         ct_tesseract.serve()
         closers.append(ct_tesseract.teardown)
