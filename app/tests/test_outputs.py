@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from _doubles import stub_components
 from prismo.outputs import (
     generate_outputs,
     plot_convergence,
@@ -21,6 +22,15 @@ from prismo.pipeline import pipeline
 RNG = np.random.default_rng(42)
 
 N_NODES = 16
+
+
+def _stub_pipeline(theta):
+    """The pipeline driven by physics-free component doubles (ticket 04).
+
+    The implicit no-backend stubs were deleted, so plotting tests that drive the
+    real ``pipeline`` supply explicit doubles through the ``components=`` seam.
+    """
+    return pipeline(theta, components=stub_components())
 
 
 def _make_history() -> list[dict]:
@@ -112,7 +122,9 @@ class TestGradientValidationPlot:
 
         rho = jnp.asarray(RNG.random(N_NODES), dtype=jnp.float64)
         with tempfile.TemporaryDirectory() as tmp:
-            path = plot_gradient_validation(pipeline, rho, n_directions=2, output_dir=tmp)
+            path = plot_gradient_validation(
+                _stub_pipeline, rho, n_directions=2, output_dir=tmp
+            )
             assert Path(path).exists()
             assert Path(path).suffix == ".pdf"
 
@@ -178,6 +190,6 @@ class TestGenerateOutputs:
         d1 = d1 / jnp.linalg.norm(d1)
         with tempfile.TemporaryDirectory() as tmp:
             path = plot_gradient_validation(
-                pipeline, rho, directions=[d1], output_dir=tmp,
+                _stub_pipeline, rho, directions=[d1], output_dir=tmp,
             )
             assert Path(path).exists()

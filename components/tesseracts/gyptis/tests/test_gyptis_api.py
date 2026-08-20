@@ -5,9 +5,10 @@ tesseract_api.py. The forward accepts a design-region permittivity *field*
 (one value per DG0 design cell) with constant surroundings, and the adjoint
 returns a per-design-cell cotangent (tickets 02/03).
 
-Covers schema validation, contract shapes, the effective-medium stub used when
-gyptis/FEniCS is absent, and gyptis-backed integration tests (guided mode,
-spatial response, single-pass field VJP vs finite differences).
+Covers schema validation, contract shapes, the hard error raised when
+gyptis/FEniCS is absent (ticket 04 -- no physics-free effective-medium
+fallback), and gyptis-backed integration tests (guided mode, spatial response,
+single-pass field VJP vs finite differences).
 """
 
 import importlib.util
@@ -92,14 +93,17 @@ def test_output_schema_neff_sq_is_scalar() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
 def test_apply_returns_output_schema() -> None:
     assert isinstance(apply(make_inputs()), OutputSchema)
 
 
+@pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
 def test_apply_returns_scalar_neff_sq() -> None:
     assert np.asarray(apply(make_inputs()).neff_sq).shape == ()
 
 
+@pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
 def test_apply_returns_finite_neff_sq() -> None:
     outputs = apply(make_inputs(np.array([12.0, 11.0, 12.5, 11.5])))
     assert np.isfinite(float(outputs.neff_sq))
@@ -123,6 +127,7 @@ def test_apply_inspection_returns_design_centroids_in_forward_order() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
 def test_vjp_returns_cotangent_shaped_like_design_field() -> None:
     inputs = make_inputs()
     apply(inputs)
@@ -133,6 +138,7 @@ def test_vjp_returns_cotangent_shaped_like_design_field() -> None:
     assert np.asarray(result["design_epsilon"]).shape == (N_DESIGN,)
 
 
+@pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
 def test_vjp_returns_finite_values() -> None:
     inputs = make_inputs()
     apply(inputs)
@@ -148,6 +154,7 @@ def test_vjp_empty_when_input_not_requested() -> None:
     assert result == {}
 
 
+@pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
 def test_vjp_linear_in_cotangent() -> None:
     inputs = make_inputs()
     apply(inputs)
@@ -163,25 +170,23 @@ def test_vjp_linear_in_cotangent() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Effective-medium stub (gyptis / FEniCS absent)
+# No physics-free fallback (gyptis / FEniCS absent) -- ticket 04
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(_gyptis_available(), reason="exercises the no-gyptis stub")
-def test_apply_stub_averages_field() -> None:
-    outputs = apply(make_inputs(np.array([1.0, 2.0, 3.0, 4.0])))
-    np.testing.assert_allclose(outputs.neff_sq, 2.5)
+@pytest.mark.skipif(_gyptis_available(), reason="exercises the no-gyptis error path")
+def test_apply_without_backend_raises() -> None:
+    with pytest.raises(RuntimeError, match="gyptis/FEniCS backend"):
+        apply(make_inputs(np.array([1.0, 2.0, 3.0, 4.0])))
 
 
-@pytest.mark.skipif(_gyptis_available(), reason="exercises the no-gyptis stub")
-def test_vjp_stub_spreads_field_cotangent_evenly() -> None:
+@pytest.mark.skipif(_gyptis_available(), reason="exercises the no-gyptis error path")
+def test_vjp_without_backend_raises() -> None:
     inputs = make_inputs()
-    result = vector_jacobian_product(
-        inputs, {"design_epsilon"}, {"neff_sq"}, {"neff_sq": 1.0}
-    )
-    np.testing.assert_allclose(
-        result["design_epsilon"], np.full(N_DESIGN, 1 / N_DESIGN)
-    )
+    with pytest.raises(RuntimeError, match="gyptis/FEniCS backend"):
+        vector_jacobian_product(
+            inputs, {"design_epsilon"}, {"neff_sq"}, {"neff_sq": 1.0}
+        )
 
 
 # ---------------------------------------------------------------------------

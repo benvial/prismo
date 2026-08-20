@@ -9,8 +9,9 @@
 # a scalar dolfin.Function over an embedded, PML-inset patch of the silicon core.
 # The forward eigensolve and the field-valued Hellmann-Feynman adjoint share a
 # single two-sided SLEPc solve (spike 01 decision 3); the adjoint assembles a
-# per-design-cell cotangent in one pass (decision 4). Falls back to an
-# effective-medium stub when gyptis/FEniCS is not installed.
+# per-design-cell cotangent in one pass (decision 4). A missing gyptis/FEniCS
+# backend is a hard error -- there is no physics-free effective-medium fallback
+# that would fabricate an effective index (rethink ticket 04).
 
 from typing import Any, Literal
 
@@ -27,7 +28,7 @@ from tesseract_core.runtime import Array, Differentiable, Float64
 WAVELENGTH: float = 1.55  # free-space wavelength, micrometres
 
 # Silicon core in oxide; surroundings stay constant (spec: only the core is
-# modulated). Defaults double as the effective-medium stub's material stack.
+# modulated).
 DEFAULT_CORE_EPSILON: float = 3.4757**2
 DEFAULT_CLAD_EPSILON: float = 2.10
 DEFAULT_SUBSTRATE_EPSILON: float = 2.10
@@ -439,9 +440,12 @@ def apply(inputs: InputSchema) -> OutputSchema:
     try:
         _ensure_dolfin()
         _ensure_gyptis()
-    except ImportError:
-        # Effective-medium fallback: scalar output shaped from the field input.
-        return OutputSchema(neff_sq=float(np.mean(design)))
+    except ImportError as exc:
+        raise RuntimeError(
+            "gyptis eigenmode solve requires a gyptis/FEniCS backend; none is "
+            "available. There is no physics-free effective-medium fallback -- "
+            "run the component in its container."
+        ) from exc
 
     simu, k0 = _build_waveguide(
         inputs.core_epsilon, inputs.clad_epsilon, inputs.substrate_epsilon
@@ -512,10 +516,12 @@ def vector_jacobian_product(
     try:
         _ensure_dolfin()
         _ensure_gyptis()
-    except ImportError:
-        n = design.size
-        vjp["design_epsilon"] = np.full(n, cotangent / n)
-        return vjp
+    except ImportError as exc:
+        raise RuntimeError(
+            "gyptis adjoint requires a gyptis/FEniCS backend; none is "
+            "available. There is no physics-free effective-medium fallback -- "
+            "run the component in its container."
+        ) from exc
 
     session = _session_registry.match(
         _solve_identity(

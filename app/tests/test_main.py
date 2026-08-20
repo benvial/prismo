@@ -79,18 +79,21 @@ def test_cli_run_help() -> None:
 
 
 @pytest.mark.slow
-def test_cli_run_synthetic() -> None:
-    """Test `prismo run` on a synthetic mesh (no gmsh)."""
+def test_cli_run_without_backend_errors() -> None:
+    """Ticket 04: a no-backend `prismo run` fails loudly, never fabricating a result.
+
+    Without a container (no Julia/gyptis solver), the deleted physics-free
+    stubs used to let the synthetic run "succeed" with fabricated carriers and
+    an effective-medium neff. It must now surface the missing solver backend.
+    """
     main_module = import_module("prismo.main")
     result = runner.invoke(
         main_module.app,
         ["--max-iter", "3", "--no-jit"],
     )
-    assert result.exit_code == 0, result.output
-    assert "Done" in result.stdout
-    # The optimum reports Δneff and the VπLπ efficiency headline (ticket 03).
-    assert "Delta_n_eff" in result.stdout
-    assert "VpiLpi" in result.stdout
+    assert result.exit_code != 0
+    assert result.exception is not None
+    assert "backend" in str(result.exception)
 
 
 def test_container_run_seeds_signed_junction_for_optimization(

@@ -3,15 +3,13 @@
 Ref: ticket 14 -- end-to-end pipeline via JAX composition.
 """
 
-from dataclasses import replace
-
 import numpy as np
 import pytest
 
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp  # noqa: E402
+from _doubles import stub_components  # noqa: E402
 from prismo.density_filter import assemble_filter_matrix  # noqa: E402
-from prismo.differentiable_component import DifferentiableComponent  # noqa: E402
 from prismo.mesh_transfer import build_mesh_transfer_operator  # noqa: E402
 from prismo.pipeline import (  # noqa: E402
     _CT_MESH_MOUNT,
@@ -39,8 +37,8 @@ RNG = np.random.default_rng(0)
 
 
 def _components_with(**overrides) -> PipelineComponents:
-    """Default in-process components with specific components replaced."""
-    return replace(build_default_components(), **overrides)
+    """Physics-free component doubles with specific components replaced (ticket 04)."""
+    return stub_components(**overrides)
 
 
 _DOPING_CEILING = DOPING_REFERENCE_CM3 * (10.0**DOPING_LOG10_SPAN - 1.0)
@@ -262,7 +260,11 @@ class TestSorefBennettJax:
 
 
 class TestPipelineStub:
-    """Pipeline with no containers available (stubs)."""
+    """Pipeline composed from explicit JAX-native doubles (ticket 04).
+
+    The implicit no-backend stubs were deleted; these tests inject physics-free
+    doubles through ``components=`` instead of relying on a fabricated default.
+    """
 
     N_NODES = 16
 
@@ -270,8 +272,23 @@ class TestPipelineStub:
     def rho(self) -> jax.Array:
         return jnp.asarray(RNG.random(self.N_NODES), dtype=jnp.float64)
 
+    def test_no_backend_is_a_hard_error(self, rho):
+        """Ticket 04: the default (backend-less) pipeline never fabricates -- it raises.
+
+        ``make run`` without a container gets a clear error rather than an
+        effective-medium neff or identity carriers.
+        """
+        with pytest.raises(Exception, match="backend"):
+            pipeline(rho)
+
+    def test_default_components_have_no_physics_free_fallback(self, rho):
+        """``build_default_components`` builds, but a call without a live solver raises."""
+        components = build_default_components()
+        with pytest.raises(Exception, match="backend"):
+            pipeline(rho, components=components)
+
     def test_forward_returns_scalar(self, rho):
-        result = pipeline(rho)
+        result = pipeline(rho, components=_components_with())
         assert result.ndim == 0
         assert jnp.isfinite(result)
 
@@ -431,16 +448,10 @@ class TestPipelineStub:
             carriers = jnp.where(bias_voltage == 0.0, doping, jnp.zeros_like(doping))
             return carriers, carriers
 
-        # gyptis stub sensitive to spatial structure: neff_sq = sum(eps^2), whose
-        # exact per-cell VJP is 2*eps (non-constant for a structured field).
-        structure_sensitive = DifferentiableComponent(
-            forward=lambda *a: None,
-            vjp=lambda *a: None,
-            out_struct=lambda eps, *s: jax.ShapeDtypeStruct((), eps.dtype),
-            stub_forward=lambda eps, *s: jnp.sum(eps**2),
-            stub_vjp=lambda eps, g, *s: 2.0 * g * eps,
-            available=lambda: False,
-        )
+        # gyptis double sensitive to spatial structure: neff_sq = sum(eps^2),
+        # a pure-JAX callable JAX differentiates natively (per-cell grad 2*eps,
+        # non-constant for a structured field).
+        structure_sensitive = lambda eps, *s: jnp.sum(eps**2)
         components = _components_with(
             chargetransport=fake_ct, gyptis=structure_sensitive
         )
@@ -450,8 +461,9 @@ class TestPipelineStub:
         assert jnp.all(jnp.isfinite(grad))
         assert float(jnp.std(grad)) > 0.0  # spatially resolved, not collapsed
 
-    def test_forward_returns_zero_pre_container(self, rho):
-        result = pipeline(rho)
+    def test_identity_doubles_give_zero_shift(self, rho):
+        """Identity carrier doubles produce an identical field at both biases."""
+        result = pipeline(rho, components=_components_with())
         np.testing.assert_allclose(result, 0.0, atol=1e-12)
 
     def test_zero_shift_is_exactly_zero_not_floored(self):
@@ -471,31 +483,36 @@ class TestPipelineStub:
         assert float(result) == 0.0
 
     def test_gradient_is_finite(self, rho):
-        grad = jax.grad(pipeline)(rho)
+        grad = jax.grad(lambda r: pipeline(r, components=_components_with()))(rho)
         assert grad.shape == rho.shape
         assert jnp.all(jnp.isfinite(grad))
 
-    def test_gradient_is_zero_pre_container(self, rho):
-        grad = jax.grad(pipeline)(rho)
+    def test_identity_doubles_give_zero_gradient(self, rho):
+        grad = jax.grad(lambda r: pipeline(r, components=_components_with()))(rho)
         np.testing.assert_allclose(grad, 0.0, atol=1e-12)
 
     def test_jit_works(self, rho):
-        jitted = jax.jit(pipeline)
+        components = _components_with()
+        jitted = jax.jit(lambda r: pipeline(r, components=components))
         result = jitted(rho)
         assert result.ndim == 0
         assert jnp.isfinite(result)
 
     def test_jit_gradient_works(self, rho):
-        grad_fn = jax.jit(jax.grad(pipeline))
+        components = _components_with()
+        grad_fn = jax.jit(jax.grad(lambda r: pipeline(r, components=components)))
         grad = grad_fn(rho)
         assert grad.shape == rho.shape
         assert jnp.all(jnp.isfinite(grad))
 
     def test_dtype_preserved(self, rho):
-        result32 = pipeline(jnp.asarray(rho, dtype=jnp.float32))
+        components = _components_with()
+        result32 = pipeline(jnp.asarray(rho, dtype=jnp.float32), components=components)
         assert result32.dtype == jnp.float32
 
-        result64 = pipeline(jnp.asarray(rho, dtype=jnp.float64))
+        result64 = pipeline(
+            jnp.asarray(rho, dtype=jnp.float64), components=components
+        )
         assert result64.dtype == jnp.float64
 
 
@@ -847,32 +864,38 @@ class TestPipelineWithFilter:
     def rho(self, n_nodes) -> jax.Array:
         return jnp.full((n_nodes,), 0.25, dtype=jnp.float64)
 
-    def test_pipeline_with_filter_runs(self, rho, H_dense, H_sum):
-        result = pipeline(rho, H=H_dense, H_sum=H_sum)
+    @pytest.fixture
+    def components(self) -> PipelineComponents:
+        return _components_with()
+
+    def test_pipeline_with_filter_runs(self, rho, H_dense, H_sum, components):
+        result = pipeline(rho, H=H_dense, H_sum=H_sum, components=components)
         assert result.ndim == 0
         assert jnp.isfinite(result)
 
-    def test_gradient_with_filter(self, rho, H_dense, H_sum):
+    def test_gradient_with_filter(self, rho, H_dense, H_sum, components):
         grad = jax.grad(
-            lambda r: pipeline(r, H=H_dense, H_sum=H_sum),
+            lambda r: pipeline(r, H=H_dense, H_sum=H_sum, components=components),
         )(rho)
         assert grad.shape == rho.shape
         assert jnp.all(jnp.isfinite(grad))
 
-    def test_jit_with_filter(self, rho, H_dense, H_sum):
-        fn = jax.jit(lambda r: pipeline(r, H=H_dense, H_sum=H_sum))
+    def test_jit_with_filter(self, rho, H_dense, H_sum, components):
+        fn = jax.jit(
+            lambda r: pipeline(r, H=H_dense, H_sum=H_sum, components=components)
+        )
         result = fn(rho)
         assert result.ndim == 0
         assert jnp.isfinite(result)
 
-    def test_box_bounds_preserved(self, rho, H_dense, H_sum):
+    def test_box_bounds_preserved(self, rho, H_dense, H_sum, components):
         for val in [0.0, 0.5, 1.0]:
             r = jnp.full_like(rho, val)
-            result = pipeline(r, H=H_dense, H_sum=H_sum)
+            result = pipeline(r, H=H_dense, H_sum=H_sum, components=components)
             assert jnp.isfinite(result)
 
-    def test_shape_consistency(self, rho, H_dense, H_sum):
-        result = pipeline(rho, H=H_dense, H_sum=H_sum)
+    def test_shape_consistency(self, rho, H_dense, H_sum, components):
+        result = pipeline(rho, H=H_dense, H_sum=H_sum, components=components)
         d = float(result)
         assert isinstance(d, float)
 
@@ -883,20 +906,21 @@ class TestPipelineDopingMapping:
     def test_range(self):
         n_nodes = 10
         theta = jnp.linspace(-1.0, 1.0, n_nodes)
-        result = pipeline(theta)
+        result = pipeline(theta, components=_components_with())
         assert jnp.isfinite(result)
         assert result.ndim == 0
 
     def test_edge_cases_finite(self):
+        components = _components_with()
         for val in [-1.0, -0.5, 0.0, 0.001, 0.5, 0.999, 1.0]:
             theta = jnp.array([val])
-            result = pipeline(theta)
+            result = pipeline(theta, components=components)
             assert jnp.isfinite(result), f"Non-finite at theta={val}"
 
     def test_gradient_exists_for_nonuniform_rho(self):
         n_nodes = 10
         rho = jnp.asarray(RNG.random(n_nodes), dtype=jnp.float64)
-        grad = jax.grad(pipeline)(rho)
+        grad = jax.grad(lambda r: pipeline(r, components=_components_with()))(rho)
         assert grad.shape == rho.shape
         assert jnp.all(jnp.isfinite(grad))
 
@@ -929,14 +953,16 @@ class TestPipelineGradientValidation:
 
     def test_gradient_vs_fd_central(self, rho_vectors, directions):
         step_sizes = [1e-3, 1e-4, 1e-5, 1e-6]
-        grad_fn = jax.grad(pipeline)
+        components = _components_with()
+        run = lambda r: pipeline(r, components=components)
+        grad_fn = jax.grad(run)
 
         for rho in rho_vectors:
             grad_exact = grad_fn(rho)
             for direction in directions:
                 for h in step_sizes:
-                    f_plus = pipeline(rho + h * direction)
-                    f_minus = pipeline(rho - h * direction)
+                    f_plus = run(rho + h * direction)
+                    f_minus = run(rho - h * direction)
                     fd_grad_dir = (f_plus - f_minus) / (2.0 * h)
                     exact_grad_dir = jnp.dot(grad_exact, direction)
 
@@ -952,7 +978,9 @@ class TestPipelineGradientValidation:
                         )
 
     def test_gradient_vs_fd_multiple_rho(self):
-        grad_fn = jax.grad(pipeline)
+        components = _components_with()
+        run = lambda r: pipeline(r, components=components)
+        grad_fn = jax.grad(run)
         for seed in [42, 99, 137]:
             rng = np.random.default_rng(seed)
             rho = jnp.asarray(rng.random(self.N_NODES), dtype=jnp.float64)
@@ -965,8 +993,8 @@ class TestPipelineGradientValidation:
             exact_dir = float(jnp.dot(grad_exact, direction))
 
             h = 1e-5
-            f_plus = pipeline(rho + h * direction)
-            f_minus = pipeline(rho - h * direction)
+            f_plus = run(rho + h * direction)
+            f_minus = run(rho - h * direction)
             fd_dir = float((f_plus - f_minus) / (2.0 * h))
 
             assert abs(fd_dir - exact_dir) < 1e-8, (
@@ -1004,12 +1032,12 @@ class TestPipelineShapeValidation:
         assert dalpha.shape == rho.shape
 
     def test_gyptis_scalar_output(self, rho):
-        result = build_default_components().gyptis(rho)
+        result = _components_with().gyptis(rho)
         assert result.ndim == 0
         assert jnp.isfinite(result)
 
     def test_ct_call_output_shapes(self, rho):
-        n_out, p_out = build_default_components().chargetransport(rho, 0.0)
+        n_out, p_out = _components_with().chargetransport(rho, 0.0)
         assert n_out.shape == rho.shape
         assert p_out.shape == rho.shape
 

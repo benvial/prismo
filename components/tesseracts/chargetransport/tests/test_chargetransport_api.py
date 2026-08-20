@@ -116,11 +116,19 @@ def test_output_schema_electrons_and_holes_are_differentiable() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    not _julia_available(),
+    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+)
 def test_apply_returns_output_schema() -> None:
     outputs = apply(make_inputs())
     assert isinstance(outputs, OutputSchema)
 
 
+@pytest.mark.skipif(
+    not _julia_available(),
+    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+)
 def test_apply_returns_fields_per_node_with_same_shape_as_doping() -> None:
     inputs = make_inputs()
     outputs = apply(inputs)
@@ -128,6 +136,10 @@ def test_apply_returns_fields_per_node_with_same_shape_as_doping() -> None:
     assert np.asarray(outputs.holes).shape == (N_NODES,)
 
 
+@pytest.mark.skipif(
+    not _julia_available(),
+    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+)
 def test_apply_returns_finite_values() -> None:
     doping = np.array([1e22, -5e21, 0.0, 5e21, -1e22])
     outputs = apply(make_inputs(doping))
@@ -135,6 +147,10 @@ def test_apply_returns_finite_values() -> None:
     assert np.all(np.isfinite(outputs.holes))
 
 
+@pytest.mark.skipif(
+    not _julia_available(),
+    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+)
 def test_apply_deterministic() -> None:
     doping = np.array([1e22, -5e21, 2e21, -2e21, 1e20])
     out1 = apply(make_inputs(doping))
@@ -143,6 +159,10 @@ def test_apply_deterministic() -> None:
     np.testing.assert_allclose(out1.holes, out2.holes)
 
 
+@pytest.mark.skipif(
+    not _julia_available(),
+    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+)
 def test_apply_output_ordering_matches_input() -> None:
     doping = np.arange(N_NODES, dtype=float) * 1e21
     outputs = apply(make_inputs(doping))
@@ -155,6 +175,10 @@ def test_apply_output_ordering_matches_input() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    not _julia_available(),
+    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+)
 def test_vjp_returns_cotangent_for_requested_input() -> None:
     inputs = make_inputs()
     apply(inputs)
@@ -166,6 +190,10 @@ def test_vjp_returns_cotangent_for_requested_input() -> None:
     assert np.asarray(result["doping"]).shape == (N_NODES,)
 
 
+@pytest.mark.skipif(
+    not _julia_available(),
+    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+)
 def test_vjp_returns_finite_values() -> None:
     inputs = make_inputs()
     apply(inputs)
@@ -184,6 +212,10 @@ def test_vjp_empty_when_input_not_requested() -> None:
     assert result == {}
 
 
+@pytest.mark.skipif(
+    not _julia_available(),
+    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+)
 def test_vjp_linear_in_cotangent() -> None:
     inputs = make_inputs()
     apply(inputs)
@@ -197,20 +229,33 @@ def test_vjp_linear_in_cotangent() -> None:
     np.testing.assert_allclose(ratio, 3.0, rtol=1e-10)
 
 
-def test_vjp_stub_sums_cotangents() -> None:
-    inputs = make_inputs()
-    apply(inputs)
-    cot_e = np.full(N_NODES, 2.0)
-    cot_h = np.full(N_NODES, 3.0)
-    result = vector_jacobian_product(
-        inputs,
-        {"doping"},
-        {"electrons", "holes"},
-        {"electrons": cot_e, "holes": cot_h},
-    )
-    np.testing.assert_allclose(result["doping"], cot_e + cot_h)
+@pytest.mark.skipif(
+    _julia_available(), reason="exercises the no-Julia error path (ticket 04)"
+)
+def test_apply_without_backend_raises() -> None:
+    """No physics-free identity fallback: a solve without Julia is a hard error."""
+    with pytest.raises(RuntimeError, match="Julia drift-diffusion backend"):
+        apply(make_inputs())
 
 
+@pytest.mark.skipif(
+    _julia_available(), reason="exercises the no-Julia error path (ticket 04)"
+)
+def test_vjp_without_backend_raises() -> None:
+    """No physics-free identity VJP: an adjoint without Julia is a hard error."""
+    with pytest.raises(RuntimeError, match="Julia adjoint backend"):
+        vector_jacobian_product(
+            make_inputs(),
+            {"doping"},
+            {"electrons", "holes"},
+            {"electrons": np.full(N_NODES, 2.0), "holes": np.full(N_NODES, 3.0)},
+        )
+
+
+@pytest.mark.skipif(
+    not _julia_available(),
+    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+)
 def test_vjp_handles_scalar_cotangents() -> None:
     inputs = make_inputs()
     apply(inputs)
@@ -229,6 +274,10 @@ def test_vjp_handles_scalar_cotangents() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    not _julia_available(),
+    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+)
 def test_vjp_matches_finite_difference() -> None:
     doping = np.array([1e22, -5e21, 2e21, -2e21, 1e20], dtype=float)
     perturbation = np.array([0.1, -0.3, 0.2, 0.5, -0.1], dtype=float)
@@ -258,6 +307,10 @@ def test_vjp_matches_finite_difference() -> None:
     np.testing.assert_allclose(vjp_dir, fd_grad_dir, rtol=1e-5)
 
 
+@pytest.mark.skipif(
+    not _julia_available(),
+    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+)
 def test_vjp_rejects_inputs_without_matching_forward() -> None:
     _api._session_registry.clear()
 
@@ -310,6 +363,10 @@ def test_vjp_reuses_matching_persistent_worker_state(
     assert requests[0]["profile_key"] == requests[1]["profile_key"]
 
 
+@pytest.mark.skipif(
+    not _julia_available(),
+    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+)
 def test_shutdown_invalidates_retained_forward_state() -> None:
     """Worker teardown prevents VJPs from using another run's state."""
     inputs = make_inputs()
@@ -345,6 +402,10 @@ def test_shutdown_invalidates_retained_forward_state() -> None:
             ),
         ),
     ],
+)
+@pytest.mark.skipif(
+    not _julia_available(),
+    reason="requires a Julia backend; no physics-free stub (ticket 04)",
 )
 def test_vjp_rejects_changed_forward_inputs(
     forward_inputs: InputSchema,
@@ -766,18 +827,18 @@ def test_vjp_matches_gmsh_pn_directional_difference(bias_voltage: float) -> None
         Path(mesh_path).unlink(missing_ok=True)
 
 
-@pytest.mark.skipif(_julia_available(), reason="Julia installed; stub path not active")
-def test_apply_mesh_ref_stub_path_works() -> None:
-    """Without Julia, apply with a mesh_ref must still pass doping through."""
+@pytest.mark.skipif(
+    _julia_available(), reason="exercises the no-Julia error path (ticket 04)"
+)
+def test_apply_mesh_ref_without_backend_raises() -> None:
+    """Without Julia, apply must raise -- no identity pass-through of the doping."""
     with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
         _make_minimal_triangle_msh(f.name)
         mesh_path = f.name
     try:
         doping = np.array([1e22, -5e21, 2e21], dtype=float)
         ref = _make_mesh_ref(mesh_path, n_nodes=3)
-        outputs = apply(InputSchema(doping=doping, mesh_ref=ref))
-        assert isinstance(outputs, OutputSchema)
-        np.testing.assert_allclose(outputs.electrons, doping)
-        np.testing.assert_allclose(outputs.holes, doping)
+        with pytest.raises(RuntimeError, match="Julia drift-diffusion backend"):
+            apply(InputSchema(doping=doping, mesh_ref=ref))
     finally:
         Path(mesh_path).unlink(missing_ok=True)

@@ -2,11 +2,10 @@
 
 A single deep module that concentrates the AD ceremony every component
 call site used to re-derive by hand: the ``custom_vjp`` forward/backward
-pair, the ``pure_callback`` bridge into numpy solver code, the output
-shape-structs, and the short-circuit that keeps the pipeline differentiable
-when a component is unavailable.
+pair, the ``pure_callback`` bridge into numpy solver code, and the output
+shape-structs.
 
-A component is described by five callables and one predicate:
+A component is described by three callables:
 
 - ``forward(x_np, *static) -> out_np``: the real (container or local) solve,
   operating on numpy arrays. Its container/local dispatch and serialization
@@ -14,12 +13,12 @@ A component is described by five callables and one predicate:
 - ``vjp(x_np, cotangent, *static) -> in_cotangent_np``: the matching adjoint.
 - ``out_struct(x, *static) -> ShapeDtypeStruct pytree``: the forward output
   structure, used to bridge back into JAX.
-- ``stub_forward(x, *static) -> out`` / ``stub_vjp(x, g, *static) -> in``:
-  JAX-native behaviour when no real backend is available, so the composed
-  pipeline still produces a value and a gradient.
-- ``available() -> bool``: whether a real backend (container or local) exists.
 
-Ref: pipeline-deepening ticket 01.
+There is no physics-free stub: a component with no live backend raises rather
+than fabricating a value or gradient. Tests compose explicit JAX-native
+doubles through the pipeline's ``components=`` seam instead.
+
+Ref: pipeline-deepening ticket 01; rethink ticket 04 (delete fake fallbacks).
 """
 
 from __future__ import annotations
@@ -34,11 +33,6 @@ import jax
 _T = TypeVar("_T")
 
 
-def has_backend(container: Any | None, local_api: Any | None) -> bool:
-    """Whether a real (container or local) backend exists for a component."""
-    return container is not None or local_api is not None
-
-
 def invoke_tesseract(
     container: Any | None,
     local_api: Any | None,
@@ -49,9 +43,8 @@ def invoke_tesseract(
     """Route one real component call to its container or local backend.
 
     The container backend is preferred when present, then the in-process
-    local module. The unavailable (stub) case is handled by
-    :class:`DifferentiableComponent` in JAX space and never reaches here, so
-    a missing backend is a programming error rather than a stub short-circuit.
+    local module. With neither, a missing backend is a hard error -- there is
+    no silent stub short-circuit -- so a physics-free run fails loudly.
     """
     if container is not None:
         return container_call(container)
@@ -64,19 +57,16 @@ def invoke_tesseract(
 class DifferentiableComponent:
     """An external component made JAX-differentiable via one adapter.
 
-    Carries the real ``forward``/``vjp`` numpy callables, the forward
-    ``out_struct``, the ``stub_forward``/``stub_vjp`` used when no backend is
-    available, and an ``available`` predicate. Calling the instance evaluates
-    the component with one differentiable array input ``x`` followed by any
-    static (non-differentiated) arguments.
+    Carries the real ``forward``/``vjp`` numpy callables and the forward
+    ``out_struct``. Calling the instance evaluates the component with one
+    differentiable array input ``x`` followed by any static (non-differentiated)
+    arguments. The ``forward``/``vjp`` callables reach a live backend or raise;
+    the adapter never substitutes a physics-free value.
     """
 
     forward: Callable[..., Any]
     vjp: Callable[..., Any]
     out_struct: Callable[..., Any]
-    stub_forward: Callable[..., Any]
-    stub_vjp: Callable[..., Any]
-    available: Callable[[], bool]
 
     def __call__(self, x: jax.Array, *static: Any) -> Any:
         """Evaluate the component at ``x`` with any static arguments."""
@@ -99,8 +89,6 @@ class DifferentiableComponent:
         return call(x, static)
 
     def _forward_value(self, x: jax.Array, static: tuple[Any, ...]) -> Any:
-        if not self.available():
-            return self.stub_forward(x, *static)
         return jax.pure_callback(
             lambda x_np: self.forward(x_np, *static),
             self.out_struct(x, *static),
@@ -108,8 +96,6 @@ class DifferentiableComponent:
         )
 
     def _vjp_value(self, x: jax.Array, static: tuple[Any, ...], g: Any) -> jax.Array:
-        if not self.available():
-            return self.stub_vjp(x, g, *static)
         return jax.pure_callback(
             lambda x_np, g_np: self.vjp(x_np, g_np, *static),
             jax.ShapeDtypeStruct(x.shape, x.dtype),

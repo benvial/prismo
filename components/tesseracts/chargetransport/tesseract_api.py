@@ -6,7 +6,8 @@
 #
 # Persistent worker pattern: Python owns one Julia process for the Tesseract
 # lifecycle and exchanges NPY/NPZ file references over JSON lines.
-# Falls back to identity stub when Julia is not installed.
+# A missing Julia backend is a hard error -- there is no physics-free identity
+# fallback that would fabricate carrier densities (rethink ticket 04).
 #
 # Ref: tickets 02 (container + I/O), 03 (forward API), 04 (adjoint),
 #      06 (container build).
@@ -391,10 +392,11 @@ def _run_julia_adjoint(
 def apply(inputs: InputSchema) -> OutputSchema:
     """Forward drift-diffusion solve via ChargeTransport.jl.
 
-    When Julia is available, sends the doping array, mesh reference, and bias
-    voltage to a persistent worker that retains compatible solver state.
-    Local development without Julia retains a deterministic identity stub;
-    failures from an available Julia solver propagate to the caller.
+    Sends the doping array, mesh reference, and bias voltage to a persistent
+    Julia worker that retains compatible solver state. A missing Julia backend
+    is a hard error -- there is no physics-free identity fallback that would
+    fabricate carrier densities -- and failures from an available Julia solver
+    propagate to the caller.
 
     Args:
         inputs: Net doping [cm⁻³], optional mesh reference, bias voltage.
@@ -404,15 +406,14 @@ def apply(inputs: InputSchema) -> OutputSchema:
     """
     doping = np.asarray(inputs.doping, dtype=float)
 
-    worker_generation = _worker_generation
-    if _julia_available() and (_SCRIPTS_DIR / "worker.jl").exists():
-        electrons, holes = _run_julia_forward(
-            doping, inputs.mesh_ref, inputs.bias_voltage
+    if not (_julia_available() and (_SCRIPTS_DIR / "worker.jl").exists()):
+        raise RuntimeError(
+            "ChargeTransport requires a Julia drift-diffusion backend "
+            "(ChargeTransport.jl worker); none is available. There is no "
+            "physics-free fallback -- run the component in its container."
         )
-        worker_generation = _get_julia_worker().generation
-    else:
-        electrons = doping.copy()
-        holes = doping.copy()
+    electrons, holes = _run_julia_forward(doping, inputs.mesh_ref, inputs.bias_voltage)
+    worker_generation = _get_julia_worker().generation
 
     identity = _forward_state_key(
         doping,
@@ -439,10 +440,10 @@ def vector_jacobian_product(
 ) -> dict[str, npt.ArrayLike]:
     """Adjoint gradient pass via discrete adjoint inside Julia.
 
-    When Julia is available, sends cotangents to the worker that owns the
-    matching forward state. Local development without Julia retains a
-    deterministic identity VJP; failures from an available Julia solver
-    propagate to the caller.
+    Sends cotangents to the Julia worker that owns the matching forward state.
+    A missing Julia backend is a hard error -- there is no physics-free identity
+    VJP that would fabricate a gradient -- and failures from an available Julia
+    solver propagate to the caller.
 
     Args:
         inputs: Same InputSchema as the preceding apply() call.
@@ -475,13 +476,16 @@ def vector_jacobian_product(
         holes_cot = np.full(n, float(holes_cot))
 
     doping = np.asarray(inputs.doping, dtype=float)
-    if _julia_available() and (_SCRIPTS_DIR / "worker.jl").exists():
-        try:
-            worker_generation = _get_julia_worker().generation
-        except RuntimeError as exc:
-            raise RuntimeError(f"Julia adjoint solve failed: {exc}") from exc
-    else:
-        worker_generation = _worker_generation
+    if not (_julia_available() and (_SCRIPTS_DIR / "worker.jl").exists()):
+        raise RuntimeError(
+            "ChargeTransport VJP requires a Julia adjoint backend "
+            "(ChargeTransport.jl worker); none is available. There is no "
+            "physics-free fallback -- run the component in its container."
+        )
+    try:
+        worker_generation = _get_julia_worker().generation
+    except RuntimeError as exc:
+        raise RuntimeError(f"Julia adjoint solve failed: {exc}") from exc
     identity = _forward_state_key(
         doping,
         inputs.mesh_ref,
@@ -494,16 +498,11 @@ def vector_jacobian_product(
             "doping, mesh reference, and bias voltage."
         )
 
-    if _julia_available() and (_SCRIPTS_DIR / "worker.jl").exists():
-        result = _run_julia_adjoint(
-            doping,
-            inputs.mesh_ref,
-            inputs.bias_voltage,
-            electrons_cot,
-            holes_cot,
-        )
-    else:
-        result = electrons_cot + holes_cot
-
-    vjp["doping"] = result
+    vjp["doping"] = _run_julia_adjoint(
+        doping,
+        inputs.mesh_ref,
+        inputs.bias_voltage,
+        electrons_cot,
+        holes_cot,
+    )
     return vjp

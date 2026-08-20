@@ -10,6 +10,7 @@ import pytest
 
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp  # noqa: E402
+from _doubles import stub_components as _stub_components  # noqa: E402
 from prismo.density_filter import assemble_filter_matrix  # noqa: E402
 from prismo.optimizer import optimize_doping  # noqa: E402
 
@@ -38,7 +39,9 @@ class TestOptimizeDopingStub:
         return np.full(self.N_NODES, 0.25, dtype=float)
 
     def test_runs_and_returns_valid(self, rho0):
-        rho_opt, history = optimize_doping(rho0, max_iter=3)
+        rho_opt, history = optimize_doping(
+            rho0, max_iter=3, components=_stub_components()
+        )
         assert isinstance(rho_opt, np.ndarray)
         assert rho_opt.shape == (self.N_NODES,)
         assert np.all(rho_opt >= 0.0)
@@ -47,7 +50,7 @@ class TestOptimizeDopingStub:
         assert len(history) > 0
 
     def test_history_format(self, rho0):
-        _, history = optimize_doping(rho0, max_iter=3)
+        _, history = optimize_doping(rho0, max_iter=3, components=_stub_components())
         for entry in history:
             assert "iteration" in entry
             assert "delta_n_eff" in entry
@@ -61,7 +64,9 @@ class TestOptimizeDopingStub:
             assert isinstance(entry["wall_time"], float)
 
     def test_default_initial_rho(self):
-        rho_opt, _ = optimize_doping(n_nodes=self.N_NODES, max_iter=3)
+        rho_opt, _ = optimize_doping(
+            n_nodes=self.N_NODES, max_iter=3, components=_stub_components()
+        )
         assert rho_opt.shape == (self.N_NODES,)
         assert np.all(rho_opt >= 0.0)
         assert np.all(rho_opt <= 1.0)
@@ -71,11 +76,13 @@ class TestOptimizeDopingStub:
             optimize_doping()
 
     def test_jit_flag_works(self, rho0):
-        rho_opt, _ = optimize_doping(rho0, max_iter=3, use_jit=False)
+        rho_opt, _ = optimize_doping(
+            rho0, max_iter=3, use_jit=False, components=_stub_components()
+        )
         assert rho_opt.shape == (self.N_NODES,)
 
     def test_max_iter_respected(self, rho0):
-        _, history = optimize_doping(rho0, max_iter=5)
+        _, history = optimize_doping(rho0, max_iter=5, components=_stub_components())
         assert len(history) <= 5
 
     def test_iteration_callback_receives_each_solver_candidate(self, rho0):
@@ -85,6 +92,7 @@ class TestOptimizeDopingStub:
             rho0,
             max_iter=3,
             on_iteration=lambda iteration, rho: received.append((iteration, rho)),
+            components=_stub_components(),
         )
 
         assert [iteration for iteration, _ in received] == list(
@@ -279,6 +287,7 @@ class TestOptimizeDopingWithFilter:
             initial_rho=rho0,
             H=H_dense,
             max_iter=3,
+            components=_stub_components(),
         )
         assert rho_opt.shape == rho0.shape
         assert len(history) > 0
@@ -288,6 +297,7 @@ class TestOptimizeDopingWithFilter:
             initial_rho=rho0,
             H=H_dense,
             max_iter=5,
+            components=_stub_components(),
         )
         assert np.all(rho_opt >= 0.0)
         assert np.all(rho_opt <= 1.0)
@@ -298,6 +308,7 @@ class TestOptimizeDopingWithFilter:
             mesh_coords=coords,
             r_min=50e-9,
             max_iter=2,
+            components=_stub_components(),
         )
         assert rho_opt.shape == rho0.shape
 

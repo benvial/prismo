@@ -25,7 +25,6 @@ from prismo_shared.schemas import MeshRef, SorefBennettCoefficients
 
 from prismo.differentiable_component import (
     DifferentiableComponent,
-    has_backend,
     invoke_tesseract,
 )
 
@@ -412,24 +411,6 @@ def _ct_out_struct(
     return _shaped_like(doping), _shaped_like(doping)
 
 
-def _ct_stub_forward(
-    doping: jax.Array,
-    bias_voltage: float,
-    mesh_ref: MeshRef | None = None,
-) -> tuple[jax.Array, jax.Array]:
-    return doping, doping
-
-
-def _ct_stub_vjp(
-    doping: jax.Array,
-    g: tuple[jax.Array, jax.Array],
-    bias_voltage: float,
-    mesh_ref: MeshRef | None = None,
-) -> jax.Array:
-    g_electrons, g_holes = g
-    return g_electrons + g_holes
-
-
 def build_chargetransport_component(
     container: Any | None = None,
     local_api: Any | None = None,
@@ -437,9 +418,10 @@ def build_chargetransport_component(
     """Build the ChargeTransport component bound to one backend.
 
     ``container`` is a running Tesseract handle; ``local_api`` an in-process
-    ``tesseract_api`` module. With neither, the component is a differentiable
-    identity stub. The backend is captured here, not read from module globals.
-    Returns a :class:`TimedComponent` owning the phase timer it records into.
+    ``tesseract_api`` module. With neither, calling the component raises -- there
+    is no physics-free identity fallback. The backend is captured here, not read
+    from module globals. Returns a :class:`TimedComponent` owning the phase timer
+    it records into.
     """
     timer = PhaseTimer()
 
@@ -528,9 +510,6 @@ def build_chargetransport_component(
         forward=forward,
         vjp=vjp,
         out_struct=_ct_out_struct,
-        stub_forward=_ct_stub_forward,
-        stub_vjp=_ct_stub_vjp,
-        available=lambda: has_backend(container, local_api),
     )
     return TimedComponent(component, timer)
 
@@ -549,21 +528,6 @@ def _gyptis_out_struct(
     return _scalar_like(design_epsilon)
 
 
-def _gyptis_stub_forward(
-    design_epsilon: jax.Array, core_epsilon: float = _DEFAULT_BACKGROUND_EPSILON
-) -> jax.Array:
-    return jnp.mean(design_epsilon)
-
-
-def _gyptis_stub_vjp(
-    design_epsilon: jax.Array,
-    g: jax.Array,
-    core_epsilon: float = _DEFAULT_BACKGROUND_EPSILON,
-) -> jax.Array:
-    n = design_epsilon.shape[0]
-    return jnp.full_like(design_epsilon, g / n)
-
-
 def _gyptis_background_vjp_impl(
     design_epsilon_np: np.ndarray,
     cot_neff_sq: np.ndarray,
@@ -571,14 +535,6 @@ def _gyptis_background_vjp_impl(
 ) -> np.ndarray:
     """Background permittivity is rho-independent: its cotangent is zero."""
     return np.zeros_like(design_epsilon_np)
-
-
-def _gyptis_background_stub_vjp(
-    design_epsilon: jax.Array,
-    g: jax.Array,
-    core_epsilon: float = _DEFAULT_BACKGROUND_EPSILON,
-) -> jax.Array:
-    return jnp.zeros_like(design_epsilon)
 
 
 def build_gyptis_components(
@@ -595,9 +551,6 @@ def build_gyptis_components(
     background_cache: dict[tuple[tuple[int, ...], str, bytes, float], np.ndarray] = {}
     cache_lock = RLock()
     timer = PhaseTimer()
-
-    def available() -> bool:
-        return has_backend(container, local_api)
 
     def forward(
         design_epsilon_np: np.ndarray,
@@ -704,18 +657,12 @@ def build_gyptis_components(
         forward=forward,
         vjp=vjp,
         out_struct=_gyptis_out_struct,
-        stub_forward=_gyptis_stub_forward,
-        stub_vjp=_gyptis_stub_vjp,
-        available=available,
     )
     # Background solve: rho-independent, so it contributes a zero cotangent.
     background = DifferentiableComponent(
         forward=background_forward,
         vjp=_gyptis_background_vjp_impl,
         out_struct=_gyptis_out_struct,
-        stub_forward=_gyptis_stub_forward,
-        stub_vjp=_gyptis_background_stub_vjp,
-        available=available,
     )
     return TimedComponent(perturbed, timer), TimedComponent(background, timer)
 
@@ -812,9 +759,11 @@ class PipelineComponents:
 def build_default_components() -> PipelineComponents:
     """Build the default in-process components from the local tesseract apis.
 
-    Loads each component's ``tesseract_api`` module if importable; otherwise
-    the component is a differentiable identity stub. Used when ``pipeline()``
-    is called without an explicit bundle (no containers running).
+    Loads each component's ``tesseract_api`` module if importable. There is no
+    physics-free stub: a component whose tesseract_api has no live solver (no
+    Julia, no gyptis/FEniCS) raises when called rather than fabricating carriers
+    or an effective index. Used when ``pipeline()`` is called without an explicit
+    bundle (no containers running).
     """
     ct_api = _load_tesseract_api("chargetransport")
     gyptis_api = _load_tesseract_api("gyptis")
