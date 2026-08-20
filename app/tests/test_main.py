@@ -24,12 +24,18 @@ def _container_components(centroids: np.ndarray):
 
     centroids = np.asarray(centroids, dtype=float)
     vertices = np.repeat(centroids[:, None, :], 3, axis=1)
+
+    def write_mesh(path: str | Path) -> np.ndarray:
+        Path(path).write_text("$MeshFormat\n2.2 0 8\n$EndMeshFormat\n")
+        return vertices
+
     return PipelineComponents(
         chargetransport=None,
         gyptis=None,
         gyptis_background=None,
         design_cell_centroids=lambda: centroids,
         design_cell_vertices=lambda: vertices,
+        write_mesh=write_mesh,
     )
 
 

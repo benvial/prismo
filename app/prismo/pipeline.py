@@ -271,6 +271,7 @@ def init_tesseract_containers(
         design_cell_vertices=partial(
             read_gyptis_design_cell_vertices, container=gyptis_tesseract
         ),
+        write_mesh=partial(write_gyptis_mesh, container=gyptis_tesseract),
         closers=tuple(closers),
     )
 
@@ -342,9 +343,45 @@ def read_gyptis_design_cell_vertices(
     return vertices
 
 
+def write_gyptis_mesh(
+    mesh_path: str | Path, *, container: Any | None = None, local_api: Any | None = None
+) -> np.ndarray:
+    """Persist gyptis' unified mesh on host and return its design-cell vertices."""
+
+    def from_container(tess: Any) -> tuple[str, np.ndarray]:
+        result = tess.apply({"operation": "write_mesh"})
+        return str(result["mesh_text"]), np.asarray(
+            result["design_cell_vertices"], dtype=float
+        )
+
+    def from_local(api: Any) -> tuple[str, np.ndarray]:
+        outputs = api.apply(api.InputSchema(operation="write_mesh"))
+        if outputs.mesh_text is None or outputs.design_cell_vertices is None:
+            raise RuntimeError("gyptis write_mesh returned no mesh payload")
+        return outputs.mesh_text, np.asarray(outputs.design_cell_vertices, dtype=float)
+
+    mesh_text, vertices = invoke_tesseract(
+        container,
+        local_api,
+        container_call=from_container,
+        local_call=from_local,
+    )
+    if not mesh_text.startswith("$MeshFormat"):
+        raise RuntimeError("gyptis write_mesh returned invalid Gmsh text")
+    if vertices.ndim != 3 or vertices.shape[1:] != (3, 2):
+        raise ValueError(
+            "gyptis design-cell vertices must have shape (n_design, 3, 2)"
+        )
+    path = Path(mesh_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(mesh_text)
+    return vertices
+
+
 def build_design_transfer(
     components: PipelineComponents,
     node_coords: np.ndarray,
+    design_cell_vertices: np.ndarray | None = None,
 ) -> jax.Array:
     """Assemble the dense mesh-transfer matrix for the container gyptis path.
 
@@ -358,12 +395,16 @@ def build_design_transfer(
     """
     from prismo.mesh_transfer import build_mesh_transfer_operator
 
-    if components.design_cell_vertices is None:
+    if design_cell_vertices is None and components.design_cell_vertices is None:
         raise RuntimeError(
             "Container pipeline requires a gyptis backend exposing design-cell "
             "vertices to build the mesh-transfer operator"
         )
-    vertices = components.design_cell_vertices()
+    vertices = (
+        components.design_cell_vertices()
+        if design_cell_vertices is None
+        else np.asarray(design_cell_vertices, dtype=float)
+    )
     operator = build_mesh_transfer_operator(node_coords, vertices)
     return jnp.asarray(operator.dense())
 
@@ -760,6 +801,7 @@ class PipelineComponents:
     gyptis_background: Callable[..., Any]
     design_cell_centroids: Callable[[], np.ndarray] | None = None
     design_cell_vertices: Callable[[], np.ndarray] | None = None
+    write_mesh: Callable[[str | Path], np.ndarray] | None = None
     closers: tuple[Callable[[], None], ...] = field(default=())
 
     def close(self) -> None:
@@ -823,6 +865,11 @@ def build_default_components() -> PipelineComponents:
         gyptis_background=gyptis_background,
         design_cell_centroids=design_cell_centroids,
         design_cell_vertices=design_cell_vertices,
+        write_mesh=(
+            partial(write_gyptis_mesh, local_api=gyptis_api)
+            if gyptis_api is not None
+            else None
+        ),
         closers=tuple(closers),
     )
 

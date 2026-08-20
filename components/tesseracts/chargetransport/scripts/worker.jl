@@ -14,6 +14,7 @@ mutable struct WorkerState
     data::Any
     cathode_breg::Int
     n_bregions::Int
+    node_parents::Vector{Int}
     control::Any
     profile_key::String
     equilibrium_sol::Any
@@ -30,6 +31,7 @@ WorkerState() = WorkerState(
     nothing,
     0,
     0,
+    Int[],
     nothing,
     "",
     nothing,
@@ -41,7 +43,7 @@ WorkerState() = WorkerState(
 read_vector(path) = Float64.(vec(npzread(path)))
 
 function rebuild_context!(state, doping, mesh_path, mesh_key)
-    ctsys, data, cathode_breg, n_bregions = build_ct_system(doping, mesh_path)
+    ctsys, data, cathode_breg, n_bregions, node_parents = build_ct_system(doping, mesh_path)
     state.mesh_path = mesh_path
     state.mesh_key = mesh_key
     state.n_nodes = length(doping)
@@ -49,6 +51,7 @@ function rebuild_context!(state, doping, mesh_path, mesh_key)
     state.data = data
     state.cathode_breg = cathode_breg
     state.n_bregions = n_bregions
+    state.node_parents = node_parents
     state.control = make_solver_control()
     state.profile_key = ""
     state.equilibrium_sol = nothing
@@ -71,10 +74,11 @@ function ensure_profile!(state, doping, mesh_path, mesh_key, profile_key)
     state.profile_key = ""
     state.equilibrium_sol = nothing
     empty!(state.forward_solutions)
+    silicon_doping = doping[state.node_parents]
     equilibrium_sol = solve_equilibrium_with_warm_start(
         state.ctsys,
         state.data,
-        doping,
+        silicon_doping,
         state.control,
         state.warm_equilibrium,
     )
@@ -124,12 +128,12 @@ function forward_solution!(state, doping, mesh_path, mesh_key, profile_key, bias
     return sol, profile_changed, used_warm_start
 end
 
-function carrier_fields(sol, data, n_nodes)
+function carrier_fields(sol, data, node_parents, n_nodes)
     electrons = zeros(Float64, n_nodes)
     holes = zeros(Float64, n_nodes)
-    for inode in 1:n_nodes
-        electrons[inode] = get_density(sol, data, 1, 1; inode = inode)
-        holes[inode] = get_density(sol, data, 2, 1; inode = inode)
+    for (silicon_node, full_node) in enumerate(node_parents)
+        electrons[full_node] = get_density(sol, data, 1, 1; inode = silicon_node)
+        holes[full_node] = get_density(sol, data, 2, 1; inode = silicon_node)
     end
     return electrons, holes
 end
@@ -150,7 +154,7 @@ function process_forward!(state, request)
         profile_key,
         bias_voltage,
     )
-    electrons, holes = carrier_fields(sol, state.data, length(doping))
+    electrons, holes = carrier_fields(sol, state.data, state.node_parents, length(doping))
     npzwrite(output_path, Dict("electrons" => electrons, "holes" => holes))
     return Dict(
         "ok" => true,
@@ -178,7 +182,7 @@ function process_vjp!(state, request)
     cot_p = read_vector(String(request["cotangent_holes_path"]))
     length(cot_n) == length(doping) || error("electron cotangent length mismatch")
     length(cot_p) == length(doping) || error("hole cotangent length mismatch")
-    vjp = compute_doping_vjp(
+    silicon_vjp = compute_doping_vjp(
         state.ctsys,
         state.data,
         deepcopy(state.forward_solutions[bias_voltage]),
@@ -186,9 +190,11 @@ function process_vjp!(state, request)
         bias_voltage,
         state.cathode_breg,
         state.n_bregions,
-        cot_n,
-        cot_p,
+        cot_n[state.node_parents],
+        cot_p[state.node_parents],
     )
+    vjp = zeros(Float64, length(doping))
+    vjp[state.node_parents] = silicon_vjp
     npzwrite(output_path, vjp)
     return Dict("ok" => true)
 end

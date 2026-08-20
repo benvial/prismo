@@ -26,9 +26,10 @@ const MINIMAL_TRIANGLE_MSH = """
 2.2 0 8
 \$EndMeshFormat
 \$PhysicalNames
-2
+3
 1 1 "contact_anode"
 1 2 "contact_cathode"
+2 3 "slab"
 \$EndPhysicalNames
 \$Nodes
 3
@@ -41,19 +42,19 @@ const MINIMAL_TRIANGLE_MSH = """
 1 1 2 1 1 1 2
 2 1 2 2 2 2 3
 3 1 2 1 3 3 1
-4 2 2 1 4 1 2 3
+4 2 2 3 4 1 2 3
 \$EndElements
 """
 
 function exercise(doping, mesh_path, bias_voltage)
-    n_nodes = length(doping)
-    ctsys, data, cathode_breg, n_bregions = build_ct_system(doping, mesh_path)
+    ctsys, data, cathode_breg, n_bregions, node_parents = build_ct_system(doping, mesh_path)
     control = make_solver_control()
-    u0 = solve_equilibrium(ctsys, data, doping, control)
+    silicon_doping = doping[node_parents]
+    u0 = solve_equilibrium(ctsys, data, silicon_doping, control)
     sol = solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregions)
 
-    electrons = [get_density(sol, data, 1, 1; inode = i) for i in 1:n_nodes]
-    holes = [get_density(sol, data, 2, 1; inode = i) for i in 1:n_nodes]
+    electrons = [get_density(sol, data, 1, 1; inode = i) for i in eachindex(node_parents)]
+    holes = [get_density(sol, data, 2, 1; inode = i) for i in eachindex(node_parents)]
 
     vjp = compute_doping_vjp(
         ctsys,
@@ -63,8 +64,8 @@ function exercise(doping, mesh_path, bias_voltage)
         bias_voltage,
         cathode_breg,
         n_bregions,
-        ones(Float64, n_nodes),
-        ones(Float64, n_nodes),
+        ones(Float64, length(node_parents)),
+        ones(Float64, length(node_parents)),
     )
 
     return electrons, holes, vjp

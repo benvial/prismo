@@ -27,6 +27,7 @@ from prismo.pipeline import (  # noqa: E402
     doping_from_theta,
     init_tesseract_containers,
     pipeline,
+    write_gyptis_mesh,
     read_gyptis_design_cell_centroids,
     vpi_lpi_v_cm,
 )
@@ -1042,6 +1043,23 @@ class TestChargeTransportMeshDelivery:
     cannot converge on. The fix is a read-only bind mount plus a rewritten path
     (ticket 02). Ref: .scratch/chargetransport-mesh-node-ordering.
     """
+
+    def test_write_gyptis_mesh_persists_host_owned_mesh(self, tmp_path):
+        """The gyptis mesh payload becomes CT's host-mounted shared mesh."""
+
+        class MeshAuthor:
+            def apply(self, inputs):
+                assert inputs == {"operation": "write_mesh"}
+                return {
+                    "mesh_text": "$MeshFormat\n2.2 0 8\n$EndMeshFormat\n",
+                    "design_cell_vertices": [[[0.0, 0.0]] * 3],
+                }
+
+        mesh_path = tmp_path / "waveguide.msh"
+        vertices = write_gyptis_mesh(mesh_path, container=MeshAuthor())
+
+        assert mesh_path.read_text() == "$MeshFormat\n2.2 0 8\n$EndMeshFormat\n"
+        assert vertices.shape == (1, 3, 2)
 
     def test_container_mesh_ref_rewrites_path_to_mount(self):
         ref = MeshRef(path="/host/outputs/waveguide.msh", n_nodes=62)

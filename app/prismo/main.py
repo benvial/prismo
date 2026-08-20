@@ -23,7 +23,7 @@ _MIN_CONTAINER_OBJECTIVE = 1e-12
 
 @app.command()
 def run(
-    r_min: float = typer.Option(50e-9, help="Density filter radius [m]"),
+    r_min: float = typer.Option(0.05, help="Density filter radius [µm]"),
     max_iter: int = typer.Option(200, help="Max MMA iterations"),
     ftol_rel: float = typer.Option(1e-5, help="Relative tolerance on objective"),
     mesh_path: str = typer.Option(
@@ -112,7 +112,14 @@ def _run_pipeline(
 
     typer.echo("[1/4] Generating waveguide mesh...")
     geometry = RibWaveguideGeometry()
-    actual_mesh = build_rib_waveguide_mesh(mesh_path=mesh_path_obj, geometry=geometry)
+    if use_containers:
+        if components is None or components.write_mesh is None:
+            raise RuntimeError("Container pipeline requires gyptis mesh authoring")
+        design_vertices = components.write_mesh(mesh_path_obj)
+        actual_mesh = mesh_path_obj
+    else:
+        actual_mesh = build_rib_waveguide_mesh(mesh_path=mesh_path_obj, geometry=geometry)
+        design_vertices = None
     typer.echo(f"      Mesh written to {actual_mesh}")
 
     typer.echo("[2/4] Building density filter matrix...")
@@ -160,12 +167,16 @@ def _run_pipeline(
         # assembled from live sources keyed to the shared mesh's nodes.
         if components is None:
             raise RuntimeError("Container pipeline requires live components")
-        design_transfer = build_design_transfer(components, coords)
+        if design_vertices is None:
+            raise RuntimeError("Container pipeline requires gyptis design-cell vertices")
+        design_transfer = build_design_transfer(
+            components, coords, design_cell_vertices=design_vertices
+        )
         typer.echo(
             f"      Mesh-transfer operator: {design_transfer.shape[0]} design cells "
             f"<- {n_nodes} nodes"
         )
-    typer.echo(f"      Filter radius: {r_min * 1e9:.0f} nm")
+    typer.echo(f"      Filter radius: {r_min:.3g} µm")
 
     typer.echo("[3/4] Running NLopt MMA optimization...")
     try:
@@ -179,7 +190,7 @@ def _run_pipeline(
                 name = f"doping_field_{iteration}"
                 plot_live_doping_field(
                     np.asarray(doping_from_theta(theta)),
-                    coords,
+                    coords * 1e-6,
                     iteration,
                     geometry=geometry,
                     output_dir=output_dir,
@@ -234,7 +245,7 @@ def _run_pipeline(
         rho_initial=rho_initial,
         rho_opt=rho_opt,
         history=history,
-        mesh_coords=coords,
+        mesh_coords=coords * 1e-6,
         geometry=geometry,
         pipeline_fn=partial(
             pipeline_fn,

@@ -13,6 +13,10 @@ using Gmsh
 # (SolverControl, System, ...). All VoronoiFVM access stays qualified.
 import VoronoiFVM
 
+# gyptis authors the shared Gmsh mesh in micrometres. ChargeTransport uses
+# centimetres, as does the 1D fallback (1e-4 cm = 1 µm).
+const MICROMETRES_TO_CENTIMETRES = 1e-4
+
 # ExtendableSparse is a transitive dep (via VoronoiFVM), not in Project.toml,
 # so it can only be reached through qualified access.
 const ExtendableSparse = VoronoiFVM.ExtendableSparse
@@ -30,11 +34,81 @@ function generate_1d_mesh(n_nodes)
     return grid
 end
 
-# Build grid + ChargeTransport system for a doping profile.
+# Return dense ExtendableGrids region ids for named Gmsh physical groups.
+function region_ids(mesh_path, dim)
+    ids = Dict{String, Int}()
+    gmsh.initialize()
+    try
+        gmsh.open(mesh_path)
+        for (id, (_, tag)) in enumerate(gmsh.model.getPhysicalGroups(dim))
+            ids[gmsh.model.getPhysicalName(dim, tag)] = id
+        end
+    finally
+        gmsh.clear()
+        gmsh.finalize()
+    end
+    return ids
+end
+
+edgekey(a, b) = a < b ? (a, b) : (b, a)
+
+"""Restrict a full optical mesh to silicon and reconstruct its exterior faces."""
+function silicon_grid(full, silicon_ids, anode_breg, cathode_breg)
+    selected = findall(region -> region in silicon_ids, full[CellRegions])
+    isempty(selected) && error("shared mesh has no silicon cells")
+    parent_cells = full[CellNodes][:, selected]
+    parent_to_local = zeros(Int64, size(full[Coordinates], 2))
+    node_parents = Int64[]
+    for parent_node in parent_cells
+        if parent_to_local[parent_node] == 0
+            push!(node_parents, parent_node)
+            parent_to_local[parent_node] = length(node_parents)
+        end
+    end
+    cells = Int64[parent_to_local[parent_node] for parent_node in parent_cells]
+
+    contact_segments = Tuple{Int64, Float64, Float64, Float64}[]
+    for ibface in eachindex(full[BFaceRegions])
+        bregion = full[BFaceRegions][ibface]
+        if bregion == anode_breg || bregion == cathode_breg
+            nodes = full[BFaceNodes][:, ibface]
+            xy = full[Coordinates][:, nodes]
+            push!(contact_segments, (bregion, minimum(xy[1, :]), maximum(xy[1, :]), xy[2, 1]))
+        end
+    end
+
+    face_counts = Dict{Tuple{Int64, Int64}, Int64}()
+    for cell in eachcol(cells)
+        for (a, b) in ((cell[1], cell[2]), (cell[2], cell[3]), (cell[3], cell[1]))
+            key = edgekey(a, b)
+            face_counts[key] = get(face_counts, key, 0) + 1
+        end
+    end
+    exterior = sort!([key for (key, count) in face_counts if count == 1])
+    bfaces = reduce(hcat, (Int64[key[1], key[2]] for key in exterior))
+    bfaceregions = ones(Int64, length(exterior))
+    for (i, local_edge) in enumerate(exterior)
+        parent_nodes = node_parents[[local_edge[1], local_edge[2]]]
+        xy = full[Coordinates][:, parent_nodes]
+        for (bregion, xmin, xmax, y) in contact_segments
+            overlaps = max(minimum(xy[1, :]), xmin) <= min(maximum(xy[1, :]), xmax) + 1e-12
+            if overlaps && all(abs.(xy[2, :] .- y) .< 1e-12)
+                bfaceregions[i] = bregion
+            end
+        end
+    end
+
+    grid = simplexgrid(
+        full[Coordinates][:, node_parents], cells, ones(Int64, size(cells, 2)), bfaces, bfaceregions,
+    )
+    grid[NodeParents] = node_parents
+    return grid
+end
+
+# Build grid + ChargeTransport system for a full shared-mesh doping profile.
 #
-# Returns (ctsys, data, cathode_breg, n_bregions). Silicon parameters at
-# 300 K, no bulk recombination, Ohmic contacts on anode/cathode boundary
-# regions (from the Gmsh physical groups when a mesh file is given).
+# Returns (ctsys, data, cathode_breg, n_bregions, node_parents). ``node_parents``
+# maps silicon-grid nodes back to the full gyptis/Gmsh node order.
 function build_ct_system(doping, mesh_path)
     n_nodes = length(doping)
 
@@ -46,22 +120,30 @@ function build_ct_system(doping, mesh_path)
         # coordinates (and simplexgrid() does not forward a Tc kwarg),
         # which makes the VoronoiFVM system Float32 — 1e-10 Newton
         # tolerances are then unreachable and every solve fails.
-        grid = ExtendableGrids.simplexgrid_from_gmsh(mesh_path; Tc = Float64)
-        contacts = get_breking_contacts(mesh_path)
-        if haskey(contacts, :anode)
-            anode_breg = contacts[:anode]
-        end
-        if haskey(contacts, :cathode)
-            cathode_breg = contacts[:cathode]
-        end
+        full = ExtendableGrids.simplexgrid_from_gmsh(mesh_path; Tc = Float64, Ti = Int64)
+        size(full[Coordinates], 2) == n_nodes || error(
+            "doping array length ($n_nodes) does not match shared mesh node count $(size(full[Coordinates], 2))",
+        )
+        cell_ids = region_ids(mesh_path, 2)
+        bface_ids = region_ids(mesh_path, 1)
+        silicon_ids = Int[
+            cell_ids[name]
+            for name in ("slab", "rib_silicon")
+            if haskey(cell_ids, name)
+        ]
+        isempty(silicon_ids) && error("shared mesh has neither slab nor rib_silicon group")
+        anode_breg = bface_ids["contact_anode"]
+        cathode_breg = bface_ids["contact_cathode"]
+        grid = silicon_grid(full, silicon_ids, anode_breg, cathode_breg)
+        grid[Coordinates] .*= MICROMETRES_TO_CENTIMETRES
+        node_parents = Int.(grid[NodeParents])
     else
         grid = generate_1d_mesh(n_nodes)
+        node_parents = collect(1:n_nodes)
     end
 
     grid_nnodes = size(grid[Coordinates], 2)
-    if grid_nnodes != n_nodes
-        error("doping array length ($n_nodes) does not match mesh node count ($grid_nnodes)")
-    end
+    silicon_doping = doping[node_parents]
 
     data = Data(grid, 2)
     data.modelType = Stationary
@@ -110,12 +192,12 @@ function build_ct_system(doping, mesh_path)
 
     paramsnodal = ParamsNodal(grid, 2)
     for i in 1:grid_nnodes
-        paramsnodal.doping[i] = doping[i]
+        paramsnodal.doping[i] = silicon_doping[i]
     end
     data.paramsnodal = paramsnodal
 
     ctsys = System(grid, data, unknown_storage = :dense)
-    return ctsys, data, cathode_breg, n_bregions
+    return ctsys, data, cathode_breg, n_bregions, node_parents
 end
 
 # Update a reusable system without rebuilding its mesh/material data.
@@ -241,8 +323,11 @@ function make_solver_control()
     control = ChargeTransport.SolverControl()
     control.abstol = 1e-10
     control.reltol = 1e-10
-    control.maxiters = 50
-    control.max_round = 5
+    control.maxiters = 100
+    # ``max_round`` bounds VoronoiFVM's damping rounds.  Limiting it to five
+    # makes the sharp P/N profiles reached by later MMA iterations fail before
+    # their Newton residual can settle.  This is the package default.
+    control.max_round = 1_000
     control.verbose = false
     return control
 end
