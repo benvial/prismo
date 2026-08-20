@@ -341,16 +341,26 @@ end
 # A single Newton step from equilibrium fails to converge at large reverse
 # bias (VoronoiFVM.ConvergenceError at -5 V, ticket 17). Ramp the cathode
 # contact voltage, warm-starting each solve from the previous one. Newton's
-# iteration count grows with the voltage step, so adapt: start with 0.5 V
-# steps, quarter the step on ConvergenceError, regrow cautiously on success.
+# iteration count grows with the voltage step, so adapt: halve the step on
+# ConvergenceError and regrow cautiously on success.
+#
+# The schedule constants are set by the hardest part of the ramp, which at
+# depletion-modulator doping (|N| ~ 3e17 cm^-3) is depletion-region formation
+# between 0 and -0.4 V. A 0.5 V start with a 1e-3 floor gives up there
+# (AssemblyError from Boltzmann overflow at every bias past -0.5 V); starting
+# at 0.1 V and allowing the step down to 1e-6 crosses it and reaches -5 V
+# (ticket 06). Halving rather than quartering keeps the recovered step close
+# to the largest one that still converges, so the retry count stays bounded.
+const CT_BIAS_STEP_INITIAL = 0.1
+const CT_BIAS_STEP_MIN = 1e-6
+const CT_BIAS_MAX_FAILURES = 400  # hard bound on retries: never hang (ticket 17)
+
 function solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregions)
     if abs(bias_voltage) == 0.0 || cathode_breg > n_bregions
         return u0
     end
 
-    step = 0.5
-    min_step = 1e-3
-    max_failures = 100  # hard bound on retries: never hang (ticket 17)
+    step = CT_BIAS_STEP_INITIAL
     failures = 0
     v_applied = 0.0
     sol = u0
@@ -361,15 +371,15 @@ function solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregion
         try
             sol = solve(ctsys; inival = sol, control = control)
             v_applied = v_next
-            step = min(step * 2, 0.5)
+            step = min(step * 1.5, CT_BIAS_STEP_INITIAL)
         catch e
             # ConvergenceError: Newton exceeded maxiters.
             # AssemblyError: NaN in flux assembly (Boltzmann overflow during
             # a Newton overshoot). Both are retried with a smaller step.
             if (e isa VoronoiFVM.ConvergenceError || e isa VoronoiFVM.AssemblyError) &&
-               failures < max_failures && step / 4 >= min_step
+               failures < CT_BIAS_MAX_FAILURES && step / 2 >= CT_BIAS_STEP_MIN
                 failures += 1
-                step /= 4
+                step /= 2
                 set_contact!(ctsys, cathode_breg, Δu = v_applied)
             else
                 rethrow()

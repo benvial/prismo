@@ -15,6 +15,7 @@ from prismo.pipeline import (  # noqa: E402
     _CT_MESH_MOUNT,
     DOPING_LOG10_SPAN,
     DOPING_REFERENCE_CM3,
+    _JUNCTION_SEED_THETA,
     REVERSE_BIAS_V,
     PipelineComponents,
     _build_design_epsilon,
@@ -93,6 +94,18 @@ class TestDopingFromTheta:
         assert 9e18 <= ceiling <= 1e20
         assert float(doping_from_theta(jnp.asarray(-1.0))) == -ceiling
 
+    def test_seed_is_a_depletion_modulator_operating_point(self):
+        """The seeded junction dopes into the partially-depleted regime.
+
+        At |N| ~ 3e15 the -5 V depletion width (~1.6 um) far exceeds the 500 nm
+        rib, so the rib depletes fully and the reverse-bias carrier field carries
+        no bulk-doping signal for a gradient to validate against (ticket 06).
+        The seed must land in the 1e17-1e18 band a real carrier-depletion
+        modulator works in.
+        """
+        seeded = abs(float(doping_from_theta(jnp.asarray(_JUNCTION_SEED_THETA))))
+        assert 1e17 <= seeded <= 1e18
+
     def test_monotonic_in_theta(self):
         """More positive theta always dopes more n-type; no folding."""
         doping = np.asarray(doping_from_theta(jnp.linspace(-1.0, 1.0, 101)))
@@ -107,7 +120,7 @@ class TestDopingFromTheta:
     def test_grad_correct_at_junction(self):
         """At theta=0 (the junction) grad equals the C^1 slope, not zero.
 
-        The map is differentiable through zero with slope 1e14*ln10*span; a naive
+        The map is differentiable through zero with slope 1e17*ln10*span; a naive
         sign*abs autodiff collapses it to 0, so the custom JVP is what makes the
         crossing the optimizer moves honest.
         """
@@ -116,7 +129,7 @@ class TestDopingFromTheta:
         np.testing.assert_allclose(got, expected, rtol=1e-6)
 
     def test_grad_matches_analytic_away_from_kink(self):
-        """dN/dtheta = 1e14 * ln10 * span * 10^(span*|theta|) off the crossing."""
+        """dN/dtheta = 1e17 * ln10 * span * 10^(span*|theta|) off the crossing."""
         for t in (-1.0, -0.4, 0.4, 1.0):
             expected = (
                 DOPING_REFERENCE_CM3
@@ -893,7 +906,7 @@ class TestPipelineWithFilter:
 
 
 class TestPipelineDopingMapping:
-    """The signed doping map N(theta) = sign(theta)*1e14*(10^(5|theta|)-1)."""
+    """The signed doping map N(theta) = sign(theta)*1e17*(10^(2|theta|)-1)."""
 
     def test_range(self):
         n_nodes = 10

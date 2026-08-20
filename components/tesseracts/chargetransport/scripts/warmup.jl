@@ -60,7 +60,6 @@ function exercise(doping, mesh_path, bias_voltage)
         ctsys,
         data,
         sol,
-        u0,
         bias_voltage,
         cathode_breg,
         n_bregions,

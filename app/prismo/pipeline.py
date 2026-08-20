@@ -42,15 +42,22 @@ _COMPONENTS_DIR = Path(__file__).resolve().parents[2] / "components" / "tesserac
 # largest reverse-bias-stable concentration on the shared ChargeTransport mesh,
 # within the B/P solid-solubility and Boltzmann-statistics window. Code = comment
 # = glossary (CONTEXT.md).
-DOPING_REFERENCE_CM3 = 1e14
-DOPING_LOG10_SPAN = 5.0
+#
+# The reference is the *depletion-modulator* concentration, not a near-intrinsic
+# one: at |N| ~ 3e15 the -5 V depletion width (~1.6 um) swamps the 500 nm x 220 nm
+# rib, so the rib is fully depleted and the reverse-bias carrier field carries no
+# bulk-doping signal at all (ticket 06). Centring the span on 1e17 keeps the seeded
+# junction partially depleted -- the regime a real carrier-depletion modulator works
+# in -- while the |theta|=1 rail still lands at ~1e19.
+DOPING_REFERENCE_CM3 = 1e17
+DOPING_LOG10_SPAN = 2.0
 
 
 @jax.custom_jvp
 def doping_from_theta(theta: jax.Array) -> jax.Array:
     """Map the signed design field ``theta`` to signed net doping in ``cm^-3``.
 
-    ``N(theta) = sign(theta) * 1e14 * (10^(span*|theta|) - 1)``. The map is
+    ``N(theta) = sign(theta) * 1e17 * (10^(span*|theta|) - 1)``. The map is
     zero-referenced (``N(0) = 0``) and antisymmetric, so a single ``theta``
     sign-crossing is a single P/N junction and no node can counterdope.
     """
@@ -65,10 +72,10 @@ def doping_from_theta(theta: jax.Array) -> jax.Array:
 def _doping_from_theta_jvp(
     primals: tuple[jax.Array], tangents: tuple[jax.Array]
 ) -> tuple[jax.Array, jax.Array]:
-    """Analytic derivative ``dN/dtheta = 1e14 * ln10 * span * 10^(span*|theta|)``.
+    """Analytic derivative ``dN/dtheta = 1e17 * ln10 * span * 10^(span*|theta|)``.
 
     The map is C^1 through the junction: the derivative is even and continuous,
-    with the true slope ``1e14 * ln10 * span`` at ``theta=0``. Autodiff of the
+    with the true slope ``1e17 * ln10 * span`` at ``theta=0``. Autodiff of the
     raw ``sign(theta) * |theta|`` form collapses to zero there (``sign(0)**2``),
     so the crossing -- exactly where the optimizer moves the junction -- is given
     its correct one-sided limit here.
@@ -87,8 +94,9 @@ def _doping_from_theta_jvp(
     return doping_from_theta(theta), derivative * theta_dot
 
 
-# Initial junction magnitude for the signed design field: moderate, non-degenerate
-# doping the reverse-bias solve converges on, well inside the [-1, 1] bounds.
+# Initial junction magnitude for the signed design field: |N| ~ 3e17 cm^-3 --
+# the partially-depleted depletion-modulator operating point, non-degenerate,
+# reverse-bias convergent, and well inside the [-1, 1] bounds.
 _JUNCTION_SEED_THETA = 0.3
 
 
