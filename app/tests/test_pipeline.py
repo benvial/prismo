@@ -658,15 +658,13 @@ class TestContainerPipeline:
         forward/VJP built by ``build_gyptis_components`` and the transfer wiring
         ticket 08 adds.
         """
-        # Shared mesh: a unit square split into two silicon triangles.
+        # Shared mesh: a unit square split into two silicon triangles. Each design
+        # cell is one of those triangles, its vertices are shared-mesh nodes.
         coords = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=float)
         silicon_triangles = np.array([[0, 1, 2], [1, 3, 2]], dtype=np.intp)
-        # Two design cells, one interior to each triangle (distinct node mixes).
-        design_centroids = np.array([[0.25, 0.25], [0.75, 0.75]], dtype=float)
+        design_vertices = coords[silicon_triangles]  # (2, 3, 2)
         design_transfer = jnp.asarray(
-            build_mesh_transfer_operator(
-                coords, silicon_triangles, design_centroids
-            ).dense()
+            build_mesh_transfer_operator(coords, design_vertices).dense()
         )
         assert design_transfer.shape == (2, 4)  # design cells <- shared-mesh nodes
 
@@ -731,46 +729,39 @@ class TestContainerPipeline:
 
 
 class TestBuildDesignTransfer:
-    """The container setup assembles the real mesh-transfer matrix (ticket 08)."""
+    """The container setup assembles the real mesh-transfer matrix (ticket 05)."""
 
-    def test_assembles_real_operator_from_centroids_and_triangulation(
-        self, monkeypatch
-    ):
+    def test_assembles_real_operator_from_design_cell_vertices(self):
         """The production helper drives the real ``build_mesh_transfer_operator``.
 
-        Both static inputs come from live sources -- centroids through the
-        component seam, the silicon triangulation from the mesh reader -- so
-        this covers the real assembly the container run performs (only the
-        gmsh-dependent triangulation read is stubbed).
+        The design-cell vertices come from the gyptis backend through the
+        component seam; on the shared mesh each cell is a triangle whose vertices
+        are shared-mesh nodes, so this covers the exact-restriction assembly the
+        container run performs.
         """
-        import prismo.waveguide_mesh as mesh_module
-
         coords = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=float)
         triangles = np.array([[0, 1, 2], [1, 3, 2]], dtype=np.intp)
-        monkeypatch.setattr(
-            mesh_module, "read_mesh_silicon_triangulation", lambda _: triangles
-        )
         components = PipelineComponents(
             chargetransport=None,
             gyptis=None,
             gyptis_background=None,
-            design_cell_centroids=lambda: np.array([[0.25, 0.25], [0.75, 0.75]]),
+            design_cell_vertices=lambda: coords[triangles],
         )
 
-        transfer = build_design_transfer(components, coords, "unused.msh")
+        transfer = build_design_transfer(components, coords)
 
         assert transfer.shape == (2, 4)  # design cells <- shared-mesh nodes
         # Partition of unity: each design cell's weights sum to one, so a uniform
         # nodal field maps to a uniform design field (keyed to the shared mesh).
         np.testing.assert_allclose(np.asarray(transfer).sum(axis=1), 1.0)
 
-    def test_requires_a_centroid_reader(self):
+    def test_requires_a_vertex_reader(self):
         """Without a gyptis backend there is no design geometry to key against."""
         components = PipelineComponents(
             chargetransport=None, gyptis=None, gyptis_background=None
         )
-        with pytest.raises(RuntimeError, match="design-cell centroids"):
-            build_design_transfer(components, np.zeros((3, 2)), "unused.msh")
+        with pytest.raises(RuntimeError, match="design-cell"):
+            build_design_transfer(components, np.zeros((3, 2)))
 
 
 class TestComponentTiming:

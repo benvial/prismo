@@ -12,20 +12,24 @@ runner = CliRunner()
 
 
 def _container_components(centroids: np.ndarray):
-    """A minimal bundle exposing the design-cell centroid seam.
+    """A minimal bundle exposing the design-cell geometry seam.
 
-    The container pipeline reads centroids through
-    ``PipelineComponents.design_cell_centroids`` to build the mesh-transfer
+    The container pipeline reads design-cell vertices through
+    ``PipelineComponents.design_cell_vertices`` to build the mesh-transfer
     operator; the solve components are unused when ``optimize_doping`` is
-    stubbed, so they can be ``None``.
+    stubbed, so they can be ``None``. Vertices are faked (the transfer build is
+    stubbed in these tests), one degenerate triangle per centroid.
     """
     from prismo.pipeline import PipelineComponents
 
+    centroids = np.asarray(centroids, dtype=float)
+    vertices = np.repeat(centroids[:, None, :], 3, axis=1)
     return PipelineComponents(
         chargetransport=None,
         gyptis=None,
         gyptis_background=None,
-        design_cell_centroids=lambda: np.asarray(centroids, dtype=float),
+        design_cell_centroids=lambda: centroids,
+        design_cell_vertices=lambda: vertices,
     )
 
 

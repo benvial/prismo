@@ -160,7 +160,7 @@ def _run_pipeline(
         # assembled from live sources keyed to the shared mesh's nodes.
         if components is None:
             raise RuntimeError("Container pipeline requires live components")
-        design_transfer = build_design_transfer(components, coords, actual_mesh)
+        design_transfer = build_design_transfer(components, coords)
         typer.echo(
             f"      Mesh-transfer operator: {design_transfer.shape[0]} design cells "
             f"<- {n_nodes} nodes"
