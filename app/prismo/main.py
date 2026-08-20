@@ -96,6 +96,7 @@ def _run_pipeline(
         build_design_transfer,
         doping_from_theta,
         seed_signed_junction,
+        vpi_lpi_v_cm,
     )
     from prismo.pipeline import pipeline as pipeline_fn
     from prismo.waveguide_mesh import (
@@ -201,7 +202,13 @@ def _run_pipeline(
         )
         typer.echo(f"      Optimization complete: {len(history)} iterations")
         if history:
-            typer.echo(f"      Final Delta_n_eff = {history[-1]['delta_n_eff']:+.6e}")
+            final_delta_neff = history[-1]["delta_n_eff"]
+            typer.echo(f"      Final Delta_n_eff = {final_delta_neff:+.6e}")
+            # VπLπ headline (V·cm): the field-standard modulation efficiency,
+            # reported from Δneff at the fixed -5 V bias (smaller |VπLπ| better).
+            typer.echo(
+                f"      VpiLpi = {vpi_lpi_v_cm(final_delta_neff):+.4e} V·cm"
+            )
     except OptimizationCancelled:
         typer.echo("      Optimization cancelled by user.")
         return

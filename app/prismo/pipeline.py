@@ -850,6 +850,29 @@ def default_components() -> PipelineComponents:
 # 1 cm^-3 = 1e6 m^-3: ChargeTransport output -> Soref-Bennett input.
 _CM3_TO_M3 = 1e6
 
+# Fixed reverse-bias operating point and free-space wavelength for the objective
+# and the VπLπ modulation-efficiency headline (ticket 03). Δneff is evaluated
+# between 0 V and REVERSE_BIAS_V; λ matches the gyptis solver's 1.55 µm C-band
+# point (WAVELENGTH in the gyptis tesseract_api).
+REVERSE_BIAS_V = -5.0
+_WAVELENGTH_CM = 1.55e-4  # 1.55 µm in cm
+
+
+def vpi_lpi_v_cm(delta_neff: float | jax.Array) -> float:
+    """Half-wave voltage-length product VπLπ [V·cm] from signed Δneff.
+
+    A carrier-depletion phase modulator accrues ``φ = (2π/λ)·Δneff·L``, so the
+    length for a π shift at the fixed reverse bias is ``Lπ = λ/(2·Δneff)`` and
+    ``VπLπ = |V_bias|·λ/(2·Δneff)``. This is the field-standard modulation-
+    efficiency headline (smaller ``|VπLπ|`` is better); it is *reported*, not
+    optimized -- signed Δneff is the optimized proxy. VπLπ carries Δneff's sign
+    (a wrong-polarity optimum reads negative) and diverges as Δneff → 0.
+    """
+    dneff = float(delta_neff)
+    if dneff == 0.0:
+        return float("inf")
+    return abs(REVERSE_BIAS_V) * _WAVELENGTH_CM / (2.0 * dneff)
+
 
 # -- Soref-Bennett (pure JAX) ----------------------------------------------------
 
@@ -940,7 +963,10 @@ def pipeline(
             in-process components built from the local tesseract apis.
 
     Returns:
-        Smooth positive effective-index shift magnitude between 0 V and -5 V.
+        Signed effective-index shift ``Δneff = Re[neff(-5V)] - Re[neff(0)]``.
+        Smooth and differentiable through zero; depletion (the physical bias
+        response) makes it positive. Report ``VπLπ`` from it via
+        :func:`vpi_lpi_v_cm`.
     """
     if background_epsilon is None:
         background_epsilon = _DEFAULT_BACKGROUND_EPSILON
@@ -962,7 +988,7 @@ def pipeline(
     n0, p0 = components.chargetransport(doping, 0.0, mesh_ref)
 
     # 4. ChargeTransport at reverse bias (-5 V)
-    n1, p1 = components.chargetransport(doping, -5.0, mesh_ref)
+    n1, p1 = components.chargetransport(doping, REVERSE_BIAS_V, mesh_ref)
 
     # CT reports carrier densities in cm^-3 (same unit system as the doping
     # input); Soref-Bennett consumes m^-3 per CarrierDensityField. Convert
@@ -989,6 +1015,8 @@ def pipeline(
     neff_0 = jnp.sqrt(jnp.maximum(neff_sq_0, 0.0))
     neff_1 = jnp.sqrt(jnp.maximum(neff_sq_1, 0.0))
 
-    delta_neff = neff_1 - neff_0
-    # Keep a positive, differentiable objective when the mode shift is zero.
-    return jnp.hypot(delta_neff, jnp.asarray(1e-15, dtype=delta_neff.dtype))
+    # Signed Δneff = Re[neff(-5V)] - Re[neff(0)]: the honest objective. Depletion
+    # raises the index, so a physical optimum is positive; the sign is physically
+    # determined, so the optimizer maximizes Δneff directly -- no epsilon fudge,
+    # no magnitude folding that would reward a wrong-polarity mode shift.
+    return neff_1 - neff_0

@@ -17,6 +17,7 @@ from prismo.pipeline import (  # noqa: E402
     _CT_MESH_MOUNT,
     DOPING_LOG10_SPAN,
     DOPING_REFERENCE_CM3,
+    REVERSE_BIAS_V,
     PipelineComponents,
     _build_design_epsilon,
     _container_mesh_ref,
@@ -29,6 +30,7 @@ from prismo.pipeline import (  # noqa: E402
     init_tesseract_containers,
     pipeline,
     read_gyptis_design_cell_centroids,
+    vpi_lpi_v_cm,
 )
 from prismo.soref_bennett import soref_bennett as _sb_numpy  # noqa: E402
 from prismo_shared.schemas import CarrierDensityField, MeshRef  # noqa: E402
@@ -42,6 +44,30 @@ def _components_with(**overrides) -> PipelineComponents:
 
 
 _DOPING_CEILING = DOPING_REFERENCE_CM3 * (10.0**DOPING_LOG10_SPAN - 1.0)
+
+
+class TestVpiLpi:
+    """VπLπ [V·cm] modulation-efficiency headline from signed Δneff (ticket 03)."""
+
+    _WAVELENGTH_CM = 1.55e-4  # 1.55 µm; must match the gyptis solver point.
+
+    def test_matches_closed_form(self):
+        """VπLπ = |V_bias|·λ / (2·Δneff)."""
+        delta_neff = 1e-4
+        expected = abs(REVERSE_BIAS_V) * self._WAVELENGTH_CM / (2.0 * delta_neff)
+        assert vpi_lpi_v_cm(delta_neff) == pytest.approx(expected)
+
+    def test_carries_the_sign_of_delta_neff(self):
+        """A wrong-polarity (negative) Δneff reports a negative VπLπ."""
+        assert vpi_lpi_v_cm(-1e-4) == pytest.approx(-vpi_lpi_v_cm(1e-4))
+
+    def test_smaller_is_better(self):
+        """A larger |Δneff| (more efficient) is a smaller |VπLπ|."""
+        assert abs(vpi_lpi_v_cm(2e-4)) < abs(vpi_lpi_v_cm(1e-4))
+
+    def test_diverges_at_zero_shift(self):
+        """Δneff = 0 (no modulation) is infinite VπLπ, not a crash."""
+        assert vpi_lpi_v_cm(0.0) == float("inf")
 
 
 class TestDopingFromTheta:
@@ -308,12 +334,26 @@ class TestPipelineStub:
         np.testing.assert_allclose(received[1], [-_DOPING_CEILING, _DOPING_CEILING])
         assert float(result) > 0.0
 
-    def test_effective_index_objective_is_positive_for_either_shift_direction(
-        self,
-    ):
-        """Optimization maximizes phase-shift magnitude, not its mode-sign."""
+    def test_objective_is_signed_by_physical_bias_response(self):
+        """Signed Δneff: depletion reads positive, injection negative.
 
-        def fake_ct(doping, bias_voltage, mesh_ref=None):
+        No ``hypot`` magnitude fold anymore (ticket 03). The reverse-bias sign
+        is physically determined -- depletion raises the index (+Δneff) and
+        carrier injection lowers it (-Δneff) -- so the optimizer maximizes the
+        signed value directly rather than rewarding either mode-shift direction.
+        """
+
+        def depleting_ct(doping, bias_voltage, mesh_ref=None):
+            # Carriers present at 0 V, swept out under reverse bias.
+            carriers = jnp.where(
+                bias_voltage == 0.0,
+                jnp.full_like(doping, 1e24),
+                jnp.zeros_like(doping),
+            )
+            return carriers, carriers
+
+        def injecting_ct(doping, bias_voltage, mesh_ref=None):
+            # Opposite (non-physical) response: carriers appear under bias.
             carriers = jnp.where(
                 bias_voltage == 0.0,
                 jnp.zeros_like(doping),
@@ -321,15 +361,22 @@ class TestPipelineStub:
             )
             return carriers, carriers
 
-        result = pipeline(
+        depleting = pipeline(
             jnp.asarray([0.25, 0.25]),
-            components=_components_with(chargetransport=fake_ct),
+            components=_components_with(chargetransport=depleting_ct),
+        )
+        injecting = pipeline(
+            jnp.asarray([0.25, 0.25]),
+            components=_components_with(chargetransport=injecting_ct),
         )
 
-        assert float(result) > 0.0
+        # Opposite physical responses land on opposite sides of zero -- the old
+        # hypot fold would have made both positive.
+        assert float(depleting) > 0.0
+        assert float(injecting) < 0.0
 
     def test_effective_index_objective_has_zero_gradient_at_zero_shift(self):
-        """The positive phase-shift objective stays differentiable at zero."""
+        """The signed objective stays finite and differentiable at zero shift."""
 
         def fake_ct(doping, bias_voltage, mesh_ref=None):
             return doping, doping
@@ -406,6 +453,22 @@ class TestPipelineStub:
     def test_forward_returns_zero_pre_container(self, rho):
         result = pipeline(rho)
         np.testing.assert_allclose(result, 0.0, atol=1e-12)
+
+    def test_zero_shift_is_exactly_zero_not_floored(self):
+        """No ``hypot(_, 1e-15)`` fudge: a null shift is exactly 0.0 (ticket 03).
+
+        Equal carriers at both biases give an identical permittivity field, so
+        the signed objective is exactly zero -- not lifted to a ~1e-15 floor.
+        """
+
+        def flat_ct(doping, bias_voltage, mesh_ref=None):
+            return doping, doping
+
+        result = pipeline(
+            jnp.asarray([0.25, 0.5]),
+            components=_components_with(chargetransport=flat_ct),
+        )
+        assert float(result) == 0.0
 
     def test_gradient_is_finite(self, rho):
         grad = jax.grad(pipeline)(rho)

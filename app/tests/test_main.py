@@ -88,6 +88,9 @@ def test_cli_run_synthetic() -> None:
     )
     assert result.exit_code == 0, result.output
     assert "Done" in result.stdout
+    # The optimum reports Δneff and the VπLπ efficiency headline (ticket 03).
+    assert "Delta_n_eff" in result.stdout
+    assert "VpiLpi" in result.stdout
 
 
 def test_container_run_seeds_signed_junction_for_optimization(
@@ -174,7 +177,7 @@ def test_container_run_rejects_near_zero_objective(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """The positive smoothing floor cannot pass a zero-physics container run."""
+    """A negligible (near-zero) Δneff fails the container validity gate."""
     import prismo.main as main_module
     import prismo.optimizer as optimizer_module
     import prismo.waveguide_mesh as mesh_module
