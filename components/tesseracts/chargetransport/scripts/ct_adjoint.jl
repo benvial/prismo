@@ -5,7 +5,6 @@ const CT_SPEC_E = 1
 const CT_SPEC_H = 2
 const CT_DOF_PSI = 3
 const CT_TINY_PENALTY_VALUE = 1e-10
-const CT_DIRICHLET_PENALTY = 1e30
 
 ct_dof_index(nspec, node, spec) = (node - 1) * nspec + spec
 
@@ -76,12 +75,6 @@ function for_each_boundary_node(callback, grid, nodefactors)
     return nothing
 end
 
-function contact_boundary_regions(data, grid)
-    return unique([
-        ibreg for ibreg in grid[BFaceRegions] if data.boundaryType[ibreg] == OhmicContact
-    ])
-end
-
 function explicit_doping_contraction(
     ctsys,
     data,
@@ -117,34 +110,6 @@ function explicit_doping_contraction(
     return gradient
 end
 
-function biased_boundary_cotangent(ctsys, data, adjoint)
-    grid = ctsys.fvmsys.grid
-    nspec = VoronoiFVM.num_species(ctsys.fvmsys)
-    boundary_cotangent = zeros(Float64, length(data.params.bψEQ))
-    nodefactors = VoronoiFVM.bfacenodefactors(ctsys.fvmsys)
-    for_each_boundary_node(grid, nodefactors) do inode, _, ibreg
-        if data.boundaryType[ibreg] == OhmicContact
-            psi_idx = ct_dof_index(nspec, inode, CT_DOF_PSI)
-            boundary_cotangent[ibreg] -= CT_DIRICHLET_PENALTY * adjoint[psi_idx]
-        end
-    end
-    return boundary_cotangent
-end
-
-function equilibrium_boundary_adjoint(ctsys, data, equilibrium_sol, boundary_cotangent)
-    grid = ctsys.fvmsys.grid
-    nspec = VoronoiFVM.num_species(ctsys.fvmsys)
-    configure_equilibrium!(ctsys, data)
-    equilibrium_jacobian = residual_jacobian(ctsys, equilibrium_sol)
-    rhs = zeros(Float64, size(equilibrium_jacobian, 1))
-    for ibreg in contact_boundary_regions(data, grid)
-        inode = equilibrium_bpsi_parent_node(grid, ibreg)
-        psi_idx = ct_dof_index(nspec, inode, CT_DOF_PSI)
-        rhs[psi_idx] -= boundary_cotangent[ibreg]
-    end
-    return equilibrium_jacobian' \ rhs
-end
-
 function configure_biased_state!(ctsys, data, bias_voltage, cathode_breg, n_bregions)
     data.calculationType = ChargeTransport.OutOfEquilibrium
     if cathode_breg <= n_bregions
@@ -157,7 +122,6 @@ function compute_doping_vjp(
     ctsys,
     data,
     sol,
-    equilibrium_sol,
     bias_voltage,
     cathode_breg,
     n_bregions,
@@ -178,21 +142,17 @@ function compute_doping_vjp(
         )
     end
 
+    # Doping enters the biased solve only through the local Poisson source, so
+    # the design gradient is the biased adjoint's ψ-component contracted against
+    # that source (explicit_doping_contraction). The retained equilibrium contact
+    # quantities (bψEQ, bDensityEQ) also depend on doping, but only at the ohmic
+    # contact nodes -- and the design θ modulates the rib interior, not the
+    # contacts, so their doping-sensitivity is zero on the design cells. The
+    # separate equilibrium-boundary adjoint that accounted for it was therefore a
+    # no-op on the design gradient AND singular on the unified mesh (it refactors
+    # a reconfigured InEquilibrium Jacobian). Ticket 06's adjoint-vs-FD proves the
+    # gradient is correct with only the direct term; the boundary term is dropped.
     configure_biased_state!(ctsys, data, bias_voltage, cathode_breg, n_bregions)
     biased_adjoint = carrier_adjoint(ctsys, sol, data, cot_n, cot_p)
-    direct_gradient = explicit_doping_contraction(ctsys, data, biased_adjoint)
-
-    boundary_cotangent = biased_boundary_cotangent(ctsys, data, biased_adjoint)
-    equilibrium_adjoint = equilibrium_boundary_adjoint(
-        ctsys,
-        data,
-        equilibrium_sol,
-        boundary_cotangent,
-    )
-    return direct_gradient + explicit_doping_contraction(
-        ctsys,
-        data,
-        equilibrium_adjoint;
-        include_equilibrium_robin = true,
-    )
+    return explicit_doping_contraction(ctsys, data, biased_adjoint)
 end

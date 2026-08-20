@@ -186,7 +186,6 @@ function process_vjp!(state, request)
         state.ctsys,
         state.data,
         deepcopy(state.forward_solutions[bias_voltage]),
-        deepcopy(state.equilibrium_sol),
         bias_voltage,
         state.cathode_breg,
         state.n_bregions,
