@@ -42,7 +42,7 @@ def optimize_doping(
     H_sum: jax.Array | None = None,
     mesh_coords: np.ndarray | None = None,
     mesh_path: str | Path | None = None,
-    r_min: float = 50e-9,
+    r_min: float = 0.05,
     *,
     max_iter: int = 200,
     ftol_rel: float = 1e-3,
@@ -70,7 +70,8 @@ def optimize_doping(
             filter matrix.
         mesh_path: Path to a ``.msh`` file for building the filter matrix
             (requires ``gmsh``).
-        r_min: Filter radius in meters (default 50 nm).
+        r_min: Filter radius in micrometres -- the unit the shared mesh's
+            coordinates are authored in (default 0.05, i.e. 50 nm).
         max_iter: Maximum MMA iterations.
         ftol_rel: Relative tolerance on the objective for early stopping.
         min_mma_evaluations: Minimum objective evaluations completed by MMA

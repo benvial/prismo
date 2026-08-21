@@ -532,8 +532,12 @@ def _shared_mesh_lateral_junction() -> tuple[Path, np.ndarray]:
     """Real 2D waveguide mesh + a lateral +/-1e19 junction in gmsh node order.
 
     The doping is contiguous in space (left half donors, right half acceptors)
-    but flips sign 16 times along the raw node index -- exactly the field that
+    but flips sign ten times along the raw node index -- exactly the field that
     scrambles into a many-junction line on the 1D fallback device.
+
+    Both files are regenerated from ``prismo.waveguide_mesh``, so the fixture
+    carries the shared-mesh contract this component reads under: micrometre
+    coordinates and the ``slab`` / ``rib_silicon`` silicon groups (ticket 15).
     """
     mesh = _FIXTURES / "waveguide.msh"
     doping = np.load(_FIXTURES / "lateral_junction_doping.npy")

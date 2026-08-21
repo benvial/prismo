@@ -154,9 +154,20 @@ class OutputSchema(BaseModel):
 # The forward solve, behind the fixed apply/vjp endpoints. apply() runs the
 # single two-sided eigensolve and stores its whole eigenstate here; the adjoint
 # retrieves the session whose inputs match and assembles the field sensitivity
-# from that state without re-solving. No scope is passed, so the registry keeps
-# only the most-recent forward.
-_session_registry = SolveSessionRegistry()
+# from that state without re-solving.
+#
+# One pipeline evaluation drives *two* independent applies into this container:
+# the rho-independent background field and the perturbed one. They are separate
+# ``pure_callback``s, so under ``jit`` XLA -- not the pipeline -- decides which
+# runs last. Keeping only the most-recent forward therefore let a background
+# apply scheduled after the perturbed one evict the very session the perturbed
+# adjoint was about to retrieve (ticket 15). Both are opened under one scope,
+# the constant surroundings they share, so the perturbed session survives
+# either order. That scope does not turn over between evaluations, so the
+# retention cap -- not the scope -- is what keeps the eigenstates from
+# accumulating across an optimization.
+_MAX_RETAINED_SOLVES = 2
+_session_registry = SolveSessionRegistry(max_sessions=_MAX_RETAINED_SOLVES)
 
 # Eigenvalue of the last accepted forward solve, keyed by the geometry it was
 # solved on. Successive solves within one optimization or finite-difference
@@ -618,6 +629,24 @@ def _two_sided_solver(A: Any, B: Any, target: float, n: int = 12) -> tuple[Any, 
     )
 
 
+def _is_guided(neff: float, core_epsilon: float, clad_epsilon: float) -> bool:
+    """Whether ``neff`` lies in the physical guided window of this waveguide.
+
+    A mode bound to the silicon is slower than the core and faster than the
+    cladding, i.e. ``sqrt(clad) < neff < sqrt(core)``. Anything else is
+    radiating, leaky, or an artefact of the discretisation -- the isolated
+    eigenvalue a pinned orphan DOF contributes, say. Both the branch selection
+    and the branch *update* consult the same window, so a solve that lands
+    outside it can neither be tracked to nor become what later solves track.
+    """
+    return float(np.sqrt(clad_epsilon)) < neff < float(np.sqrt(core_epsilon))
+
+
+def _neff_of(solver: Any, index: int, k0: float) -> float:
+    """Effective index of a converged eigenpair."""
+    return float(np.real(np.sqrt(solver.getEigenvalue(index))) / k0)
+
+
 def _select_index(
     solver: Any,
     nconv: int,
@@ -629,26 +658,28 @@ def _select_index(
     """Index of the tracked eigenpair.
 
     When ``ref_lam`` is given -- the eigenvalue this geometry was last solved on
-    -- the mode is tracked by nearest eigenvalue, so every solve after the first
-    stays on one branch. On the first solve of a geometry there is nothing to
-    track, so the fundamental *guided* mode is selected: the largest-neff
-    eigenpair whose neff lies in the physical window ``(sqrt(clad), sqrt(core))``.
-    Falls back to nearest-target when the mesh resolves no guided mode (a leaky
-    mode; gradient correctness is unaffected).
+    -- the mode is tracked by nearest eigenvalue *among the guided candidates*,
+    so every solve after the first stays on one physical branch rather than
+    hopping to whichever root happened to converge closest. On the first solve
+    of a geometry there is nothing to track, so the fundamental guided mode is
+    selected: the largest-neff eigenpair inside the window. Either way, a solve
+    that resolves no guided mode at all falls back to the nearest candidate
+    over the whole converged set (a leaky mode; gradient correctness is
+    unaffected).
     """
-    if ref_lam is not None:
-        dists = [abs(solver.getEigenvalue(i) - ref_lam) for i in range(nconv)]
-        return int(np.argmin(dists))
+    guided = [
+        i
+        for i in range(nconv)
+        if _is_guided(_neff_of(solver, i, k0), core_epsilon, clad_epsilon)
+    ]
 
-    n_core = np.sqrt(core_epsilon)
-    n_clad = np.sqrt(clad_epsilon)
-    best_idx, best_neff = None, -np.inf
-    for i in range(nconv):
-        neff = float(np.real(np.sqrt(solver.getEigenvalue(i))) / k0)
-        if n_clad < neff < n_core and neff > best_neff:
-            best_idx, best_neff = i, neff
-    if best_idx is not None:
-        return best_idx
+    if ref_lam is not None:
+        candidates = guided if guided else list(range(nconv))
+        dists = [abs(solver.getEigenvalue(i) - ref_lam) for i in candidates]
+        return int(candidates[int(np.argmin(dists))])
+
+    if guided:
+        return max(guided, key=lambda i: _neff_of(solver, i, k0))
 
     target = complex(core_epsilon * k0 * k0, 0.0)
     dists = [abs(solver.getEigenvalue(i) - target) for i in range(nconv)]
@@ -663,7 +694,13 @@ def _solve_state(
     clad_epsilon: float,
     ref_lam: complex | None = None,
 ) -> dict[str, Any]:
-    """Assemble + two-sided solve; return the tracked eigenpair state."""
+    """Assemble + two-sided solve; return the tracked eigenpair state.
+
+    The state carries ``guided``: whether the selected eigenpair landed in the
+    physical guided window. ``apply`` gates the tracked-branch update on it, so
+    a shift retry that misses the branch costs one solve rather than
+    redirecting every later solve of this geometry (ticket 15).
+    """
     A, B = _assemble_AB(simu, eps_core_field)
     target = core_epsilon * k0 * k0
     solver, nconv = _two_sided_solver(A, B, target)
@@ -677,8 +714,25 @@ def _solve_state(
     neff = float(np.real(kz / k0))
     return {
         "A": A, "B": B, "lam": lam, "kz": kz, "neff": neff,
+        "guided": _is_guided(neff, core_epsilon, clad_epsilon),
         "rx": rx, "cx": cx, "ry": ry, "cy": cy,
     }
+
+
+def _advance_tracked_lam(
+    tracked: dict[tuple[float, float, float], complex],
+    geometry: tuple[float, float, float],
+    state: dict[str, Any],
+) -> None:
+    """Record this solve's eigenvalue as the branch later solves track.
+
+    Only a guided solve may advance the branch. Recording a non-guided one
+    would make every later solve of this geometry track *it*, with nothing to
+    recover from: the reference is what selection is measured against, so once
+    it moves off the guided window it never comes back (ticket 15).
+    """
+    if state["guided"]:
+        tracked[geometry] = state["lam"]
 
 
 def _lr_product(matrix: Any, state: dict[str, Any]) -> complex:
@@ -892,7 +946,7 @@ def apply(inputs: InputSchema) -> OutputSchema:
         )
 
     design, simu, dg0, mask, k0, state, geometry = _forward_solve(inputs)
-    _tracked_lam[geometry] = state["lam"]
+    _advance_tracked_lam(_tracked_lam, geometry, state)
 
     _session_registry.open(
         _solve_identity(
@@ -902,6 +956,7 @@ def apply(inputs: InputSchema) -> OutputSchema:
             inputs.substrate_epsilon,
         ),
         state={"simu": simu, "dg0": dg0, "mask": mask, "k0": k0, "eigen": state},
+        scope=geometry,
     )
 
     neff = state["neff"]

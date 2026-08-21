@@ -102,3 +102,49 @@ def test_registry_keyed_by_array_identity() -> None:
 
     assert registry.match(array_identity(np.array([1.0, 2.25, 12.1]))) is not None
     assert registry.match(array_identity(np.array([1.0, 2.25, 12.2]))) is None
+
+
+def test_registry_bounds_retention_within_one_scope() -> None:
+    """``max_sessions`` caps a scope that would otherwise grow unboundedly.
+
+    A scope wide enough to hold every forward of one autodiff pass (gyptis
+    scopes by geometry, since its background and perturbed solves share only
+    the constants) does not change between passes, so without a cap the
+    registry would keep every solve of an optimization alive. Eviction is
+    least-recently-used, counting both ``open`` and ``match``.
+    """
+    registry = SolveSessionRegistry(max_sessions=2)
+    registry.open("a", scope="geometry")
+    registry.open("b", scope="geometry")
+    registry.open("c", scope="geometry")
+
+    assert registry.match("a") is None
+    assert registry.match("b") is not None
+    assert registry.match("c") is not None
+
+
+def test_registry_match_refreshes_recency() -> None:
+    registry = SolveSessionRegistry(max_sessions=2)
+    registry.open("a", scope="geometry")
+    registry.open("b", scope="geometry")
+    assert registry.match("a") is not None  # "a" is now the most recent
+    registry.open("c", scope="geometry")
+
+    assert registry.match("b") is None
+    assert registry.match("a") is not None
+    assert registry.match("c") is not None
+
+
+def test_registry_survives_either_order_of_two_concurrent_forwards() -> None:
+    """The ordering defect: an unscoped registry drops whichever came first.
+
+    gyptis' background and perturbed solves are independent ``pure_callback``s
+    into one container, and XLA picks their order. Under one scope both
+    survive, so the perturbed adjoint finds its session no matter which forward
+    XLA ran last (ticket 15).
+    """
+    for order in (("background", "perturbed"), ("perturbed", "background")):
+        registry = SolveSessionRegistry(max_sessions=2)
+        for identity in order:
+            registry.open(identity, scope="geometry")
+        assert registry.match("perturbed") is not None

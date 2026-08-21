@@ -157,7 +157,7 @@ def validate_gradient(
 
 
 @dataclass
-class _PipelineInputs:
+class PipelineInputs:
     """Everything ``pipeline()`` needs at a fixed design, shared by run/validate.
 
     Assembled once from the mesh: the node coordinates, the signed-junction seed
@@ -181,19 +181,21 @@ class _PipelineInputs:
     design_vertices: np.ndarray | None = None
 
 
-def _build_pipeline_inputs(
+def build_pipeline_inputs(
     r_min: float,
     mesh_path: str,
     use_containers: bool,
     components: Any | None,
-) -> _PipelineInputs:
+) -> PipelineInputs:
     """Author the shared mesh and assemble the fixed pipeline inputs.
 
-    Both ``prismo run`` (optimization) and ``prismo validate-gradient`` (the
-    ticket 06 deliverable) start here so they solve on exactly the same mesh,
-    filter, transfer, and seed. Container runs author the mesh via gyptis
+    ``prismo run`` (optimization), ``prismo validate-gradient`` (the ticket 06
+    deliverable) and ``scripts/benchmark_multiphysics_optimization.py`` all
+    start here so they solve on exactly the same mesh, filter, transfer, and
+    seed -- the benchmark used to assemble its own and drifted out of contract
+    with this one (ticket 15). Container runs author the mesh via gyptis
     ``write_mesh`` and require live components; the in-process path builds the
-    rib mesh locally.
+    rib mesh locally. Lengths are micrometres throughout, ``r_min`` included.
     """
     import jax.numpy as jnp
     from prismo_shared.schemas import MeshRef
@@ -226,9 +228,12 @@ def _build_pipeline_inputs(
             "      WARNING: empty mesh (gmsh not available?). Using synthetic 8x8 grid."
         )
         n_side = 8
+        # Micrometres, like every real mesh this app reads (ticket 15): a 20 nm
+        # node pitch is 0.02 here, so the µm-scaled ``--r-min`` still means the
+        # same physical radius on the fallback grid.
         xs, ys = np.meshgrid(
-            np.arange(n_side) * 20e-9,
-            np.arange(n_side) * 20e-9,
+            np.arange(n_side) * 0.02,
+            np.arange(n_side) * 0.02,
             indexing="xy",
         )
         coords = np.stack([xs.ravel(), ys.ravel()], axis=1)
@@ -274,7 +279,7 @@ def _build_pipeline_inputs(
         )
     typer.echo(f"      Filter radius: {r_min:.3g} µm")
 
-    return _PipelineInputs(
+    return PipelineInputs(
         geometry=geometry,
         coords=coords,
         n_nodes=n_nodes,
@@ -290,7 +295,7 @@ def _build_pipeline_inputs(
 
 
 def _optimized_mode_field(
-    inputs: _PipelineInputs,
+    inputs: PipelineInputs,
     rho_opt: np.ndarray,
     components: Any | None,
 ) -> ModeField | None:
@@ -360,7 +365,7 @@ def _run_pipeline(
     typer.echo()
 
     typer.echo("[1/3] Preparing pipeline inputs...")
-    inputs = _build_pipeline_inputs(r_min, mesh_path, use_containers, components)
+    inputs = build_pipeline_inputs(r_min, mesh_path, use_containers, components)
     geometry = inputs.geometry
     coords = inputs.coords
     n_nodes = inputs.n_nodes
@@ -382,7 +387,7 @@ def _run_pipeline(
                 name = f"doping_field_{iteration}"
                 plot_live_doping_field(
                     np.asarray(doping_from_theta(theta)),
-                    coords * 1e-6,
+                    coords,
                     iteration,
                     geometry=geometry,
                     output_dir=output_dir,
@@ -445,7 +450,9 @@ def _run_pipeline(
         rho_initial=rho_initial,
         rho_opt=rho_opt,
         history=history,
-        mesh_coords=coords * 1e-6,
+        # Node coordinates are micrometres on both paths (ticket 15), which is
+        # what the figures plot in -- no conversion at this seam.
+        mesh_coords=coords,
         geometry=geometry,
         # Bind the *same* pipeline the optimizer drove -- filter, mesh_ref and
         # transfer included. Omitting them made the figure's finite differences
@@ -498,7 +505,7 @@ def _run_gradient_validation(
     typer.echo()
 
     typer.echo("[1/2] Preparing pipeline inputs...")
-    inputs = _build_pipeline_inputs(r_min, mesh_path, use_containers, components)
+    inputs = build_pipeline_inputs(r_min, mesh_path, use_containers, components)
 
     typer.echo("[2/2] Checking adjoint against central finite differences...")
     bound_pipeline = partial(

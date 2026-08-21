@@ -194,7 +194,9 @@ def plot_doping_field(
     Args:
         rho_initial: Initial design vector ``(n_nodes,)``.
         rho_opt: Optimized design vector ``(n_nodes,)``.
-        mesh_coords: Node coordinates ``(n_nodes, 2)`` in meters.
+        mesh_coords: Node coordinates ``(n_nodes, 2)`` in micrometres -- the
+            unit both mesh authors emit (ticket 15), and the unit the axes are
+            labelled in, so no conversion happens here.
         geometry: ``RibWaveguideGeometry`` for overlay (optional).
         output_dir: Directory to write ``doping_field.pdf``.
 
@@ -202,7 +204,7 @@ def plot_doping_field(
         Path to the saved figure.
     """
     out = _ensure_output_dir(output_dir)
-    x, y = mesh_coords[:, 0] * 1e6, mesh_coords[:, 1] * 1e6
+    x, y = mesh_coords[:, 0], mesh_coords[:, 1]
 
     fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(10, 4))
 
@@ -248,10 +250,11 @@ def plot_live_doping_field(
 
     The image is atomically replaced at every optimizer callback, so it can be
     opened while a long container-backed solve is still running.
+    ``mesh_coords`` is in micrometres, as everywhere else in the app.
     """
     out = _ensure_output_dir(output_dir)
     doping = np.asarray(doping, dtype=float)
-    x, y = mesh_coords[:, 0] * 1e6, mesh_coords[:, 1] * 1e6
+    x, y = mesh_coords[:, 0], mesh_coords[:, 1]
     limit = float(np.max(np.abs(doping))) if doping.size else 1.0
     limit = max(limit, 1e14)
 
@@ -286,18 +289,19 @@ def plot_live_doping_field(
 def _overlay_geometry(ax: plt.Axes, geometry: object) -> None:
     """Draw waveguide geometry overlay on an axis.
 
-    Coordinates are converted from meters to µm.
+    The geometry's dimensions are already micrometres (ticket 15), the same
+    unit as the node coordinates and the axes, so nothing is rescaled here.
     """
     # Geometry is duck-typed to keep plotting independent from mesh module.
     geom = geometry  # type: ignore[assignment]
-    rib_l = geom.rib_left * 1e6  # type: ignore[attr-defined]
-    rib_r = geom.rib_right * 1e6  # type: ignore[attr-defined]
-    slab_top = geom.slab_top * 1e6  # type: ignore[attr-defined]
-    rib_top = geom.rib_top * 1e6  # type: ignore[attr-defined]
-    sub_top = geom.substrate_thickness * 1e6  # type: ignore[attr-defined]
-    hw = geom.half_width * 1e6  # type: ignore[attr-defined]
-    ct_off = geom.contact_offset * 1e6  # type: ignore[attr-defined]
-    ct_w = geom.contact_width * 1e6  # type: ignore[attr-defined]
+    rib_l = geom.rib_left  # type: ignore[attr-defined]
+    rib_r = geom.rib_right  # type: ignore[attr-defined]
+    slab_top = geom.slab_top  # type: ignore[attr-defined]
+    rib_top = geom.rib_top  # type: ignore[attr-defined]
+    sub_top = geom.substrate_thickness  # type: ignore[attr-defined]
+    hw = geom.half_width  # type: ignore[attr-defined]
+    ct_off = geom.contact_offset  # type: ignore[attr-defined]
+    ct_w = geom.contact_width  # type: ignore[attr-defined]
 
     ax.plot([rib_l, rib_r], [slab_top, slab_top], "w--", linewidth=0.8, alpha=0.7)
     ax.plot([rib_l, rib_r], [rib_top, rib_top], "w--", linewidth=0.8, alpha=0.7)
@@ -672,7 +676,7 @@ def generate_outputs(
         rho_initial: Initial design vector.
         rho_opt: Optimized design vector.
         history: Optimization history from ``optimize_doping``.
-        mesh_coords: Node coordinates ``(n_nodes, 2)``.
+        mesh_coords: Node coordinates ``(n_nodes, 2)`` in micrometres.
         geometry: ``RibWaveguideGeometry`` instance.
         pipeline_fn: Differentiable pipeline function for gradient
             validation. Skipped if ``None``.

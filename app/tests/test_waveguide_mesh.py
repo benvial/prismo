@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from prismo.waveguide_mesh import (
     PHYSICAL_GROUP_NAMES,
+    SILICON_GROUP_NAMES,
     RibWaveguideGeometry,
     build_rib_waveguide_mesh,
     build_rib_waveguide_mesh_via_gmsh,
@@ -20,23 +21,23 @@ class TestRibWaveguideGeometry:
 
     def test_default_dimensions(self):
         geom = RibWaveguideGeometry()
-        assert geom.rib_thickness == 220e-9
-        assert geom.rib_width == 500e-9
-        assert geom.slab_thickness == 100e-9
-        assert geom.box_width == 3e-6
-        assert geom.total_height == pytest.approx(1320e-9)
-        assert geom.contact_width == 50e-9
-        assert geom.contact_offset == 200e-9
+        assert geom.rib_thickness == 0.22
+        assert geom.rib_width == 0.5
+        assert geom.slab_thickness == 0.1
+        assert geom.box_width == 3.0
+        assert geom.total_height == pytest.approx(1.32)
+        assert geom.contact_width == 0.05
+        assert geom.contact_offset == 0.2
 
     def test_custom_dimensions(self):
         geom = RibWaveguideGeometry(
-            rib_thickness=300e-9,
-            rib_width=600e-9,
-            slab_thickness=150e-9,
+            rib_thickness=0.3,
+            rib_width=0.6,
+            slab_thickness=0.15,
         )
-        assert geom.rib_thickness == 300e-9
-        assert geom.rib_width == 600e-9
-        assert geom.slab_thickness == 150e-9
+        assert geom.rib_thickness == 0.3
+        assert geom.rib_width == 0.6
+        assert geom.slab_thickness == 0.15
 
     def test_material_indices(self):
         geom = RibWaveguideGeometry()
@@ -66,7 +67,12 @@ class TestPhysicalGroupNaming:
     """Tests for physical group naming convention."""
 
     def test_required_groups_exist(self):
-        required = {"silicon", "oxide", "contact_anode", "contact_cathode"}
+        required = {
+            *SILICON_GROUP_NAMES,
+            "oxide",
+            "contact_anode",
+            "contact_cathode",
+        }
         assert required.issubset(set(PHYSICAL_GROUP_NAMES))
 
     def test_names_are_strings(self):
@@ -116,7 +122,7 @@ class TestMeshGenerationGmsh:
         group_names = {gmsh.model.getPhysicalName(dim, tag) for dim, tag in groups}
         gmsh.clear()
 
-        assert "silicon" in group_names
+        assert set(SILICON_GROUP_NAMES).issubset(group_names)
         assert "oxide" in group_names
         assert "contact_anode" in group_names
         assert "contact_cathode" in group_names
@@ -169,7 +175,7 @@ class TestMeshGenerationGmsh:
 
     def test_build_mesh_resolution_10nm(self, gmsh, output_path):
         geom = RibWaveguideGeometry()
-        geom.mesh_res_junction = 10e-9
+        geom.mesh_res_junction = 0.01
         build_rib_waveguide_mesh_via_gmsh(output_path, geom)
 
         gmsh.open(str(output_path))
@@ -209,7 +215,7 @@ class TestBuildRibWaveguideMeshPublic:
         assert result == output_path
 
     def test_geometry_accepts_custom_dimensions(self, output_path):
-        geom = RibWaveguideGeometry(rib_width=600e-9)
+        geom = RibWaveguideGeometry(rib_width=0.6)
         result = build_rib_waveguide_mesh(output_path, geometry=geom)
         assert Path(result).exists()
 
@@ -296,28 +302,34 @@ class TestSiliconTriangulation:
         triangles = read_mesh_silicon_triangulation(output_path)
 
         gmsh.open(str(output_path))
-        silicon_tag = next(
+        silicon_tags = [
             tag
             for dim, tag in gmsh.model.getPhysicalGroups(2)
-            if gmsh.model.getPhysicalName(dim, tag) == "silicon"
-        )
+            if gmsh.model.getPhysicalName(dim, tag) in SILICON_GROUP_NAMES
+        ]
+        assert len(silicon_tags) == len(SILICON_GROUP_NAMES)
         node_tags, _, _ = gmsh.model.mesh.getNodes()
         index_by_tag = {int(tag): index for index, tag in enumerate(node_tags)}
         expected_parts = []
-        for entity_tag in gmsh.model.getEntitiesForPhysicalGroup(2, silicon_tag):
-            element_types, _, element_nodes = gmsh.model.mesh.getElements(2, entity_tag)
-            for element_type, nodes in zip(element_types, element_nodes, strict=True):
-                if gmsh.model.mesh.getElementProperties(element_type)[3] != 3:
-                    continue
-                tags = np.asarray(nodes, dtype=np.int64).reshape(-1, 3)
-                expected_parts.append(
-                    np.asarray(
-                        [
-                            [index_by_tag[int(tag)] for tag in triangle]
-                            for triangle in tags
-                        ]
-                    )
+        for silicon_tag in silicon_tags:
+            for entity_tag in gmsh.model.getEntitiesForPhysicalGroup(2, silicon_tag):
+                element_types, _, element_nodes = gmsh.model.mesh.getElements(
+                    2, entity_tag
                 )
+                for element_type, nodes in zip(
+                    element_types, element_nodes, strict=True
+                ):
+                    if gmsh.model.mesh.getElementProperties(element_type)[3] != 3:
+                        continue
+                    tags = np.asarray(nodes, dtype=np.int64).reshape(-1, 3)
+                    expected_parts.append(
+                        np.asarray(
+                            [
+                                [index_by_tag[int(tag)] for tag in triangle]
+                                for triangle in tags
+                            ]
+                        )
+                    )
         gmsh.clear()
         expected = np.concatenate(expected_parts)
 
@@ -334,3 +346,78 @@ class TestSiliconTriangulation:
         triangles = read_mesh_silicon_triangulation(output_path)
         assert triangles.shape == (0, 3)
         assert np.issubdtype(triangles.dtype, np.integer)
+
+
+class TestSharedMeshContract:
+    """The local mesh author must match the shared-mesh contract (ticket 15).
+
+    ChargeTransport reads whichever mesh the run path authored: gyptis'
+    unified mesh on the container path, this module's rib mesh on the local
+    one. Both are the *same* contract -- micrometre coordinates and gyptis'
+    silicon vocabulary -- because ``ct_common.jl`` scales the grid by
+    ``MICROMETRES_TO_METRES`` and collects its silicon cells from the ``slab``
+    and ``rib_silicon`` groups regardless of which author wrote the file.
+    """
+
+    @pytest.fixture
+    def gmsh(self):
+        pytest.importorskip("gmsh")
+        import gmsh  # type: ignore[import-untyped]
+
+        gmsh.initialize()
+        yield gmsh
+        gmsh.finalize()
+
+    @pytest.fixture
+    def output_path(self):
+        with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
+            path = f.name
+        yield path
+        Path(path).unlink(missing_ok=True)
+
+    def test_geometry_is_authored_in_micrometres(self):
+        geom = RibWaveguideGeometry()
+        assert geom.rib_thickness == pytest.approx(0.22)
+        assert geom.rib_width == pytest.approx(0.5)
+        assert geom.slab_thickness == pytest.approx(0.1)
+        assert geom.box_width == pytest.approx(3.0)
+        assert geom.wavelength == pytest.approx(1.55)
+
+    def test_mesh_coordinates_are_micrometres(self, gmsh, output_path):
+        geom = RibWaveguideGeometry()
+        build_rib_waveguide_mesh_via_gmsh(output_path, geom)
+        coords = read_mesh_node_coordinates(output_path)
+
+        assert coords.shape[0] > 0
+        # A 3 µm-wide, 1.32 µm-tall device spans ~3 units, not ~3e-6 of them.
+        assert np.max(coords[:, 0]) - np.min(coords[:, 0]) == pytest.approx(3.0)
+        assert np.max(coords[:, 1]) == pytest.approx(1.32)
+        assert geom.box_width == pytest.approx(3.0)
+
+    def test_silicon_groups_use_the_gyptis_vocabulary(self, gmsh, output_path):
+        build_rib_waveguide_mesh_via_gmsh(output_path, RibWaveguideGeometry())
+
+        gmsh.open(str(output_path))
+        names = {
+            gmsh.model.getPhysicalName(dim, tag)
+            for dim, tag in gmsh.model.getPhysicalGroups()
+        }
+        gmsh.clear()
+
+        # ct_common.jl collects ("slab", "rib_silicon") and errors on neither.
+        assert "slab" in names
+        assert "rib_silicon" in names
+        assert "silicon" not in names
+
+    def test_silicon_triangulation_spans_slab_and_rib(self, gmsh, output_path):
+        """The reader covers both silicon groups, not just the rib."""
+        build_rib_waveguide_mesh_via_gmsh(output_path, RibWaveguideGeometry())
+        triangles = read_mesh_silicon_triangulation(output_path)
+        coords = read_mesh_node_coordinates(output_path)
+
+        assert triangles.shape[0] > 0
+        geom = RibWaveguideGeometry()
+        ys = coords[triangles.ravel(), 1]
+        # Slab band (below slab_top) and rib band (above it) are both present.
+        assert np.any(ys < geom.slab_top - 1e-12)
+        assert np.any(ys > geom.slab_top + 1e-12)

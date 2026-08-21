@@ -2,11 +2,18 @@ import numpy as np
 from scipy.sparse import csr_matrix
 
 
-def assemble_filter_matrix(mesh_coords: np.ndarray, r_min: float = 50e-9) -> csr_matrix:
+def assemble_filter_matrix(mesh_coords: np.ndarray, r_min: float = 0.05) -> csr_matrix:
     """Build sparse convolution filter matrix from node coordinates.
 
     H_ij = max(0, r_min - dist(i,j))
     Returns csr_matrix.
+
+    ``r_min`` is a distance in whatever length unit ``mesh_coords`` is authored
+    in -- the two must agree. The PRISMO run paths author both in micrometres
+    (see :mod:`prismo.waveguide_mesh`), which is what the ``0.05`` default (a
+    50 nm radius) is expressed in; a radius in the wrong unit silently turns
+    the filter into either an all-pairs average or the identity rather than
+    failing.
     """
     coords = np.asarray(mesh_coords, dtype=float)
     n = coords.shape[0]

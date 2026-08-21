@@ -16,8 +16,13 @@ N = 32
 RNG = np.random.default_rng(0)
 
 
-def _grid_coords(n=N, spacing=20e-9):
-    """Build a regular n x n grid of node coordinates."""
+def _grid_coords(n=N, spacing=0.02):
+    """Build a regular n x n grid of node coordinates, in micrometres.
+
+    A 0.02 µm pitch under the module's 0.05 µm default radius is the same
+    geometry the old 20 nm / 50 nm pair described, now in the unit the real
+    meshes are authored in (ticket 15).
+    """
     xs, ys = np.meshgrid(
         np.arange(n) * spacing, np.arange(n) * spacing, indexing="xy"
     )
@@ -49,7 +54,8 @@ def test_filter_matrix_symmetric(H):
 def test_filter_matrix_diagonal_positive(H):
     diag = H.diagonal()
     assert np.all(diag > 0)
-    np.testing.assert_allclose(diag, 50e-9 * np.ones_like(diag))
+    # H_ii = max(0, r_min - 0) = r_min, the default 0.05 µm radius.
+    np.testing.assert_allclose(diag, 0.05 * np.ones_like(diag))
 
 
 def test_uniform_preserved(H):

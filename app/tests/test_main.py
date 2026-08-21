@@ -455,3 +455,42 @@ def test_container_run_rejects_near_zero_objective(
             use_containers=True,
             components=_container_components([[0.5, 0.0]]),
         )
+
+
+def test_local_pipeline_inputs_keep_the_seeded_junction_under_the_default_filter(
+    tmp_path: Path,
+) -> None:
+    """The µm-scaled ``--r-min`` default must be a local filter on the local mesh.
+
+    ``build_pipeline_inputs`` authors the rib mesh itself when no containers
+    are running. That mesh used to be written in metres while ``--r-min``
+    defaulted to ``0.05`` micrometres, so the filter radius was 0.05 m over a
+    3 µm device: ``H`` became all-pairs and ``theta_tilde`` collapsed to the
+    global mean, erasing the seeded P/N junction the optimizer starts from
+    (ticket 15). Both are micrometres now, so the filtered field must still
+    change sign across the junction.
+    """
+    pytest.importorskip("gmsh")
+    import jax.numpy as jnp
+
+    main_module = import_module("prismo.main")
+
+    inputs = main_module.build_pipeline_inputs(
+        r_min=0.05,
+        mesh_path=str(tmp_path / "waveguide.msh"),
+        use_containers=False,
+        components=None,
+    )
+
+    assert inputs.real_mesh
+    theta_tilde = np.asarray(
+        (inputs.H_dense @ jnp.asarray(inputs.theta_init)) / inputs.H_sum
+    )
+    assert theta_tilde.min() < 0.0 < theta_tilde.max()
+
+    # A local filter couples a node to a handful of neighbours, not to the
+    # whole mesh; all-pairs coupling is exactly the mean-collapse failure.
+    density = float(np.count_nonzero(np.asarray(inputs.H_dense))) / (
+        inputs.n_nodes**2
+    )
+    assert density < 0.5

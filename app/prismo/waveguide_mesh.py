@@ -5,6 +5,18 @@ Both the ChargeTransport.jl and gyptis Tesseracts consume the same mesh file at 
 ``MeshRef.path``.  Physical-group naming is defined here so both integrators
 agree on which subdomains are contacts, silicon, and oxide.
 
+Units and vocabulary follow the *shared-mesh contract*, not SI (ticket 15).
+A container run authors the shared mesh with gyptis, an in-process run authors
+it here, and ChargeTransport reads whichever one was written: ``ct_common.jl``
+scales the grid it loads by ``MICROMETRES_TO_METRES`` and collects its silicon
+cells from the ``slab`` and ``rib_silicon`` physical groups. Both authors
+therefore emit **micrometre** coordinates under gyptis' group names -- and so
+do the geometry dimensions below, the ``--r-min`` filter radius, and the node
+coordinates the plots consume. Authoring this mesh in metres instead made the
+µm-scaled default filter radius an all-pairs filter over a 3 µm device (which
+collapses the design field to its global mean) and left the Julia silicon
+lookup with no group it recognised.
+
 Geometry (cross-section, not to scale)::
 
     ┌───────────────────────────────────────┐  ← SiO₂ cladding
@@ -20,7 +32,7 @@ Geometry (cross-section, not to scale)::
     └───────────────────────────────────────┘
 
 Physical groups exported to the ``.msh`` file:
-``silicon``, ``oxide``, ``contact_anode``, ``contact_cathode``.
+``slab``, ``rib_silicon``, ``oxide``, ``contact_anode``, ``contact_cathode``.
 """
 
 from __future__ import annotations
@@ -31,7 +43,11 @@ import numpy as np
 
 
 class RibWaveguideGeometry:
-    """SOI rib waveguide cross-section dimensions and material properties."""
+    """SOI rib waveguide cross-section dimensions and material properties.
+
+    Every length is in **micrometres**, matching the shared-mesh contract this
+    module documents; the refractive indices are dimensionless.
+    """
 
     rib_thickness: float
     rib_width: float
@@ -51,20 +67,20 @@ class RibWaveguideGeometry:
     def __init__(
         self,
         *,
-        rib_thickness: float = 220e-9,
-        rib_width: float = 500e-9,
-        slab_thickness: float = 100e-9,
-        substrate_thickness: float = 500e-9,
-        cladding_thickness: float = 500e-9,
-        box_width: float = 3e-6,
-        contact_width: float = 50e-9,
-        contact_offset: float = 200e-9,
-        mesh_res_junction: float = 10e-9,
-        mesh_res_core: float = 20e-9,
-        mesh_res_bulk: float = 50e-9,
+        rib_thickness: float = 0.22,
+        rib_width: float = 0.5,
+        slab_thickness: float = 0.1,
+        substrate_thickness: float = 0.5,
+        cladding_thickness: float = 0.5,
+        box_width: float = 3.0,
+        contact_width: float = 0.05,
+        contact_offset: float = 0.2,
+        mesh_res_junction: float = 0.01,
+        mesh_res_core: float = 0.02,
+        mesh_res_bulk: float = 0.05,
         silicon_index: float = 3.4757,
         oxide_index: float = 1.444,
-        wavelength: float = 1.55e-6,
+        wavelength: float = 1.55,
     ) -> None:
         self.rib_thickness = rib_thickness
         self.rib_width = rib_width
@@ -117,8 +133,13 @@ class RibWaveguideGeometry:
         return self.slab_top + self.rib_thickness
 
 
+# gyptis' vocabulary for the same regions: the silicon is split into the
+# full-width ``slab`` and the ``rib_silicon`` core above it, which is what
+# ``ct_common.jl`` collects as the silicon domain.
+SILICON_GROUP_NAMES: tuple[str, str] = ("slab", "rib_silicon")
+
 PHYSICAL_GROUP_NAMES: list[str] = [
-    "silicon",
+    *SILICON_GROUP_NAMES,
     "oxide",
     "contact_anode",
     "contact_cathode",
@@ -231,22 +252,23 @@ def _build_mesh_rectangles(
     core_sz = geometry.mesh_res_core
     bulk_sz = geometry.mesh_res_bulk
 
-    silicon_surfs: list[int] = []
+    slab_surfs: list[int] = []
+    rib_silicon_surfs: list[int] = []
     oxide_surfs: list[int] = []
     anode_surfs: list[int] = []
     cathode_surfs: list[int] = []
 
     oxide_surfs.append(_rect(-hw, y0, hw, y1, bulk_sz))
 
-    silicon_surfs.append(_rect(-hw, y1, ct_l_start, y2, bulk_sz))
+    slab_surfs.append(_rect(-hw, y1, ct_l_start, y2, bulk_sz))
     anode_surfs.append(_rect(ct_l_start, y1, ct_l_end, y2, bulk_sz))
-    silicon_surfs.append(_rect(ct_l_end, y1, rib_l, y2, bulk_sz))
-    silicon_surfs.append(_rect(rib_l, y1, rib_r, y2, core_sz))
-    silicon_surfs.append(_rect(rib_r, y1, ct_r_start, y2, bulk_sz))
+    slab_surfs.append(_rect(ct_l_end, y1, rib_l, y2, bulk_sz))
+    slab_surfs.append(_rect(rib_l, y1, rib_r, y2, core_sz))
+    slab_surfs.append(_rect(rib_r, y1, ct_r_start, y2, bulk_sz))
     cathode_surfs.append(_rect(ct_r_start, y1, ct_r_end, y2, bulk_sz))
-    silicon_surfs.append(_rect(ct_r_end, y1, hw, y2, bulk_sz))
+    slab_surfs.append(_rect(ct_r_end, y1, hw, y2, bulk_sz))
 
-    silicon_surfs.append(_rect(rib_l, y2, rib_r, y3, core_sz))
+    rib_silicon_surfs.append(_rect(rib_l, y2, rib_r, y3, core_sz))
 
     oxide_surfs.append(_rect(-hw, y2, rib_l, y3, bulk_sz))
     oxide_surfs.append(_rect(rib_r, y2, hw, y3, bulk_sz))
@@ -270,10 +292,14 @@ def _build_mesh_rectangles(
     # (curves in 2D), and ExtendableGrids only reads dim-1 elements as
     # boundary faces (ticket 17). The metal patches themselves stay part of
     # the silicon domain for the electrical solve.
-    silicon_surfs.extend(anode_surfs)
-    silicon_surfs.extend(cathode_surfs)
+    slab_surfs.extend(anode_surfs)
+    slab_surfs.extend(cathode_surfs)
 
-    _add_physical_group(gmsh, 2, silicon_surfs, "silicon")
+    # gyptis' vocabulary, not a local one: ChargeTransport collects its silicon
+    # domain from ``slab`` + ``rib_silicon`` whichever author wrote the shared
+    # mesh (ticket 15).
+    _add_physical_group(gmsh, 2, slab_surfs, "slab")
+    _add_physical_group(gmsh, 2, rib_silicon_surfs, "rib_silicon")
     _add_physical_group(gmsh, 2, oxide_surfs, "oxide")
     _add_physical_group(gmsh, 1, [_top_curves[s] for s in anode_surfs], "contact_anode")
     _add_physical_group(gmsh, 1, [_top_curves[s] for s in cathode_surfs], "contact_cathode")
@@ -331,9 +357,11 @@ def read_mesh_silicon_triangulation(mesh_path: str | Path) -> np.ndarray:
 
     The returned indices address the coordinate rows from
     :func:`read_mesh_node_coordinates`. Only dim-2, three-node triangle
-    elements in the ``silicon`` physical group are included. As with the node
-    coordinate reader, an environment without Gmsh returns an empty array so
-    no-backend code paths remain importable.
+    elements in the :data:`SILICON_GROUP_NAMES` physical groups (``slab`` and
+    ``rib_silicon``, the same pair ``ct_common.jl`` collects) are included, so
+    the reader spans the whole silicon domain of either mesh author. As with
+    the node coordinate reader, an environment without Gmsh returns an empty
+    array so no-backend code paths remain importable.
     """
     import importlib.util
 
@@ -357,7 +385,7 @@ def read_mesh_silicon_triangulation(mesh_path: str | Path) -> np.ndarray:
         silicon_groups = [
             tag
             for dim, tag in gmsh.model.getPhysicalGroups(2)
-            if gmsh.model.getPhysicalName(dim, tag) == "silicon"
+            if gmsh.model.getPhysicalName(dim, tag) in SILICON_GROUP_NAMES
         ]
         triangles: list[np.ndarray] = []
         for group_tag in silicon_groups:

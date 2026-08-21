@@ -11,6 +11,7 @@ fallback), and gyptis-backed integration tests (guided mode, spatial response,
 single-pass field VJP vs finite differences).
 """
 
+import functools
 import importlib.util
 from pathlib import Path
 
@@ -28,7 +29,9 @@ OutputSchema = _api.OutputSchema
 apply = _api.apply
 vector_jacobian_product = _api.vector_jacobian_product
 
-N_DESIGN = 8
+# Field length used when no backend can be asked for the real one -- the
+# schema-only tests, which never reach a solve.
+_FALLBACK_N_DESIGN = 8
 
 
 def _gyptis_available() -> bool:
@@ -46,16 +49,31 @@ def _gyptis_available() -> bool:
 # ---------------------------------------------------------------------------
 
 
+@functools.cache
+def n_design() -> int:
+    """How many DG0 design cells the rib interior actually has.
+
+    The unified mesh (ticket 05) fixed this, and ``apply`` rejects any other
+    length. Hardcoding a short field instead made every apply/vjp contract test
+    raise ``ValueError`` rather than exercise the contract (ticket 15), so the
+    size is read from the component's own design region whenever a backend can
+    answer. Cached: each query rebuilds and remeshes the whole waveguide, and
+    the design region does not change within a run.
+    """
+    if not _gyptis_available():
+        return _FALLBACK_N_DESIGN
+    return int(np.asarray(_api.design_cell_centroids()).shape[0])
+
+
 def make_inputs(design_epsilon: np.ndarray | None = None) -> InputSchema:
     if design_epsilon is None:
-        design_epsilon = np.full(N_DESIGN, _api.DEFAULT_CORE_EPSILON)
+        design_epsilon = np.full(n_design(), _api.DEFAULT_CORE_EPSILON)
     return InputSchema(design_epsilon=design_epsilon)
 
 
 def _sized_design(rng_scale: float = 0.5) -> np.ndarray:
     """A structured design field sized to the real gyptis design region."""
-    centroids = _api.design_cell_centroids()
-    n = centroids.shape[0]
+    n = n_design()
     pattern = np.random.RandomState(0).uniform(-1.0, 1.0, n)
     pattern -= pattern.mean()
     return _api.DEFAULT_CORE_EPSILON + rng_scale * pattern
@@ -105,7 +123,7 @@ def test_apply_returns_scalar_neff_sq() -> None:
 
 @pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
 def test_apply_returns_finite_neff_sq() -> None:
-    outputs = apply(make_inputs(np.array([12.0, 11.0, 12.5, 11.5])))
+    outputs = apply(make_inputs(_sized_design(0.5)))
     assert np.isfinite(float(outputs.neff_sq))
 
 
@@ -135,7 +153,7 @@ def test_vjp_returns_cotangent_shaped_like_design_field() -> None:
         inputs, {"design_epsilon"}, {"neff_sq"}, {"neff_sq": 1.0}
     )
     assert set(result.keys()) == {"design_epsilon"}
-    assert np.asarray(result["design_epsilon"]).shape == (N_DESIGN,)
+    assert np.asarray(result["design_epsilon"]).shape == (n_design(),)
 
 
 @pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
@@ -419,3 +437,123 @@ def test_mode_field_does_not_advance_the_tracked_branch() -> None:
 
     apply(InputSchema(operation="mode_field", design_epsilon=design))
     assert _api._tracked_lam == tracked
+
+
+# ---------------------------------------------------------------------------
+# Mode tracking failure modes (ticket 15 defect 6)
+# ---------------------------------------------------------------------------
+
+
+class _FakeSolver:
+    """A converged SLEPc solve, standing in for its eigenvalue list."""
+
+    def __init__(self, eigenvalues):
+        self._eigenvalues = [complex(v) for v in eigenvalues]
+
+    def getEigenvalue(self, index):  # SLEPc's spelling, kept verbatim
+        return self._eigenvalues[index]
+
+
+_K0 = 2.0 * np.pi / _api.WAVELENGTH
+
+
+def _lam_for(neff: float) -> complex:
+    """The eigenvalue a mode of this effective index would come back as."""
+    return complex((neff * _K0) ** 2, 0.0)
+
+
+def _select(neffs, ref_neff=None):
+    solver = _FakeSolver([_lam_for(n) for n in neffs])
+    return _api._select_index(
+        solver,
+        len(neffs),
+        _K0,
+        _api.DEFAULT_CORE_EPSILON,
+        _api.DEFAULT_CLAD_EPSILON,
+        None if ref_neff is None else _lam_for(ref_neff),
+    )
+
+
+def test_first_solve_selects_the_fundamental_guided_mode() -> None:
+    # 0.9 is below the cladding index and 5.0 above the core index: neither is
+    # a guided mode of this waveguide.
+    assert _select([0.9, 2.4, 2.9, 5.0]) == 2
+
+
+def test_tracking_follows_the_nearest_guided_eigenvalue() -> None:
+    assert _select([2.40, 2.62, 2.90], ref_neff=2.61) == 1
+
+
+def test_tracking_ignores_closer_non_guided_eigenvalues() -> None:
+    """The tracked branch must stay inside the guided window.
+
+    Nearest-eigenvalue with no window applied locks tracking onto whatever
+    converged closest -- including a spurious or radiating root -- and, since
+    ``apply`` then records that as the branch, every later solve follows it
+    (ticket 15). The window is checked on the *candidates*, not just on the
+    first solve.
+    """
+    # A deliberately narrow window, so a non-guided root can sit nearer the
+    # reference than any guided one: neff must land in (2.0, 2.2).
+    clad_epsilon, core_epsilon = 4.0, 4.84
+    solver = _FakeSolver([_lam_for(2.10), _lam_for(2.60), _lam_for(2.05)])
+    ref = _lam_for(2.59)
+
+    index = _api._select_index(solver, 3, _K0, core_epsilon, clad_epsilon, ref)
+
+    assert index == 0, "nearest guided eigenvalue, not nearest overall"
+
+
+def test_tracking_falls_back_to_nearest_when_nothing_is_guided() -> None:
+    """A solve that resolves no guided mode still returns a branch."""
+    clad_epsilon, core_epsilon = 4.0, 4.84
+    solver = _FakeSolver([_lam_for(1.10), _lam_for(2.55), _lam_for(3.90)])
+    ref = _lam_for(2.60)
+
+    index = _api._select_index(solver, 3, _K0, core_epsilon, clad_epsilon, ref)
+
+    assert index == 1
+
+
+def test_is_guided_is_the_window_both_selection_and_tracking_use() -> None:
+    core, clad = _api.DEFAULT_CORE_EPSILON, _api.DEFAULT_CLAD_EPSILON
+    assert _api._is_guided(2.6, core, clad)
+    assert not _api._is_guided(1.2, core, clad)
+    assert not _api._is_guided(3.6, core, clad)
+
+
+def test_a_guided_solve_advances_the_tracked_branch() -> None:
+    geometry = (12.08, 2.085, 2.085)
+    tracked: dict = {}
+    _api._advance_tracked_lam(
+        tracked, geometry, {"lam": _lam_for(2.62), "guided": True}
+    )
+    assert tracked[geometry] == _lam_for(2.62)
+
+
+def test_a_non_guided_solve_leaves_the_tracked_branch_alone() -> None:
+    """The permanent-redirection failure mode (ticket 15).
+
+    ``apply`` used to record whatever ``_select_index`` returned. One shift
+    retry that missed the branch and came back with a spurious eigenpair would
+    therefore become *the* tracked eigenvalue, and every later solve of that
+    geometry would follow the spurious branch -- with no way back, since
+    nothing rechecks the window. A solve outside the guided window now leaves
+    the previous branch in place.
+    """
+    geometry = (12.08, 2.085, 2.085)
+    tracked = {geometry: _lam_for(2.62)}
+    _api._advance_tracked_lam(
+        tracked, geometry, {"lam": _lam_for(0.4), "guided": False}
+    )
+    assert tracked[geometry] == _lam_for(2.62)
+
+
+def test_a_first_non_guided_solve_records_nothing() -> None:
+    """With no branch to keep, a leaky solve must not seed one either."""
+    geometry = (12.08, 2.085, 2.085)
+    tracked: dict = {}
+    _api._advance_tracked_lam(
+        tracked, geometry, {"lam": _lam_for(0.4), "guided": False}
+    )
+    assert geometry not in tracked
