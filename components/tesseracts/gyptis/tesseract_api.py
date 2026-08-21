@@ -23,6 +23,7 @@
 # shared ``.msh`` (as text, so the host -- not this container's uid -- owns the
 # file) for the ChargeTransport container and the mesh-transfer operator.
 
+import itertools
 from pathlib import Path
 from typing import Any, Literal
 
@@ -73,6 +74,11 @@ _CORE_MESH_SIZE: float = 0.04
 # is inset from the x-PML by construction and sits in the rib band away from the
 # y-PMLs, so no design cell ever touches a PML.
 _DESIGN_Y_INSET: float = 0.0
+
+# Tolerance for locating geometry entities by coordinate. The smallest
+# feature is the 50 nm contact footprint, so 1e-6 um is far below any real
+# separation while still absorbing OCC's coordinate round-off.
+_GEOMETRY_TOL: float = 1e-6
 
 
 #
@@ -183,84 +189,138 @@ def _solve_identity(
     )
 
 
+def _band_columns() -> tuple[tuple[float, float], ...]:
+    """The x intervals every silicon band is cut into, left to right.
+
+    The slab and the rib band are built from the *same* columns so that the
+    curves along their shared interface are exactly coincident and
+    ``remove_all_duplicates`` (run at the end of ``LayeredBoxPML2D.__init__``)
+    merges each pair into one curve owned by both bands. Cutting the two bands
+    independently -- or fragmenting one of them afterwards, as this geometry did
+    until ticket 14 -- leaves each side with its own curve and its own 1D mesh.
+    The silicon domain ChargeTransport then solves on falls into two
+    disconnected pieces: a slab carrying both contacts, and a rib island that
+    never sees the applied bias and whose quasi-Fermi levels are fixed only up
+    to a free constant.
+
+    The column edges are the rib sides and the two contact footprints, so the
+    contacts are real edges of the silicon surfaces rather than lines embedded
+    into them.
+    """
+    contact_inner = _RIB_HALF_WIDTH + _CONTACT_OFFSET
+    contact_outer = contact_inner + 2 * _CONTACT_HALF_WIDTH
+    edges = (
+        -_WIDTH / 2,
+        -contact_outer,
+        -contact_inner,
+        -_RIB_HALF_WIDTH,
+        _RIB_HALF_WIDTH,
+        contact_inner,
+        contact_outer,
+        _WIDTH / 2,
+    )
+    return tuple(itertools.pairwise(edges))
+
+
+def _contact_span(name: str) -> tuple[float, float]:
+    """The (x_min, x_max) footprint of a contact on the slab top."""
+    contact_inner = _RIB_HALF_WIDTH + _CONTACT_OFFSET
+    contact_outer = contact_inner + 2 * _CONTACT_HALF_WIDTH
+    if name == "contact_anode":
+        return -contact_outer, -contact_inner
+    return contact_inner, contact_outer
+
+
 def _rib_box_pml_2d() -> Any:
     """Build the ``RibBoxPML2D`` class extending gyptis ``LayeredBoxPML2D``.
 
     Deferred behind a function so the gyptis import stays lazy (the class body
-    subclasses a gyptis type). Ported from the ticket-01 spike: a silicon rib is
-    embedded in the oxide rib band, inset from the x-PML, with Ohmic contact
-    lines split into the slab-top interface on each shoulder.
+    subclasses a gyptis type). A silicon rib sits in the centre of the oxide rib
+    band, inset from the x-PML, over a full-width silicon slab that carries an
+    Ohmic contact line on each shoulder.
     """
     gyptis = _ensure_gyptis()
 
     class RibBoxPML2D(gyptis.geometry.LayeredBoxPML2D):  # type: ignore[misc]
         """LayeredBoxPML2D with an embedded silicon rib + contact lines."""
 
-        def add_rib(self) -> None:
-            # Embed a silicon rectangle in the centre of the oxide "rib" band,
-            # inset from +/- WIDTH/2 (the x-PML). The oxide remainder of the band
-            # keeps the "rib" material tag so pml_x_rib matches oxide; the centred
-            # silicon surface is tagged "rib_silicon".
-            y0_rib = self.y_position["rib"]
-            rib = self.add_rectangle(
-                -_RIB_HALF_WIDTH, y0_rib, 0, 2 * _RIB_HALF_WIDTH, _LAYER_THICKNESS["rib"]
-            )
-            band = self.subdomains_entities["surfaces"]["rib"]
-            self.fragment(rib, band)  # conform the mesh across the rib/oxide edge
+        def make_layer(self, y_position: float, thickness: float) -> Any:
+            """Cut the two silicon-bearing bands into the shared columns.
+
+            Called by ``LayeredBoxPML2D.__init__`` once per layer. Every other
+            layer stays the single full-width rectangle gyptis builds.
+            """
+            if not any(
+                abs(y_position - self._layer_y(name)) < _GEOMETRY_TOL
+                for name in ("slab", "rib")
+            ):
+                return super().make_layer(y_position, thickness)
+            return [
+                self.add_rectangle(x0, y_position, 0, x1 - x0, thickness)
+                for x0, x1 in _band_columns()
+            ]
+
+        def _layer_y(self, name: str) -> float:
+            """Bottom y of a named layer, usable before ``y_position`` is filled."""
+            y = -self.total_thickness / 2
+            for layer_name, thickness in self.thicknesses.items():
+                if layer_name == name:
+                    return y
+                y += thickness
+            raise KeyError(f"no layer named {name!r}")
+
+        def tag_rib_silicon(self) -> None:
+            """Split the rib band's physical group into oxide and silicon.
+
+            The band's centre column is the silicon rib; the oxide remainder
+            keeps the ``rib`` material tag so ``pml_x_rib`` still matches the
+            oxide background either side of it.
+            """
             self.synchronize()
-            e = 1e-6
-            sils = self.model.getEntitiesInBoundingBox(
-                -_RIB_HALF_WIDTH - e, y0_rib - e, -e,
-                _RIB_HALF_WIDTH + e, y0_rib + _LAYER_THICKNESS["rib"] + e, e, 2,
+            band = list(self.subdomains_entities["surfaces"]["rib"])
+            core = [tag for tag in band if self._spans_rib_core(tag)]
+            if len(core) != 1:
+                raise RuntimeError(
+                    f"expected exactly one silicon column in the rib band, "
+                    f"found {len(core)} of {len(band)} surfaces"
+                )
+            oxide = [tag for tag in band if tag not in core]
+            self.model.removePhysicalGroups([(2, self.subdomains["surfaces"]["rib"])])
+            self.add_physical(oxide, "rib")
+            self.add_physical(core, "rib_silicon")
+
+        def _spans_rib_core(self, surface: int) -> bool:
+            xmin, _ymin, _zmin, xmax, _ymax, _zmax = self.model.getBoundingBox(
+                2, surface
             )
-            rib_tags = [t for (_d, t) in sils]
-            allband = self.model.getEntitiesInBoundingBox(
-                -self.width / 2 - e, y0_rib - e, -e,
-                self.width / 2 + e, y0_rib + _LAYER_THICKNESS["rib"] + e, e, 2,
+            return (
+                abs(xmin + _RIB_HALF_WIDTH) < _GEOMETRY_TOL
+                and abs(xmax - _RIB_HALF_WIDTH) < _GEOMETRY_TOL
             )
-            oxide_tags = [t for (_d, t) in allband if t not in rib_tags]
-            self.add_physical(rib_tags, "rib_silicon")
-            self.add_physical(oxide_tags, "rib")
 
         def add_contacts(self) -> None:
-            # Ohmic contacts are dim-1 lines on the slab-top interface (bottom of
-            # the rib band), one per shoulder, offset from the rib edge. Splitting
-            # the existing interface curve (0d-into-1d fragment) never renumbers
-            # surfaces, so the material physical groups survive; embedding each
-            # contact into both neighbouring surfaces makes their triangles share
-            # its nodes so ExtendableGrids retains it for the CT silicon subgrid.
-            e = 1e-6
+            """Tag the two Ohmic contact lines on the slab shoulders.
+
+            The contact footprints are column edges of both silicon bands, so
+            each is already a single curve shared by the slab below and the
+            oxide above -- no fragmenting, no ``mesh.embed``, and no orphan
+            points left over from either.
+            """
+            self.synchronize()
             y = self.y_position["rib"]  # slab top
-            xc_l = -_RIB_HALF_WIDTH - _CONTACT_OFFSET - _CONTACT_HALF_WIDTH
-            xc_r = _RIB_HALF_WIDTH + _CONTACT_OFFSET + _CONTACT_HALF_WIDTH
-            contacts = {"contact_anode": xc_l, "contact_cathode": xc_r}
-
-            pts = []
-            for xc in contacts.values():
-                pts.append(self.add_point(xc - _CONTACT_HALF_WIDTH, y, 0))
-                pts.append(self.add_point(xc + _CONTACT_HALF_WIDTH, y, 0))
-            self.synchronize()
-
-            iface = self.model.getEntitiesInBoundingBox(
-                -self.width / 2 - e, y - e, -e, self.width / 2 + e, y + e, e, 1,
-            )
-            self.occ.fragment([(0, p) for p in pts], iface)
-            self.synchronize()
-
-            for name, xc in contacts.items():
-                segs = self.model.getEntitiesInBoundingBox(
-                    xc - _CONTACT_HALF_WIDTH - e, y - e, -e,
-                    xc + _CONTACT_HALF_WIDTH + e, y + e, e, 1,
+            for name in ("contact_anode", "contact_cathode"):
+                xmin, xmax = _contact_span(name)
+                e = _GEOMETRY_TOL
+                segments = self.model.getEntitiesInBoundingBox(
+                    xmin - e, y - e, -e, xmax + e, y + e, e, 1
                 )
-                tags = [t for (_d, t) in segs]
+                tags = [tag for (_dim, tag) in segments]
+                if len(tags) != 1:
+                    raise RuntimeError(
+                        f"expected one {name} curve on the slab top, found "
+                        f"{len(tags)}; the slab and rib bands are not merged"
+                    )
                 self.add_physical(tags, name, dim=1)
-                nearby = self.model.getEntitiesInBoundingBox(
-                    xc - _CONTACT_HALF_WIDTH - e, y - e, -e,
-                    xc + _CONTACT_HALF_WIDTH + e, y + e, e, 2,
-                )
-                for tag in tags:
-                    for _d, surface in nearby:
-                        self.model.mesh.embed(1, tag, 2, surface)
 
     return RibBoxPML2D
 
@@ -296,9 +356,10 @@ def _build_waveguide(
         mesh_name="unified_mesh.msh",
         binary_mesh=False,
     )
-    geom.add_rib()
+    geom.tag_rib_silicon()
     geom.add_contacts()
     geom.set_size("rib_silicon", _CORE_MESH_SIZE)
+    geom.set_size("slab", _CORE_MESH_SIZE)
     geom.build()
 
     # Oxide everywhere except the two silicon regions (slab + rib interior). The
@@ -422,14 +483,19 @@ def write_mesh(
 def _pin_orphan_dofs(A: Any, B: Any) -> None:
     """Give a unit diagonal to any DOF whose A and B rows are both empty.
 
-    The shared unified mesh carries Ohmic contact lines embedded into the silicon
-    surfaces so ChargeTransport can retain them (ticket 05); a handful of the
-    edge DOFs those embedded internal lines introduce couple to nothing in the
-    curl-curl formulation, leaving zero rows in A and B. The shift-invert
-    factorization ``(A - sigma B)`` then hits a zero pivot. Pinning each such DOF
-    to ``A[i,i] = B[i,i] = 1`` gives it the isolated eigenvalue ``1`` -- far
-    outside the guided window ``(n_clad, n_core)`` at this wavenumber, so it is
-    never the tracked mode and never enters the field sensitivity.
+    A DOF that couples to nothing leaves zero rows in both A and B, and the
+    shift-invert factorization ``(A - sigma B)`` then hits a zero pivot. Pinning
+    each such DOF to ``A[i,i] = B[i,i] = 1`` gives it the isolated eigenvalue
+    ``1`` -- far outside the guided window ``(n_clad, n_core)`` at this
+    wavenumber, so it is never the tracked mode and never enters the field
+    sensitivity.
+
+    The shared mesh no longer produces any: it used to embed the Ohmic contact
+    lines into the silicon surfaces, which left orphan mesh nodes behind, and the
+    contacts are now ordinary edges of the silicon columns (ticket 14, asserted
+    by ``test_unified_mesh_has_no_orphan_nodes``). This stays as a cheap guard so
+    a future geometry change degrades into a harmless spurious eigenvalue rather
+    than a factorization failure.
     """
     rstart, rend = A.getOwnershipRange()
     orphans = [

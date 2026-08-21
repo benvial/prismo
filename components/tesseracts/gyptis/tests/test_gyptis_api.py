@@ -242,3 +242,130 @@ def test_vjp_field_matches_finite_difference() -> None:
         fd = (fp - fm) / (2 * h)
         rel = abs(fd - grad[local]) / max(abs(grad[local]), 1e-12)
         assert rel < 1e-3, f"cell {local}: rel-err {rel:.2e}"
+
+
+# ---------------------------------------------------------------------------
+# Shared unified mesh (ticket 14)
+# ---------------------------------------------------------------------------
+
+
+def _silicon_mesh_topology(mesh_path: str) -> dict[str, object]:
+    """Silicon triangles, contact-line nodes and orphan nodes of a shared mesh.
+
+    ChargeTransport solves on the silicon subdomain of the shared mesh -- the
+    ``slab`` and ``rib_silicon`` groups -- with the applied bias entering through
+    the ``contact_anode``/``contact_cathode`` lines. That only describes a device
+    if the two silicon groups are one connected domain and the contact lines lie
+    on it.
+    """
+    import gmsh
+
+    was_initialized = gmsh.isInitialized()
+    if not was_initialized:
+        gmsh.initialize()
+    try:
+        gmsh.open(mesh_path)
+        node_tags, _coords, _ = gmsh.model.mesh.getNodes()
+        entity_groups: dict[int, list[str]] = {}
+        for dim, tag in gmsh.model.getPhysicalGroups():
+            name = gmsh.model.getPhysicalName(dim, tag)
+            for entity in gmsh.model.getEntitiesForPhysicalGroup(dim, tag):
+                entity_groups.setdefault(entity if dim == 2 else -entity, []).append(
+                    name
+                )
+
+        triangles: list[tuple[int, ...]] = []
+        used_nodes: set[int] = set()
+        for _dim, entity in gmsh.model.getEntities(2):
+            names = entity_groups.get(entity, [])
+            element_types, _, element_nodes = gmsh.model.mesh.getElements(2, entity)
+            for element_type, nodes in zip(element_types, element_nodes, strict=True):
+                _n, dim, _o, nodes_per_element, _p, _q = (
+                    gmsh.model.mesh.getElementProperties(element_type)
+                )
+                if dim != 2 or nodes_per_element != 3:
+                    continue
+                cells = np.asarray(nodes, dtype=np.int64).reshape(-1, 3)
+                used_nodes.update(int(t) for t in cells.ravel())
+                if any(name in ("slab", "rib_silicon") for name in names):
+                    triangles.extend(tuple(int(t) for t in cell) for cell in cells)
+
+        contact_nodes: set[int] = set()
+        for _dim, entity in gmsh.model.getEntities(1):
+            names = entity_groups.get(-entity, [])
+            if not any(name.startswith("contact_") for name in names):
+                continue
+            _types, _tags, element_nodes = gmsh.model.mesh.getElements(1, entity)
+            for nodes in element_nodes:
+                contact_nodes.update(int(t) for t in nodes)
+
+        orphans = {int(t) for t in node_tags} - used_nodes
+    finally:
+        gmsh.clear()
+        if not was_initialized:
+            gmsh.finalize()
+
+    return {
+        "triangles": triangles,
+        "contact_nodes": contact_nodes,
+        "orphan_nodes": orphans,
+    }
+
+
+def _connected_components(triangles: list[tuple[int, ...]]) -> list[set[int]]:
+    """Node sets of the connected components of a triangle soup."""
+    adjacency: dict[int, set[int]] = {}
+    for a, b, c in triangles:
+        for u, v in ((a, b), (b, c), (c, a)):
+            adjacency.setdefault(u, set()).add(v)
+            adjacency.setdefault(v, set()).add(u)
+
+    components: list[set[int]] = []
+    unvisited = set(adjacency)
+    while unvisited:
+        stack = [unvisited.pop()]
+        component = set(stack)
+        while stack:
+            for neighbour in adjacency[stack.pop()]:
+                if neighbour not in component:
+                    component.add(neighbour)
+                    unvisited.discard(neighbour)
+                    stack.append(neighbour)
+        components.append(component)
+    return components
+
+
+@pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
+def test_unified_mesh_silicon_is_one_contacted_domain(tmp_path: Path) -> None:
+    mesh_text, _vertices = _api.write_mesh()
+    mesh_path = tmp_path / "unified.msh"
+    mesh_path.write_text(mesh_text)
+    topology = _silicon_mesh_topology(str(mesh_path))
+
+    components = _connected_components(topology["triangles"])
+    assert len(components) == 1, (
+        f"silicon splits into {len(components)} disconnected pieces "
+        f"(sizes {sorted(len(c) for c in components)}); the rib would float "
+        "with no contact and never see the applied bias"
+    )
+
+    silicon_nodes = components[0]
+    contact_nodes = topology["contact_nodes"]
+    assert contact_nodes, "shared mesh carries no contact line elements"
+    assert contact_nodes <= silicon_nodes, (
+        "contact-line nodes sit outside the silicon domain: "
+        f"{sorted(contact_nodes - silicon_nodes)}"
+    )
+
+
+@pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
+def test_unified_mesh_has_no_orphan_nodes(tmp_path: Path) -> None:
+    mesh_text, _vertices = _api.write_mesh()
+    mesh_path = tmp_path / "unified.msh"
+    mesh_path.write_text(mesh_text)
+    topology = _silicon_mesh_topology(str(mesh_path))
+    assert not topology["orphan_nodes"], (
+        "nodes belong to no cell: "
+        f"{sorted(topology['orphan_nodes'])}; they leave zero rows in the "
+        "eigenproblem and false contact geometry for ChargeTransport"
+    )

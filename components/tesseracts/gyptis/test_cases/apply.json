@@ -209,9 +209,12 @@
             "shape": [],
             "dtype": "float64",
             "data": {
-                "buffer": 9.166306560652364,
+                "buffer": 7.7599437465120475,
                 "encoding": "json"
             }
-        }
+        },
+        "design_cell_centroids": null,
+        "mesh_text": null,
+        "design_cell_vertices": null
     }
 }

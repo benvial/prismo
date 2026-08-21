@@ -21,7 +21,12 @@ using JSON
 include(joinpath(@__DIR__, "ct_common.jl"))
 include(joinpath(@__DIR__, "ct_adjoint.jl"))
 
-const MINIMAL_TRIANGLE_MSH = """
+# A three-cell strip with an Ohmic contact at each end of its bottom edge, one
+# free cell apart. Both contacts have to be distinct faces of the silicon
+# boundary that share no node: ``silicon_grid`` refuses a device where either is
+# missing (ticket 14), and a node belonging to both would carry two conflicting
+# Ohmic Dirichlet values once the bias is applied.
+const MINIMAL_DEVICE_MSH = """
 \$MeshFormat
 2.2 0 8
 \$EndMeshFormat
@@ -32,17 +37,26 @@ const MINIMAL_TRIANGLE_MSH = """
 2 3 "slab"
 \$EndPhysicalNames
 \$Nodes
-3
+8
 1 0.0 0.0 0.0
 2 1e-7 0.0 0.0
-3 0.0 1e-7 0.0
+3 2e-7 0.0 0.0
+4 3e-7 0.0 0.0
+5 0.0 1e-7 0.0
+6 1e-7 1e-7 0.0
+7 2e-7 1e-7 0.0
+8 3e-7 1e-7 0.0
 \$EndNodes
 \$Elements
-4
+8
 1 1 2 1 1 1 2
-2 1 2 2 2 2 3
-3 1 2 1 3 3 1
-4 2 2 3 4 1 2 3
+2 1 2 2 2 3 4
+3 2 2 3 3 1 2 6
+4 2 2 3 3 1 6 5
+5 2 2 3 3 2 3 7
+6 2 2 3 3 2 7 6
+7 2 2 3 3 3 4 8
+8 2 2 3 3 3 8 7
 \$EndElements
 """
 
@@ -89,8 +103,8 @@ function main()
 
         # 2D Gmsh mesh path (physical-group contacts)
         mesh_path = joinpath(tmp, "tiny.msh")
-        write(mesh_path, MINIMAL_TRIANGLE_MSH)
-        exercise(fill(1e22, 3), mesh_path, -1.0)
+        write(mesh_path, MINIMAL_DEVICE_MSH)
+        exercise(fill(1e22, 8), mesh_path, -1.0)
     end
     println("warmup done")
 end

@@ -132,8 +132,14 @@ function silicon_grid(full, silicon_ids, anode_breg, cathode_breg)
         parent_nodes = node_parents[[local_edge[1], local_edge[2]]]
         xy = full[Coordinates][:, parent_nodes]
         for (bregion, xmin, xmax, y) in contact_segments
-            overlaps = max(minimum(xy[1, :]), xmin) <= min(maximum(xy[1, :]), xmax) + 1e-12
-            if overlaps && all(abs.(xy[2, :] .- y) .< 1e-12)
+            # Containment, not overlap: the shared mesh cuts the silicon bands at
+            # the contact footprints (ticket 14), so a contact face coincides with
+            # a contact segment exactly. Accepting any face that merely *touches*
+            # one would also swallow the neighbouring shoulder face, silently
+            # widening the contact to whatever the coarse slab meshing produced.
+            contained = minimum(xy[1, :]) >= xmin - 1e-12 &&
+                        maximum(xy[1, :]) <= xmax + 1e-12
+            if contained && all(abs.(xy[2, :] .- y) .< 1e-12)
                 bfaceregions[i] = bregion
             end
         end
@@ -143,7 +149,59 @@ function silicon_grid(full, silicon_ids, anode_breg, cathode_breg)
         full[Coordinates][:, node_parents], cells, ones(Int64, size(cells, 2)), bfaces, bfaceregions,
     )
     grid[NodeParents] = node_parents
+    check_contacted_device(grid, cells, bfaceregions, anode_breg, cathode_breg)
     return grid
+end
+
+"""Fail loudly unless the silicon subgrid is one region reachable from both contacts.
+
+A drift-diffusion solve on a silicon domain that falls into disconnected pieces
+still converges, and converges quietly: any piece carrying no contact is a pure
+Neumann problem whose quasi-Fermi levels are fixed only up to a free constant,
+so it never responds to the applied bias and Newton settles on whichever member
+of that family it drifts into. That is exactly how a non-conformal slab/rib
+interface in the shared mesh left the design region floating, with the composed
+objective reading a bias-independent gauge instead of depletion (ticket 14).
+Nothing downstream can detect it, so the invariant is asserted here.
+"""
+function check_contacted_device(grid, cells, bfaceregions, anode_breg, cathode_breg)
+    n_nodes = size(grid[Coordinates], 2)
+    component = zeros(Int, n_nodes)
+    neighbours = [Int[] for _ in 1:n_nodes]
+    for cell in eachcol(cells)
+        for (a, b) in ((cell[1], cell[2]), (cell[2], cell[3]), (cell[3], cell[1]))
+            push!(neighbours[a], b)
+            push!(neighbours[b], a)
+        end
+    end
+    n_components = 0
+    for start in 1:n_nodes
+        component[start] == 0 || continue
+        n_components += 1
+        stack = [start]
+        component[start] = n_components
+        while !isempty(stack)
+            node = pop!(stack)
+            for other in neighbours[node]
+                if component[other] == 0
+                    component[other] = n_components
+                    push!(stack, other)
+                end
+            end
+        end
+    end
+    n_components == 1 || error(
+        "silicon subgrid is not connected ($n_components pieces): the shared " *
+        "mesh does not conform across the silicon material interfaces, so part " *
+        "of the device cannot see the contacts",
+    )
+    for (name, bregion) in (("anode", anode_breg), ("cathode", cathode_breg))
+        count(==(bregion), bfaceregions) > 0 || error(
+            "silicon subgrid has no $name contact face; the contact lines in the " *
+            "shared mesh do not lie on the silicon boundary",
+        )
+    end
+    return nothing
 end
 
 # Build grid + ChargeTransport system for a full shared-mesh doping profile.
@@ -189,6 +247,11 @@ function build_ct_system(doping, mesh_path)
     data = Data(grid, 2)
     data.modelType = Stationary
 
+    # Auger, radiative and Shockley-Read-Hall all stay off: at depletion-modulator
+    # bias the carrier profile is set by the electrostatics and the contacts, not
+    # by recombination. Switching SRH on was measured to leave the whole 0 -> -5 V
+    # ramp unchanged to five digits, while nudging a few design nodes off pure
+    # depletion (ticket 14).
     data.bulkRecombination = set_bulk_recombination(
         iphin = 1, iphip = 2,
         bulk_recomb_Auger = false,
