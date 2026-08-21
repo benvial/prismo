@@ -1,6 +1,6 @@
 # 0001 — gyptis consumes a permittivity field on the design region
 
-Status: Accepted (2026-08-19)
+Status: Accepted (2026-08-19) — mesh-transfer bullet superseded by ADR 0002
 
 ## Context
 
@@ -39,6 +39,8 @@ approximation is retired.
   charge-transport mesh, so the nodal perturbation is carried onto the design
   cells by point-location (barycentric) interpolation — a static, silicon-only,
   partition-of-unity operator (`prismo.mesh_transfer`).
+  *(Superseded by ADR 0002: the two solvers now share one mesh, so the transfer
+  is an exact 1/3-per-vertex restriction rather than an interpolation.)*
 - **JAX driver unchanged.** The outer optimization driver (density filter +
   projection) stays in JAX; `gyptis.optimize` is not adopted.
 

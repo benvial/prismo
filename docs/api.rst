@@ -13,6 +13,12 @@ API Reference
 .. automodule:: prismo.density_filter
    :members:
 
+.. automodule:: prismo.mesh_transfer
+   :members:
+
+.. automodule:: prismo.differentiable_component
+   :members:
+
 .. automodule:: prismo.waveguide_mesh
    :members:
 

@@ -28,16 +28,18 @@ New to Tesseract? Start with the [Tesseract Core docs](https://docs.pasteurlabs.
 │   ├── requirements.txt             # tesseract-core
 │   ├── prismo
 │   │   ├── __init__.py
-│   │   ├── main.py                  # CLI entrypoint (typer)
+│   │   ├── main.py                  # CLI entrypoint (typer): run, validate-gradient
+│   │   ├── pipeline.py              # θ → Δneff, JAX-differentiable end to end
+│   │   ├── optimizer.py             # NLopt MMA loop over the signed design field
 │   │   ├── density_filter.py        # Andreassen density filter (sparse H matrix)
 │   │   ├── soref_bennett.py         # Carrier → permittivity coupling layer
-│   │   ├── waveguide_mesh.py        # SOI rib waveguide Gmsh mesh builder
+│   │   ├── mesh_transfer.py         # Nodal field → design-cell exact restriction
+│   │   ├── differentiable_component.py  # Tesseract apply/VJP adapter
+│   │   ├── outputs.py               # Headline figures + gradient validation
+│   │   ├── waveguide_mesh.py        # Local (non-container) Gmsh mesh fallback
 │   │   └── _version.py
+│   ├── outputs/                     # Generated figures
 │   └── tests
-│       ├── test_main.py
-│       ├── test_density_filter.py
-│       ├── test_soref_bennett.py
-│       └── test_waveguide_mesh.py
 # 🧩 Component code
 ├── components
 │   ├── shared_code
@@ -70,20 +72,25 @@ New to Tesseract? Start with the [Tesseract Core docs](https://docs.pasteurlabs.
 ├── CONTEXT.md                       # Domain glossary
 ├── RULES.md                         # Hackathon brief
 └── docs/
+    ├── adr/                         # Architecture decision records
     ├── agents/                      # Agent workflow reference
     └── research/                    # Research memos
 ```
 
 ## Solver components
 
-Three Tesseracts implement the same PN-junction phase-shifter problem with different physics engines and autodiff strategies:
+Two Tesseracts split the PN-junction phase-shifter problem across two physics engines and two autodiff strategies:
 
-| Tesseract | Engine | Language | Adjoint strategy |
-|---|---|---|---|
-| `gyptis` | gyptis / FEniCS | conda | Eigen-adjoint (Hellmann-Feynman) |
-| `chargetransport` | ChargeTransport.jl | Python + Julia | Discrete adjoint |
+| Tesseract | Engine | Language | Solves on | Adjoint strategy |
+|---|---|---|---|---|
+| `gyptis` | gyptis / FEniCS | conda | Full optical domain | Eigen-adjoint (Hellmann-Feynman) |
+| `chargetransport` | ChargeTransport.jl | Python + Julia | Silicon subdomain | Discrete adjoint |
 
-Shared Pydantic schemas (`components/shared_code/`) define the mesh and carrier/permittivity field exchange format so any solver can be swapped into the pipeline.
+Both consume **one shared mesh**, authored by the gyptis Tesseract's `write_mesh`
+op (see [ADR 0002](docs/adr/0002-shared-mesh-authored-by-gyptis.md)). Shared
+Pydantic schemas (`components/shared_code/`) define the mesh and
+carrier/permittivity field exchange format so any solver can be swapped into the
+pipeline.
 
 ## Usage
 
@@ -113,12 +120,19 @@ $ make test gyptis
 # Test app only
 $ make test app
 
-# Run app end-to-end (stub)
-$ make run
+# Run the optimization end-to-end against the real solvers
+$ make run-containers
+
+# Validate the composed adjoint against central finite differences
+$ make validate-gradient-containers
 
 # Clean build artifacts and caches
 $ make clean
 ```
+
+There is no stub solver path: `make run` and `make validate-gradient` without
+the containers raise rather than substituting a fake forward or gradient. Tests
+inject explicit doubles through the `components=` seam instead.
 
 ## Adding regression test cases
 

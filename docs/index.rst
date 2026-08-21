@@ -32,13 +32,14 @@
 
    .. grid-item-card:: :iconify:`mdi:vector-triangle` Mesh & geometry
 
-      Waveguide mesh generation and geometry parameterization with Gmsh,
-      plus density-field filtering for topology optimization.
+      One shared Gmsh mesh of the SOI cross-section for both solvers,
+      plus density filtering of the signed design field.
 
    .. grid-item-card:: :iconify:`mdi:chart-line` Differentiable optimization
 
       End-to-end adjoint gradients through the PN-junction phase shifter
-      model, from geometry to S-parameters to figure of merit.
+      model, from the signed doping field to the effective-index figure of
+      merit, validated against finite differences.
 
    .. grid-item-card:: :iconify:`mdi:docker` Containerized solvers
 

@@ -1,8 +1,8 @@
 """NLopt MMA optimization loop for the PRISMO pipeline.
 
 Wraps the JAX-differentiable pipeline in an NLopt MMA optimizer.
-Design variables: per-node rho in [0, 1].
-Objective: maximize delta_n_eff (or minimize -delta_n_eff).
+Design variables: the per-node signed design field theta in [-1, 1].
+Objective: maximize signed delta_n_eff (or minimize -delta_n_eff).
 Ref: ticket 15.
 """
 

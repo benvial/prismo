@@ -1,4 +1,4 @@
-"""End-to-end differentiable pipeline: rho -> delta_n_eff.
+"""End-to-end differentiable pipeline: signed design field theta -> delta_n_eff.
 
 Composes density filter -> doping mapping -> ChargeTransport.jl (0V, -5V)
 -> Soref-Bennett coupling -> gyptis -> delta_n_eff into a single
