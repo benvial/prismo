@@ -365,3 +365,84 @@ class TestOptimizeDopingThreadsMeshRef:
         # never None.
         assert ct.mesh_paths, "ChargeTransport was never called"
         assert all(p == f"{_CT_MESH_MOUNT}/waveguide.msh" for p in ct.mesh_paths)
+
+
+class TestOptimizeDopingSurvivesSolverFailure:
+    """A failed physics solve ends the run on the best feasible design.
+
+    ChargeTransport's Newton solve diverges on some designs MMA proposes. NLopt
+    cannot be told to reject a trial point, and feeding MMA a fabricated penalty
+    poisons its asymptote update, so the optimizer stops and keeps the best
+    design whose physics actually solved instead of crashing the whole run.
+    """
+
+    N_NODES = 4
+
+    def test_keeps_best_feasible_design(self):
+        target = np.full(self.N_NODES, 0.8, dtype=float)
+        target_j = jnp.asarray(target)
+        calls = {"n": 0}
+        # ``on_iteration`` sees the concrete candidate; the pipeline mock only
+        # ever sees a JAX tracer, so candidates must be captured here.
+        candidates: list[np.ndarray] = []
+
+        def mock_pipeline(rho, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 4:
+                raise RuntimeError("Julia forward solve failed: ConvergenceError()")
+            return -jnp.sum((rho - target_j) ** 2)
+
+        with mock.patch("prismo.optimizer.pipeline", side_effect=mock_pipeline):
+            rho_opt, history = optimize_doping(
+                initial_rho=np.full(self.N_NODES, 0.25, dtype=float),
+                max_iter=100,
+                ftol_rel=1e-8,
+                # Count real evaluations: under JIT the mock is traced once and
+                # the raise would never reach the optimizer at run time.
+                use_jit=False,
+                on_iteration=lambda i, r: candidates.append(r),
+            )
+
+        assert calls["n"] == 4, "run continued past the failed solve"
+        # The failed trial is not a physics evaluation, so it stays out of
+        # history -- main.py audits every entry there for a valid signal.
+        assert len(history) == 3
+        # The returned design is the best of the three that actually solved.
+        feasible = candidates[:3]
+        best = max(feasible, key=lambda r: -float(np.sum((r - target) ** 2)))
+        np.testing.assert_allclose(rho_opt, best)
+
+    def test_failure_on_the_seed_still_raises(self):
+        def mock_pipeline(rho, **kwargs):
+            raise RuntimeError("Julia forward solve failed: ConvergenceError()")
+
+        with (
+            mock.patch("prismo.optimizer.pipeline", side_effect=mock_pipeline),
+            pytest.raises(RuntimeError, match="ConvergenceError"),
+        ):
+            optimize_doping(
+                initial_rho=np.full(self.N_NODES, 0.25, dtype=float),
+                max_iter=10,
+                use_jit=False,
+            )
+
+    def test_stalled_design_stops_instead_of_burning_evaluations(self):
+        """A design MMA re-proposes unchanged must not cost solves forever."""
+        calls = {"n": 0}
+
+        def mock_pipeline(rho, **kwargs):
+            calls["n"] += 1
+            # Flat objective: every trial point is identical to the last, which
+            # is the degenerate loop observed against the real containers.
+            return jnp.asarray(1.0, dtype=jnp.float64)
+
+        with mock.patch("prismo.optimizer.pipeline", side_effect=mock_pipeline):
+            rho_opt, _ = optimize_doping(
+                initial_rho=np.full(self.N_NODES, 0.25, dtype=float),
+                max_iter=500,
+                ftol_rel=0.0,
+                use_jit=False,
+            )
+
+        assert calls["n"] < 20, f"stall guard did not fire ({calls['n']} solves)"
+        assert rho_opt.shape == (self.N_NODES,)

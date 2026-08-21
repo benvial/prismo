@@ -75,13 +75,20 @@ function ensure_profile!(state, doping, mesh_path, mesh_key, profile_key)
     state.equilibrium_sol = nothing
     empty!(state.forward_solutions)
     silicon_doping = doping[state.node_parents]
-    equilibrium_sol = solve_equilibrium_with_warm_start(
-        state.ctsys,
-        state.data,
-        silicon_doping,
-        state.control,
-        state.warm_equilibrium,
-    )
+    # Label the stage: both the equilibrium and the biased solve surface as a
+    # bare VoronoiFVM.ConvergenceError once the error string crosses the worker
+    # boundary, which leaves a failure undiagnosable from the Python side.
+    equilibrium_sol = try
+        solve_equilibrium_with_warm_start(
+            state.ctsys,
+            state.data,
+            silicon_doping,
+            state.control,
+            state.warm_equilibrium,
+        )
+    catch e
+        error("equilibrium solve failed: $(e)")
+    end
     state.profile_key = profile_key
     state.equilibrium_sol = deepcopy(equilibrium_sol)
     state.warm_equilibrium = deepcopy(equilibrium_sol)
@@ -111,15 +118,19 @@ function forward_solution!(state, doping, mesh_path, mesh_key, profile_key, bias
         sol = deepcopy(state.equilibrium_sol)
         used_warm_start = !profile_changed
     else
-        sol = solve_at_bias_with_warm_start(
-            state.ctsys,
-            state.control,
-            deepcopy(state.equilibrium_sol),
-            bias_voltage,
-            state.cathode_breg,
-            state.n_bregions,
-            get(state.warm_bias_solutions, bias_voltage, nothing),
-        )
+        sol = try
+            solve_at_bias_with_warm_start(
+                state.ctsys,
+                state.control,
+                deepcopy(state.equilibrium_sol),
+                bias_voltage,
+                state.cathode_breg,
+                state.n_bregions,
+                get(state.warm_bias_solutions, bias_voltage, nothing),
+            )
+        catch e
+            error("biased solve at $(bias_voltage) V failed: $(e)")
+        end
         used_warm_start = haskey(state.warm_bias_solutions, bias_voltage)
     end
 

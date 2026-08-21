@@ -383,27 +383,58 @@ end
 # NaNs from overflowed Boltzmann factors (p-type, almost any magnitude).
 #
 # Instead we solve the FULL nonlinear problem (λ1 = 1) directly, but
-# ramp the doping profile in factor-10 steps from a near-intrinsic
-# magnitude, warm-starting each solve from the previous one. Every Newton
-# solve then starts inside its basin of attraction (ticket 17).
+# ramp the doping profile from a near-intrinsic magnitude, warm-starting each
+# solve from the previous one. Every Newton solve then starts inside its basin
+# of attraction (ticket 17). The step is adaptive: a decade at a time is only
+# the nominal schedule, and it is halved wherever Newton cannot cross.
+
+# Smallest magnitude-continuation step, in decades of doping. The ramp is in
+# log10 space, so this is the analogue of ``CT_BIAS_STEP_MIN`` for the bias ramp.
+const CT_DOPING_STEP_MIN = 1e-4
+const CT_DOPING_MAX_FAILURES = 400  # hard bound on retries: never hang
+
 function solve_equilibrium(ctsys, data, doping, control)
-    grid = ctsys.fvmsys.grid
     fvmsys = ctsys.fvmsys
 
     configure_equilibrium!(ctsys, data)
 
     start_doping = 1e10  # near-intrinsic: converges from a zero start
     max_doping = maximum(abs.(doping); init = 0.0)
-    nsteps = max(1, ceil(Int, log10(max(max_doping, start_doping) / start_doping)))
-    scales = 10 .^ range(log10(start_doping / max(max_doping, start_doping)), 0.0,
-                         length = nsteps + 1)
+    # Ramp the doping magnitude in log10 space from t0 (near-intrinsic) to 0
+    # (the requested profile). A fixed one-decade step is only the *nominal*
+    # schedule: a free-form design the optimizer proposes can make some decade
+    # too hard for Newton, and an unguarded ramp then throws ConvergenceError
+    # out of the whole forward solve. Halve the step on failure and regrow it on
+    # success, mirroring the bias ramp in ``solve_at_bias``.
+    t0 = log10(start_doping / max(max_doping, start_doping))
+    step = t0 < 0.0 ? -t0 / max(1, ceil(Int, -t0)) : 1.0
 
     sol = VoronoiFVM.unknowns(fvmsys, inival = 0.0)
-    for s in scales
-        set_doping!(data, doping .* s)
-        sol = VoronoiFVM.solve(fvmsys, inival = sol, control = control)
+    set_doping!(data, doping .* 10.0^t0)
+    sol = VoronoiFVM.solve(fvmsys, inival = sol, control = control)
+
+    t = t0
+    failures = 0
+    while t < 0.0
+        t_next = min(t + step, 0.0)
+        set_doping!(data, doping .* 10.0^t_next)
+        try
+            sol = VoronoiFVM.solve(fvmsys, inival = sol, control = control)
+            t = t_next
+            step = min(step * 1.5, 1.0)
+        catch e
+            if (e isa VoronoiFVM.ConvergenceError || e isa VoronoiFVM.AssemblyError) &&
+               failures < CT_DOPING_MAX_FAILURES && step / 2 >= CT_DOPING_STEP_MIN
+                failures += 1
+                step /= 2
+                set_doping!(data, doping .* 10.0^t)
+            else
+                rethrow()
+            end
+        end
     end
 
+    set_doping!(data, doping)
     store_equilibrium_contact_data!(ctsys, data, sol)
     return sol
 end

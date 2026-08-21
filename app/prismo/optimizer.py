@@ -30,6 +30,29 @@ from prismo.pipeline import (
 
 _HistoryEntry = dict[str, Any]
 
+# Below this the seed objective is treated as numerically indistinguishable
+# from zero and normalisation is skipped rather than amplifying noise.
+_OBJECTIVE_SCALE_FLOOR = 1e-30
+
+# Consecutive evaluations at a bitwise-identical design before the loop is
+# declared stalled. MMA's inner conservative loop legitimately re-proposes a
+# point a couple of times; past that it is looping, and every repeat costs a
+# full multiphysics solve.
+_MAX_STALLED_EVALUATIONS = 5
+
+
+class _StopOptimization(Exception):
+    """Internal: end the NLopt loop and keep the best feasible design.
+
+    NLopt has no way to reject a trial point, so a design whose physics solve
+    diverges cannot be handed back as a value without lying to MMA about the
+    function. Feeding it a fabricated penalty poisons MMA's asymptote update and
+    it converges on whatever basin it lands in -- observed driving a run from
+    Delta_neff=+3.4e-4 to a wrong-polarity -3.8e-4 and then re-proposing an
+    identical design forever. Stopping and keeping the best feasible design is
+    the honest outcome.
+    """
+
 
 class OptimizationCancelled(Exception):
     """Raised when the user interrupts the optimization loop."""
@@ -145,6 +168,19 @@ def optimize_doping(
     prev_handler = signal.signal(signal.SIGINT, _sigint_handler)
 
     try:
+        # NLopt's MMA sizes its move from the magnitude of the objective it is
+        # handed: the subproblem step scales linearly with f, so the physical
+        # Delta_n_eff (~1e-4) produces a first step of ~1e-7 and ftol_rel fires
+        # before the design has moved at all -- the run "converges" at the seed.
+        # Normalise so MMA sees an O(1) objective. ftol_rel is relative and the
+        # maximiser of a positively-scaled objective is unchanged, so this moves
+        # only the conditioning; history and printing stay physical.
+        objective_scale: list[float] = []
+
+        # Best design whose physics actually solved, so a run that stops early
+        # still reports a real optimum rather than the trial that broke it.
+        best_feasible: list[tuple[float, np.ndarray]] = []
+        stalled = [0]
 
         def _obj(rho_np: np.ndarray, grad_out: np.ndarray) -> float:
             nonlocal prev_rho
@@ -153,21 +189,52 @@ def optimize_doping(
                 grad_out[:] = 0.0
                 return 0.0
 
+            # Checked before the solve: a repeat costs a full multiphysics
+            # evaluation and tells us nothing new.
+            if prev_rho is not None and np.array_equal(rho_np, prev_rho):
+                stalled[0] += 1
+                if stalled[0] >= _MAX_STALLED_EVALUATIONS:
+                    raise _StopOptimization(
+                        f"design unchanged over {stalled[0]} consecutive evaluations"
+                    )
+            else:
+                stalled[0] = 0
+
             callback_started_at = time.perf_counter()
             iter_count = len(history) + 1
             if on_iteration is not None:
                 on_iteration(iter_count, rho_np.copy())
             rho = jnp.asarray(rho_np)
-            value, grad = value_and_grad_fn(rho)
+            try:
+                value, grad = value_and_grad_fn(rho)
+            except Exception as exc:
+                # Nothing feasible to fall back to: the seed itself is broken,
+                # so surface that rather than pretending the run can continue.
+                if not best_feasible:
+                    raise
+                raise _StopOptimization(
+                    f"physics solve failed at evaluation {iter_count} "
+                    f"({type(exc).__name__}: {exc})"
+                ) from exc
 
             f_val = float(value)
-            grad_out[:] = np.asarray(grad)
+            grad_phys = np.asarray(grad)
+
+            if not objective_scale:
+                objective_scale.append(
+                    1.0 / abs(f_val) if abs(f_val) > _OBJECTIVE_SCALE_FLOOR else 1.0
+                )
+            scale = objective_scale[0]
+
+            grad_out[:] = grad_phys * scale
+            if not best_feasible or f_val > best_feasible[0][0]:
+                best_feasible[:] = [(f_val, rho_np.copy())]
             callback_time = time.perf_counter() - callback_started_at
 
             delta = 0.0
             if prev_rho is not None:
                 delta = float(np.linalg.norm(rho_np - prev_rho))
-            g_norm = float(np.linalg.norm(grad_out))
+            g_norm = float(np.linalg.norm(grad_phys))
             wall = time.perf_counter() - t_start
 
             history.append(
@@ -186,11 +253,14 @@ def optimize_doping(
                 f"‖Δρ‖={delta:.4e}  "
                 f"‖∇f‖={g_norm:.4e}  "
                 f"callback={callback_time:.1f}s  "
-                f"wall={wall:.1f}s"
+                f"wall={wall:.1f}s",
+                # Each iteration is minutes of solver time; without an explicit
+                # flush the block-buffered stream hides all progress until exit.
+                flush=True,
             )
 
             prev_rho = rho_np.copy()
-            return f_val
+            return f_val * scale
 
         for algorithm in (nlopt.LD_MMA, nlopt.LD_CCSAQ):
             opt = nlopt.opt(algorithm, n_nodes)
@@ -210,6 +280,14 @@ def optimize_doping(
             opt.set_ftol_rel(ftol_rel)
             try:
                 rho_opt = opt.optimize(initial_rho.copy())
+                break
+            except _StopOptimization as exc:
+                rho_opt = best_feasible[0][1]
+                print(
+                    f"      Optimization stopped early: {exc}. Keeping the best "
+                    f"feasible design (Delta_n_eff={best_feasible[0][0]:+.6e}).",
+                    flush=True,
+                )
                 break
             except nlopt.RoundoffLimited as exc:
                 if algorithm == nlopt.LD_MMA and len(history) < min_mma_evaluations:

@@ -218,7 +218,9 @@ def build_pipeline_inputs(
         design_vertices = components.write_mesh(mesh_path_obj)
         actual_mesh = mesh_path_obj
     else:
-        actual_mesh = build_rib_waveguide_mesh(mesh_path=mesh_path_obj, geometry=geometry)
+        actual_mesh = build_rib_waveguide_mesh(
+            mesh_path=mesh_path_obj, geometry=geometry
+        )
         design_vertices = None
     typer.echo(f"      Mesh written to {actual_mesh}")
 
@@ -269,7 +271,9 @@ def build_pipeline_inputs(
         if components is None:
             raise RuntimeError("Container pipeline requires live components")
         if design_vertices is None:
-            raise RuntimeError("Container pipeline requires gyptis design-cell vertices")
+            raise RuntimeError(
+                "Container pipeline requires gyptis design-cell vertices"
+            )
         design_transfer = build_design_transfer(
             components, coords, design_cell_vertices=design_vertices
         )
@@ -414,19 +418,23 @@ def _run_pipeline(
             typer.echo(f"      Final Delta_n_eff = {final_delta_neff:+.6e}")
             # VπLπ headline (V·cm): the field-standard modulation efficiency,
             # reported from Δneff at the fixed -5 V bias (smaller |VπLπ| better).
-            typer.echo(
-                f"      VpiLpi = {vpi_lpi_v_cm(final_delta_neff):+.4e} V·cm"
-            )
+            typer.echo(f"      VpiLpi = {vpi_lpi_v_cm(final_delta_neff):+.4e} V·cm")
     except OptimizationCancelled:
         typer.echo("      Optimization cancelled by user.")
         return
 
     if use_containers:
+        # This audits that the containers produced a *live* signal, not that the
+        # optimizer liked it. The magnitude is what carries that: a dead or
+        # stubbed pipeline reads |Delta_neff| ~ 0 with no gradient. The sign is
+        # not a validity condition -- with a signed design field the optimizer
+        # legitimately crosses the junction-polarity boundary while searching,
+        # and a wrong-polarity *result* is surfaced by the reported VpiLpi.
         invalid = [
             entry
             for entry in history
             if (
-                entry["delta_n_eff"] <= _MIN_CONTAINER_OBJECTIVE
+                abs(entry["delta_n_eff"]) <= _MIN_CONTAINER_OBJECTIVE
                 or entry["grad_norm"] <= 0.0
             )
         ]
@@ -531,7 +539,7 @@ def _run_gradient_validation(
         f"(tolerance {result.tolerance:.3e})"
     )
     for i, err in enumerate(result.best_rel_errors):
-        typer.echo(f"        direction {i+1}: best relative error {err:.3e}")
+        typer.echo(f"        direction {i + 1}: best relative error {err:.3e}")
     typer.echo(f"      Figure: {result.figure_path}")
 
     typer.echo()
