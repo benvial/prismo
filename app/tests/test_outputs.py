@@ -122,6 +122,25 @@ class TestDopingFieldPlot:
             assert first.name == "doping_field_live.png"
             assert first.exists()
 
+    def test_live_plot_named_per_iteration(self):
+        coords = _make_coords()
+        doping = np.linspace(-1e18, 1e18, N_NODES)
+        with tempfile.TemporaryDirectory() as tmp:
+            first = plot_live_doping_field(
+                doping, coords, iteration=1, output_dir=tmp, name="doping_field_1"
+            )
+            second = plot_live_doping_field(
+                doping * 0.5, coords, iteration=2, output_dir=tmp, name="doping_field_2"
+            )
+            assert first != second
+            assert first.exists() and second.exists()
+            # No leftover temp files: each snapshot is written straight to its
+            # final path.
+            assert sorted(q.name for q in Path(tmp).iterdir()) == [
+                "doping_field_1.png",
+                "doping_field_2.png",
+            ]
+
     def test_with_geometry(self):
         from prismo.waveguide_mesh import RibWaveguideGeometry
 

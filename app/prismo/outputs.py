@@ -246,11 +246,12 @@ def plot_live_doping_field(
     output_dir: str | Path | None = None,
     name: str | None = None,
 ) -> Path:
-    """Update the optimizer's current signed doping-field image.
+    """Write the optimizer's current signed doping-field image.
 
-    The image is atomically replaced at every optimizer callback, so it can be
-    opened while a long container-backed solve is still running.
-    ``mesh_coords`` is in micrometres, as everywhere else in the app.
+    One image per optimizer callback, named by ``name``; callers pass the
+    iteration number so a long run leaves a snapshot per iteration rather than
+    one file overwritten in place. ``mesh_coords`` is in micrometres, as
+    everywhere else in the app.
     """
     out = _ensure_output_dir(output_dir)
     doping = np.asarray(doping, dtype=float)
@@ -279,10 +280,8 @@ def plot_live_doping_field(
     name = name or "doping_field_live"
 
     path = out / f"{name}.png"
-    temporary_path = out / f".{name}.tmp.png"
-    fig.savefig(temporary_path)
+    fig.savefig(path)
     plt.close(fig)
-    temporary_path.replace(path)
     return path
 
 
