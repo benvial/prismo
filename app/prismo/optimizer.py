@@ -153,17 +153,14 @@ def optimize_doping(
                 return 0.0
 
             callback_started_at = time.perf_counter()
-            try:
-                iter_count = len(history) + 1
-                if on_iteration is not None:
-                    on_iteration(iter_count, rho_np.copy())
-                rho = jnp.asarray(rho_np)
-                value, grad = value_and_grad_fn(rho)
+            iter_count = len(history) + 1
+            if on_iteration is not None:
+                on_iteration(iter_count, rho_np.copy())
+            rho = jnp.asarray(rho_np)
+            value, grad = value_and_grad_fn(rho)
 
-                f_val = float(value)
-                grad_out[:] = np.asarray(grad)
-            finally:
-                phase_timing = components.collect_phase_timing()
+            f_val = float(value)
+            grad_out[:] = np.asarray(grad)
             callback_time = time.perf_counter() - callback_started_at
 
             delta = 0.0
@@ -180,7 +177,6 @@ def optimize_doping(
                     "grad_norm": g_norm,
                     "wall_time": wall,
                     "callback_time": callback_time,
-                    "phase_timing": phase_timing,
                 }
             )
             print(

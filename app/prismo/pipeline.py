@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
@@ -136,82 +135,6 @@ _M3_TO_CM3: float = 1e-6
 _DEFAULT_COEFFS: SorefBennettCoefficients = SorefBennettCoefficients()
 
 
-@dataclass
-class _PhaseTiming:
-    """Aggregated component-boundary timing for one optimizer callback."""
-
-    calls: int = 0
-    seconds: float = 0.0
-    cold_calls: int = 0
-    cold_seconds: float = 0.0
-
-
-class PhaseTimer:
-    """Per-component boundary timing owned by the components, not a global.
-
-    Records elapsed time per phase label (e.g. ``ct_forward_0V``, ``ct_vjp``),
-    tracking cold (first-use) versus warm cost. ``collect`` returns the tallies
-    accumulated since the previous ``collect`` and resets them for the next
-    optimizer callback, while the cold/warm phase memory persists for the
-    component's lifetime.
-    """
-
-    def __init__(self) -> None:
-        self._lock = RLock()
-        self._tallies: dict[str, _PhaseTiming] = {}
-        self._seen: set[str] = set()
-
-    def record(self, name: str, started_at: float) -> None:
-        """Record one component-boundary call without exposing solver internals."""
-        elapsed = time.perf_counter() - started_at
-        with self._lock:
-            cold = name not in self._seen
-            self._seen.add(name)
-            timing = self._tallies.setdefault(name, _PhaseTiming())
-            timing.calls += 1
-            timing.seconds += elapsed
-            timing.cold_calls += int(cold)
-            if cold:
-                timing.cold_seconds += elapsed
-
-    def collect(self) -> dict[str, dict[str, float | int]]:
-        """Return and reset the tallies accumulated since the last collect."""
-        with self._lock:
-            result = {
-                name: {
-                    "calls": timing.calls,
-                    "seconds": timing.seconds,
-                    "cold_calls": timing.cold_calls,
-                    "cold_seconds": timing.cold_seconds,
-                    "warm_seconds": timing.seconds - timing.cold_seconds,
-                }
-                for name, timing in self._tallies.items()
-            }
-            self._tallies = {}
-            return result
-
-
-@dataclass(frozen=True)
-class TimedComponent:
-    """A differentiable component paired with the timer it records into.
-
-    Callable exactly like the wrapped component and transparently delegating
-    its attributes, so ``pipeline()`` composes it unchanged. The optimizer
-    reads per-callback timings from ``timer`` after each callback instead of a
-    global begin/finish protocol.
-    """
-
-    component: DifferentiableComponent
-    timer: PhaseTimer
-
-    def __call__(self, x: jax.Array, *static: Any) -> Any:
-        """Evaluate the wrapped component."""
-        return self.component(x, *static)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.component, name)
-
-
 def _close_all(
     closers: tuple[Callable[[], None], ...] | list[Callable[[], None]],
 ) -> None:
@@ -301,31 +224,60 @@ def teardown_containers(components: PipelineComponents) -> None:
     components.close()
 
 
-def read_gyptis_design_cell_centroids(
-    *, container: Any | None = None, local_api: Any | None = None
-) -> np.ndarray:
-    """Read gyptis design-cell centroids in ``design_epsilon`` field order.
+def _gyptis_query(
+    payload: dict[str, Any],
+    outputs: tuple[str, ...],
+    *,
+    container: Any | None,
+    local_api: Any | None,
+) -> tuple[Any, ...]:
+    """Run one read-only gyptis ``apply()`` against whichever backend is bound.
 
-    The Tesseract API's fixed endpoint set exposes this static geometry query
-    through ``apply(operation="design_cell_centroids")``. A live gyptis/FEniCS
-    backend is required; unlike a solve, there is no meaningful local stub for
-    its mesh-dependent cells.
+    The Tesseract API's fixed endpoint set carries these static geometry and
+    field queries as ``operation`` values on ``apply``. Returns the named
+    outputs in order, ``None`` for any the backend omitted, so each caller
+    validates the payload it needs. A live gyptis/FEniCS backend is required:
+    unlike a solve, there is no meaningful local stub for its mesh-dependent
+    cells.
     """
 
-    def from_container(tess: Any) -> np.ndarray:
-        result = tess.apply({"operation": "design_cell_centroids"})
-        return np.asarray(result["design_cell_centroids"], dtype=float)
+    def from_container(tess: Any) -> tuple[Any, ...]:
+        result = tess.apply(payload)
+        return tuple(result.get(name) for name in outputs)
 
-    def from_local(api: Any) -> np.ndarray:
-        outputs = api.apply(api.InputSchema(operation="design_cell_centroids"))
-        return np.asarray(outputs.design_cell_centroids, dtype=float)
+    def from_local(api: Any) -> tuple[Any, ...]:
+        result = api.apply(api.InputSchema(**payload))
+        return tuple(getattr(result, name, None) for name in outputs)
 
-    centroids = invoke_tesseract(
+    return invoke_tesseract(
         container,
         local_api,
         container_call=from_container,
         local_call=from_local,
     )
+
+
+def _as_design_cell_vertices(raw: Any) -> np.ndarray:
+    """Validate a design-cell vertex payload as ``(n_design, 3, 2)`` floats."""
+    vertices = np.asarray(raw, dtype=float)
+    if vertices.ndim != 3 or vertices.shape[1:] != (3, 2):
+        raise ValueError("gyptis design-cell vertices must have shape (n_design, 3, 2)")
+    return vertices
+
+
+def read_gyptis_design_cell_centroids(
+    *, container: Any | None = None, local_api: Any | None = None
+) -> np.ndarray:
+    """Read gyptis design-cell centroids in ``design_epsilon`` field order."""
+    (raw,) = _gyptis_query(
+        {"operation": "design_cell_centroids"},
+        ("design_cell_centroids",),
+        container=container,
+        local_api=local_api,
+    )
+    if raw is None:
+        raise RuntimeError("gyptis design_cell_centroids returned no centroids")
+    centroids = np.asarray(raw, dtype=float)
     if centroids.ndim != 2 or centroids.shape[1] != 2:
         raise ValueError("gyptis design-cell centroids must have shape (n_design, 2)")
     return centroids
@@ -339,28 +291,17 @@ def read_gyptis_design_cell_vertices(
     Each gyptis design cell is a triangle of the shared unified mesh; its three
     vertices are shared-mesh nodes. The host matches these coordinates to node
     indices to assemble the exact node->DG0-cell restriction operator (ticket
-    05). Exposed through the ``write_mesh`` operation. Requires a gyptis backend.
+    05). Exposed through the ``write_mesh`` operation.
     """
-
-    def from_container(tess: Any) -> np.ndarray:
-        result = tess.apply({"operation": "write_mesh"})
-        return np.asarray(result["design_cell_vertices"], dtype=float)
-
-    def from_local(api: Any) -> np.ndarray:
-        outputs = api.apply(api.InputSchema(operation="write_mesh"))
-        return np.asarray(outputs.design_cell_vertices, dtype=float)
-
-    vertices = invoke_tesseract(
-        container,
-        local_api,
-        container_call=from_container,
-        local_call=from_local,
+    (raw,) = _gyptis_query(
+        {"operation": "write_mesh"},
+        ("design_cell_vertices",),
+        container=container,
+        local_api=local_api,
     )
-    if vertices.ndim != 3 or vertices.shape[1:] != (3, 2):
-        raise ValueError(
-            "gyptis design-cell vertices must have shape (n_design, 3, 2)"
-        )
-    return vertices
+    if raw is None:
+        raise RuntimeError("gyptis write_mesh returned no design-cell vertices")
+    return _as_design_cell_vertices(raw)
 
 
 def read_gyptis_mode_field(
@@ -376,47 +317,27 @@ def read_gyptis_mode_field(
     peak-normalized magnitude per vertex and the matching ``(n_vertices, 2)``
     vertex coordinates in micrometres. This is the headline optical-mode figure's
     data source (ticket 07); it is a read-only query, so it does not advance the
-    component's tracked mode branch. Requires a gyptis backend.
+    component's tracked mode branch.
 
     ``core_epsilon`` must be the same background the solve components were given:
     it is part of the geometry key the component tracks the mode branch by, so a
     mismatched value would both solve a different device and miss the tracked
     branch, falling back to the mode selection ticket 13 replaced.
     """
-    design = np.asarray(design_epsilon, dtype=float)
-
-    def payload() -> dict[str, Any]:
-        return {
+    abs_e_raw, coords_raw = _gyptis_query(
+        {
             "operation": "mode_field",
-            "design_epsilon": design,
+            "design_epsilon": np.asarray(design_epsilon, dtype=float),
             "core_epsilon": float(core_epsilon),
-        }
-
-    def from_container(tess: Any) -> tuple[np.ndarray, np.ndarray]:
-        result = tess.apply(payload())
-        abs_e, coords = result.get("mode_abs_e"), result.get("mode_coordinates")
-        if abs_e is None or coords is None:
-            raise RuntimeError("gyptis mode_field returned no field payload")
-        return (
-            np.asarray(abs_e, dtype=float),
-            np.asarray(coords, dtype=float),
-        )
-
-    def from_local(api: Any) -> tuple[np.ndarray, np.ndarray]:
-        outputs = api.apply(api.InputSchema(**payload()))
-        if outputs.mode_abs_e is None or outputs.mode_coordinates is None:
-            raise RuntimeError("gyptis mode_field returned no field payload")
-        return (
-            np.asarray(outputs.mode_abs_e, dtype=float),
-            np.asarray(outputs.mode_coordinates, dtype=float),
-        )
-
-    abs_e, coords = invoke_tesseract(
-        container,
-        local_api,
-        container_call=from_container,
-        local_call=from_local,
+        },
+        ("mode_abs_e", "mode_coordinates"),
+        container=container,
+        local_api=local_api,
     )
+    if abs_e_raw is None or coords_raw is None:
+        raise RuntimeError("gyptis mode_field returned no field payload")
+    abs_e = np.asarray(abs_e_raw, dtype=float)
+    coords = np.asarray(coords_raw, dtype=float)
     if coords.ndim != 2 or coords.shape[1] != 2:
         raise ValueError("gyptis mode coordinates must have shape (n_vertices, 2)")
     if abs_e.ndim != 1 or abs_e.shape[0] != coords.shape[0]:
@@ -431,34 +352,20 @@ def write_gyptis_mesh(
     mesh_path: str | Path, *, container: Any | None = None, local_api: Any | None = None
 ) -> np.ndarray:
     """Persist gyptis' unified mesh on host and return its design-cell vertices."""
-
-    def from_container(tess: Any) -> tuple[str, np.ndarray]:
-        result = tess.apply({"operation": "write_mesh"})
-        return str(result["mesh_text"]), np.asarray(
-            result["design_cell_vertices"], dtype=float
-        )
-
-    def from_local(api: Any) -> tuple[str, np.ndarray]:
-        outputs = api.apply(api.InputSchema(operation="write_mesh"))
-        if outputs.mesh_text is None or outputs.design_cell_vertices is None:
-            raise RuntimeError("gyptis write_mesh returned no mesh payload")
-        return outputs.mesh_text, np.asarray(outputs.design_cell_vertices, dtype=float)
-
-    mesh_text, vertices = invoke_tesseract(
-        container,
-        local_api,
-        container_call=from_container,
-        local_call=from_local,
+    mesh_text, vertices_raw = _gyptis_query(
+        {"operation": "write_mesh"},
+        ("mesh_text", "design_cell_vertices"),
+        container=container,
+        local_api=local_api,
     )
-    if not mesh_text.startswith("$MeshFormat"):
+    if mesh_text is None or vertices_raw is None:
+        raise RuntimeError("gyptis write_mesh returned no mesh payload")
+    if not str(mesh_text).startswith("$MeshFormat"):
         raise RuntimeError("gyptis write_mesh returned invalid Gmsh text")
-    if vertices.ndim != 3 or vertices.shape[1:] != (3, 2):
-        raise ValueError(
-            "gyptis design-cell vertices must have shape (n_design, 3, 2)"
-        )
+    vertices = _as_design_cell_vertices(vertices_raw)
     path = Path(mesh_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(mesh_text)
+    path.write_text(str(mesh_text))
     return vertices
 
 
@@ -571,25 +478,20 @@ def _ct_out_struct(
 def build_chargetransport_component(
     container: Any | None = None,
     local_api: Any | None = None,
-) -> TimedComponent:
+) -> DifferentiableComponent:
     """Build the ChargeTransport component bound to one backend.
 
     ``container`` is a running Tesseract handle; ``local_api`` an in-process
     ``tesseract_api`` module. With neither, calling the component raises -- there
     is no physics-free identity fallback. The backend is captured here, not read
-    from module globals. Returns a :class:`TimedComponent` owning the phase timer
-    it records into.
+    from module globals.
     """
-    timer = PhaseTimer()
 
     def forward(
         doping_np: np.ndarray,
         bias_voltage: float,
         mesh_ref: MeshRef | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        started_at = time.perf_counter()
-        phase = f"ct_forward_{bias_voltage:g}V"
-
         def from_container(tess: Any) -> tuple[np.ndarray, np.ndarray]:
             result = tess.apply(
                 _ct_container_inputs(
@@ -612,15 +514,12 @@ def build_chargetransport_component(
                 np.asarray(outputs.holes, dtype=doping_np.dtype),
             )
 
-        try:
-            return invoke_tesseract(
-                container,
-                local_api,
-                container_call=from_container,
-                local_call=from_local,
-            )
-        finally:
-            timer.record(phase, started_at)
+        return invoke_tesseract(
+            container,
+            local_api,
+            container_call=from_container,
+            local_call=from_local,
+        )
 
     def vjp(
         doping_np: np.ndarray,
@@ -629,7 +528,6 @@ def build_chargetransport_component(
         mesh_ref: MeshRef | None = None,
     ) -> np.ndarray:
         cot_n, cot_p = cotangent
-        started_at = time.perf_counter()
 
         def from_container(tess: Any) -> np.ndarray:
             vjp_result = tess.vector_jacobian_product(
@@ -653,22 +551,18 @@ def build_chargetransport_component(
             )
             return np.asarray(vjp_result["doping"], dtype=doping_np.dtype)
 
-        try:
-            return invoke_tesseract(
-                container,
-                local_api,
-                container_call=from_container,
-                local_call=from_local,
-            )
-        finally:
-            timer.record("ct_vjp", started_at)
+        return invoke_tesseract(
+            container,
+            local_api,
+            container_call=from_container,
+            local_call=from_local,
+        )
 
-    component = DifferentiableComponent(
+    return DifferentiableComponent(
         forward=forward,
         vjp=vjp,
         out_struct=_ct_out_struct,
     )
-    return TimedComponent(component, timer)
 
 
 # -- gyptis component ------------------------------------------------------------
@@ -697,26 +591,21 @@ def _gyptis_background_vjp_impl(
 def build_gyptis_components(
     container: Any | None = None,
     local_api: Any | None = None,
-) -> tuple[TimedComponent, TimedComponent]:
+) -> tuple[DifferentiableComponent, DifferentiableComponent]:
     """Build the perturbed and background gyptis components for one backend.
 
     Both share a background eigenmode cache owned by this call, so the
-    rho-independent background solve runs once per component lifecycle, and one
-    phase timer, so their combined boundary timings read from one place. The
+    rho-independent background solve runs once per component lifecycle. The
     backend is captured here, not read from module globals.
     """
     background_cache: dict[tuple[tuple[int, ...], str, bytes, float], np.ndarray] = {}
     cache_lock = RLock()
-    timer = PhaseTimer()
 
     def forward(
         design_epsilon_np: np.ndarray,
         core_epsilon: float = DEFAULT_BACKGROUND_EPSILON,
-        *,
-        phase: str = "gyptis_perturbed_forward",
     ) -> np.ndarray:
         out_dtype = design_epsilon_np.dtype
-        started_at = time.perf_counter()
 
         def from_container(tess: Any) -> np.ndarray:
             result = tess.apply(
@@ -735,15 +624,12 @@ def build_gyptis_components(
             )
             return np.asarray(outputs.neff_sq, dtype=out_dtype)
 
-        try:
-            return invoke_tesseract(
-                container,
-                local_api,
-                container_call=from_container,
-                local_call=from_local,
-            )
-        finally:
-            timer.record(phase, started_at)
+        return invoke_tesseract(
+            container,
+            local_api,
+            container_call=from_container,
+            local_call=from_local,
+        )
 
     def background_forward(
         design_epsilon_np: np.ndarray,
@@ -758,13 +644,9 @@ def build_gyptis_components(
         with cache_lock:
             cached = background_cache.get(key)
         if cached is not None:
-            started_at = time.perf_counter()
-            timer.record("gyptis_background_cache", started_at)
             return cached.copy()
 
-        result = forward(
-            design_epsilon_np, core_epsilon, phase="gyptis_background_forward"
-        )
+        result = forward(design_epsilon_np, core_epsilon)
         with cache_lock:
             background_cache[key] = result.copy()
         return result
@@ -775,7 +657,6 @@ def build_gyptis_components(
         core_epsilon: float = DEFAULT_BACKGROUND_EPSILON,
     ) -> np.ndarray:
         out_dtype = design_epsilon_np.dtype
-        started_at = time.perf_counter()
 
         def from_container(tess: Any) -> np.ndarray:
             vjp_result = tess.vector_jacobian_product(
@@ -800,15 +681,12 @@ def build_gyptis_components(
             )
             return np.asarray(vjp_result["design_epsilon"], dtype=out_dtype)
 
-        try:
-            return invoke_tesseract(
-                container,
-                local_api,
-                container_call=from_container,
-                local_call=from_local,
-            )
-        finally:
-            timer.record("gyptis_vjp", started_at)
+        return invoke_tesseract(
+            container,
+            local_api,
+            container_call=from_container,
+            local_call=from_local,
+        )
 
     perturbed = DifferentiableComponent(
         forward=forward,
@@ -821,7 +699,7 @@ def build_gyptis_components(
         vjp=_gyptis_background_vjp_impl,
         out_struct=_gyptis_out_struct,
     )
-    return TimedComponent(perturbed, timer), TimedComponent(background, timer)
+    return perturbed, background
 
 
 def _build_design_epsilon(
@@ -895,28 +773,6 @@ class PipelineComponents:
     def close(self) -> None:
         """Release owned resources (containers, worker processes)."""
         _close_all(self.closers)
-
-    def collect_phase_timing(self) -> dict[str, dict[str, float | int]]:
-        """Merge each component's per-callback phase timings and reset them.
-
-        Reads the ``PhaseTimer`` each timed component owns rather than a global
-        begin/finish protocol. Components sharing a timer (the gyptis pair) are
-        collected once; components without one (e.g. test fakes) contribute
-        nothing.
-        """
-        merged: dict[str, dict[str, float | int]] = {}
-        seen_timers: set[int] = set()
-        for component in (
-            self.chargetransport,
-            self.gyptis,
-            self.gyptis_background,
-        ):
-            timer = getattr(component, "timer", None)
-            if timer is None or id(timer) in seen_timers:
-                continue
-            seen_timers.add(id(timer))
-            merged.update(timer.collect())
-        return merged
 
 
 def build_default_components() -> PipelineComponents:

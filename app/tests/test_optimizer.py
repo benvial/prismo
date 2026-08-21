@@ -171,7 +171,6 @@ class TestOptimizeDopingAnalytical:
 
         for entry in history:
             assert entry["callback_time"] >= 0.0
-            assert isinstance(entry["phase_timing"], dict)
 
     def test_combined_callback_uses_public_component_calls_once(self, rho_initial):
         """One callback makes two bias forwards and their matching VJPs."""
@@ -249,12 +248,6 @@ class TestOptimizeDopingAnalytical:
         assert ct.vjp_biases.count(0.0) == len(history)
         assert ct.vjp_biases.count(-5.0) == len(history)
         assert gyptis.vjp_calls == len(history)
-        for entry in history:
-            assert entry["phase_timing"]["ct_forward_0V"]["calls"] == 1
-            assert entry["phase_timing"]["ct_forward_-5V"]["calls"] == 1
-            assert entry["phase_timing"]["ct_vjp"]["calls"] == 2
-            assert entry["phase_timing"]["ct_vjp"]["cold_seconds"] >= 0.0
-            assert entry["phase_timing"]["ct_vjp"]["warm_seconds"] >= 0.0
 
 
 class TestOptimizeDopingWithFilter:

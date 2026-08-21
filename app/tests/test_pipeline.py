@@ -823,12 +823,15 @@ class TestBuildDesignTransfer:
             build_design_transfer(components, np.zeros((3, 2)))
 
 
-class TestComponentTiming:
-    """Phase timing is owned by the components, read via the bundle."""
+class TestPipelineComponentCalls:
+    """The pipeline drives each component exactly once per solve it needs."""
 
-    def _fake_ct(self):
+    def _fake_ct(self, biases: list[float] | None = None):
+        recorded = biases if biases is not None else []
+
         class FakeChargeTransport:
             def apply(self, inputs):
+                recorded.append(inputs["bias_voltage"])
                 doping = np.asarray(inputs["doping"], dtype=float)
                 carrier = np.full_like(
                     doping, 1e18 if inputs["bias_voltage"] == 0.0 else 0.0
@@ -837,52 +840,34 @@ class TestComponentTiming:
 
         return build_chargetransport_component(container=FakeChargeTransport())
 
-    def test_component_records_its_own_forward_tallies(self):
-        ct = self._fake_ct()
+    def test_solves_charge_transport_at_both_bias_points(self):
+        biases: list[float] = []
+        ct = self._fake_ct(biases)
         ct(jnp.full((4,), 0.25), 0.0)
         ct(jnp.full((4,), 0.25), -5.0)
 
-        timings = ct.timer.collect()
-        assert timings["ct_forward_0V"]["calls"] == 1
-        assert timings["ct_forward_-5V"]["calls"] == 1
+        assert biases == [0.0, -5.0]
 
-    def test_collect_resets_between_callbacks_but_keeps_cold_memory(self):
-        ct = self._fake_ct()
-        ct(jnp.full((4,), 0.25), 0.0)
-
-        first = ct.timer.collect()
-        assert first["ct_forward_0V"]["cold_calls"] == 1
-        # A fresh collect with no new calls is empty.
-        assert ct.timer.collect() == {}
-
-        # The second call is warm: the phase is no longer cold.
-        ct(jnp.full((4,), 0.25), 0.0)
-        second = ct.timer.collect()
-        assert second["ct_forward_0V"]["calls"] == 1
-        assert second["ct_forward_0V"]["cold_calls"] == 0
-
-    def test_bundle_merges_component_timings(self):
-        gyptis_recorder = []
+    def test_one_pipeline_call_drives_both_backends_once_each(self):
+        biases: list[float] = []
+        gyptis_calls = []
 
         class FakeGyptis:
             def apply(self, inputs):
-                gyptis_recorder.append(inputs["design_epsilon"])
+                gyptis_calls.append(np.asarray(inputs["design_epsilon"], dtype=float))
                 return {"neff_sq": float(np.mean(inputs["design_epsilon"]))}
 
         perturbed, background = build_gyptis_components(container=FakeGyptis())
         components = PipelineComponents(
-            chargetransport=self._fake_ct(),
+            chargetransport=self._fake_ct(biases),
             gyptis=perturbed,
             gyptis_background=background,
         )
         pipeline(jnp.full((4,), 0.25), components=components)
 
-        merged = components.collect_phase_timing()
-        # CT and gyptis boundary phases are collected from their owning timers.
-        assert merged["ct_forward_0V"]["calls"] == 1
-        assert merged["ct_forward_-5V"]["calls"] == 1
-        assert "gyptis_perturbed_forward" in merged
-        assert "gyptis_background_forward" in merged
+        assert sorted(biases) == [-5.0, 0.0]
+        # One background solve and one perturbed solve.
+        assert len(gyptis_calls) == 2
 
 
 class TestPipelineWithFilter:

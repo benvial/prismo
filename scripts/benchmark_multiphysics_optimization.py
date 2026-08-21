@@ -257,12 +257,9 @@ def main() -> None:
         for iteration in range(args.iterations):
             rho = initial_rho + iteration * 1e-4 * direction
             started_at = time.perf_counter()
-            try:
-                value, gradient = callback(rho)
-                value_float = float(value)
-                gradient_norm = float(jnp.linalg.norm(gradient))
-            finally:
-                phase_timing = components.collect_phase_timing()
+            value, gradient = callback(rho)
+            value_float = float(value)
+            gradient_norm = float(jnp.linalg.norm(gradient))
             measurements.append(
                 {
                     "kind": "cold" if iteration == 0 else "warm",
@@ -270,7 +267,6 @@ def main() -> None:
                     "delta_n_eff": value_float,
                     "gradient_norm": gradient_norm,
                     "rho_change_norm": float(jnp.linalg.norm(rho - initial_rho)),
-                    "phase_timing": phase_timing,
                 }
             )
     finally:
