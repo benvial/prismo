@@ -131,7 +131,7 @@ def _load_tesseract_api(name: str) -> Any | None:
         return None
 
 
-_DEFAULT_BACKGROUND_EPSILON: float = 3.4757**2
+DEFAULT_BACKGROUND_EPSILON: float = 3.4757**2
 _M3_TO_CM3: float = 1e-6
 _DEFAULT_COEFFS: SorefBennettCoefficients = SorefBennettCoefficients()
 
@@ -291,6 +291,7 @@ def init_tesseract_containers(
             read_gyptis_design_cell_vertices, container=gyptis_tesseract
         ),
         write_mesh=partial(write_gyptis_mesh, container=gyptis_tesseract),
+        mode_field=partial(read_gyptis_mode_field, container=gyptis_tesseract),
         closers=tuple(closers),
     )
 
@@ -360,6 +361,70 @@ def read_gyptis_design_cell_vertices(
             "gyptis design-cell vertices must have shape (n_design, 3, 2)"
         )
     return vertices
+
+
+def read_gyptis_mode_field(
+    design_epsilon: np.ndarray,
+    core_epsilon: float = DEFAULT_BACKGROUND_EPSILON,
+    *,
+    container: Any | None = None,
+    local_api: Any | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read the tracked mode's ``|E|`` profile at the gyptis mesh vertices.
+
+    Solves once at ``design_epsilon`` and returns ``(abs_e, coords)`` -- the
+    peak-normalized magnitude per vertex and the matching ``(n_vertices, 2)``
+    vertex coordinates in micrometres. This is the headline optical-mode figure's
+    data source (ticket 07); it is a read-only query, so it does not advance the
+    component's tracked mode branch. Requires a gyptis backend.
+
+    ``core_epsilon`` must be the same background the solve components were given:
+    it is part of the geometry key the component tracks the mode branch by, so a
+    mismatched value would both solve a different device and miss the tracked
+    branch, falling back to the mode selection ticket 13 replaced.
+    """
+    design = np.asarray(design_epsilon, dtype=float)
+
+    def payload() -> dict[str, Any]:
+        return {
+            "operation": "mode_field",
+            "design_epsilon": design,
+            "core_epsilon": float(core_epsilon),
+        }
+
+    def from_container(tess: Any) -> tuple[np.ndarray, np.ndarray]:
+        result = tess.apply(payload())
+        abs_e, coords = result.get("mode_abs_e"), result.get("mode_coordinates")
+        if abs_e is None or coords is None:
+            raise RuntimeError("gyptis mode_field returned no field payload")
+        return (
+            np.asarray(abs_e, dtype=float),
+            np.asarray(coords, dtype=float),
+        )
+
+    def from_local(api: Any) -> tuple[np.ndarray, np.ndarray]:
+        outputs = api.apply(api.InputSchema(**payload()))
+        if outputs.mode_abs_e is None or outputs.mode_coordinates is None:
+            raise RuntimeError("gyptis mode_field returned no field payload")
+        return (
+            np.asarray(outputs.mode_abs_e, dtype=float),
+            np.asarray(outputs.mode_coordinates, dtype=float),
+        )
+
+    abs_e, coords = invoke_tesseract(
+        container,
+        local_api,
+        container_call=from_container,
+        local_call=from_local,
+    )
+    if coords.ndim != 2 or coords.shape[1] != 2:
+        raise ValueError("gyptis mode coordinates must have shape (n_vertices, 2)")
+    if abs_e.ndim != 1 or abs_e.shape[0] != coords.shape[0]:
+        raise ValueError(
+            "gyptis mode field must carry one magnitude per mesh vertex "
+            f"({abs_e.shape} values for {coords.shape[0]} vertices)"
+        )
+    return abs_e, coords
 
 
 def write_gyptis_mesh(
@@ -615,7 +680,7 @@ def build_chargetransport_component(
 
 
 def _gyptis_out_struct(
-    design_epsilon: jax.Array, core_epsilon: float = _DEFAULT_BACKGROUND_EPSILON
+    design_epsilon: jax.Array, core_epsilon: float = DEFAULT_BACKGROUND_EPSILON
 ) -> jax.ShapeDtypeStruct:
     return _scalar_like(design_epsilon)
 
@@ -623,7 +688,7 @@ def _gyptis_out_struct(
 def _gyptis_background_vjp_impl(
     design_epsilon_np: np.ndarray,
     cot_neff_sq: np.ndarray,
-    core_epsilon: float = _DEFAULT_BACKGROUND_EPSILON,
+    core_epsilon: float = DEFAULT_BACKGROUND_EPSILON,
 ) -> np.ndarray:
     """Background permittivity is rho-independent: its cotangent is zero."""
     return np.zeros_like(design_epsilon_np)
@@ -646,7 +711,7 @@ def build_gyptis_components(
 
     def forward(
         design_epsilon_np: np.ndarray,
-        core_epsilon: float = _DEFAULT_BACKGROUND_EPSILON,
+        core_epsilon: float = DEFAULT_BACKGROUND_EPSILON,
         *,
         phase: str = "gyptis_perturbed_forward",
     ) -> np.ndarray:
@@ -682,7 +747,7 @@ def build_gyptis_components(
 
     def background_forward(
         design_epsilon_np: np.ndarray,
-        core_epsilon: float = _DEFAULT_BACKGROUND_EPSILON,
+        core_epsilon: float = DEFAULT_BACKGROUND_EPSILON,
     ) -> np.ndarray:
         key = (
             design_epsilon_np.shape,
@@ -707,7 +772,7 @@ def build_gyptis_components(
     def vjp(
         design_epsilon_np: np.ndarray,
         cot_neff_sq: np.ndarray,
-        core_epsilon: float = _DEFAULT_BACKGROUND_EPSILON,
+        core_epsilon: float = DEFAULT_BACKGROUND_EPSILON,
     ) -> np.ndarray:
         out_dtype = design_epsilon_np.dtype
         started_at = time.perf_counter()
@@ -811,8 +876,9 @@ class PipelineComponents:
     gyptis backend as the solve components: a zero-arg reader returning the
     ``(n_design, 2)`` centroids in ``design_epsilon`` order, so the pipeline
     setup can build the mesh-transfer operator (ticket 08) through the seam
-    without reaching for a raw container handle. ``None`` when no gyptis
-    backend is bound.
+    without reaching for a raw container handle. ``mode_field`` is the matching
+    read-only query for the tracked mode's ``|E|`` profile, used by the headline
+    mode figure (ticket 07). Both are ``None`` when no gyptis backend is bound.
     """
 
     chargetransport: Callable[..., Any]
@@ -821,6 +887,9 @@ class PipelineComponents:
     design_cell_centroids: Callable[[], np.ndarray] | None = None
     design_cell_vertices: Callable[[], np.ndarray] | None = None
     write_mesh: Callable[[str | Path], np.ndarray] | None = None
+    mode_field: (
+        Callable[[np.ndarray, float], tuple[np.ndarray, np.ndarray]] | None
+    ) = None
     closers: tuple[Callable[[], None], ...] = field(default=())
 
     def close(self) -> None:
@@ -886,6 +955,11 @@ def build_default_components() -> PipelineComponents:
         design_cell_vertices=design_cell_vertices,
         write_mesh=(
             partial(write_gyptis_mesh, local_api=gyptis_api)
+            if gyptis_api is not None
+            else None
+        ),
+        mode_field=(
+            partial(read_gyptis_mode_field, local_api=gyptis_api)
             if gyptis_api is not None
             else None
         ),
@@ -990,6 +1064,66 @@ def _sb_jax(
 # -- Pipeline --------------------------------------------------------------------
 
 
+def design_epsilon_from_theta(
+    theta: jax.Array,
+    H: jax.Array | None = None,
+    H_sum: jax.Array | None = None,
+    mesh_ref: MeshRef | None = None,
+    background_epsilon: float | None = None,
+    design_transfer: jax.Array | None = None,
+    components: PipelineComponents | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Everything ``pipeline()`` does up to the eigensolves.
+
+    Runs filter -> signed doping -> both ChargeTransport solves -> Soref-Bennett
+    -> mesh transfer, and returns the ``(epsilon_bg, epsilon_pert)`` design-cell
+    permittivity fields the two gyptis solves consume. Split out of
+    :func:`pipeline` so the same permittivity the objective was evaluated on can
+    be handed to the mode-field query for the headline figure (ticket 07),
+    rather than reconstructing the chain a second way.
+
+    Arguments match :func:`pipeline`.
+    """
+    if background_epsilon is None:
+        background_epsilon = DEFAULT_BACKGROUND_EPSILON
+    if components is None:
+        components = _DEFAULT_COMPONENTS
+
+    # 1. Density filter: theta -> theta_tilde (linear; regularizes junction width)
+    if H is not None:
+        if H_sum is None:
+            H_sum = jnp.sum(H, axis=1)
+        theta_tilde = _filter_jax(theta, H, H_sum)
+    else:
+        theta_tilde = theta
+
+    # 2. Signed doping mapping: theta_tilde -> N(theta) [cm^-3]
+    doping = doping_from_theta(theta_tilde)
+
+    # 3. ChargeTransport at equilibrium (0 V)
+    n0, p0 = components.chargetransport(doping, 0.0, mesh_ref)
+
+    # 4. ChargeTransport at reverse bias (-5 V)
+    n1, p1 = components.chargetransport(doping, REVERSE_BIAS_V, mesh_ref)
+
+    # CT reports carrier densities in cm^-3 (same unit system as the doping
+    # input); Soref-Bennett consumes m^-3 per CarrierDensityField. Convert
+    # at the component boundary (ticket 17).
+    n0 = n0 * _CM3_TO_M3
+    p0 = p0 * _CM3_TO_M3
+    n1 = n1 * _CM3_TO_M3
+    p1 = p1 * _CM3_TO_M3
+
+    # 5. Soref-Bennett coupling (equilibrium-subtracted)
+    delta_eps, _ = _sb_jax(n1, p1, n0, p0)
+
+    # 6. Design-region permittivity field. The perturbation keeps its full
+    # spatial structure (no mean-collapse): a topology change that redistributes
+    # carriers at fixed mean now moves neff.
+    bg = jnp.asarray(background_epsilon, dtype=delta_eps.dtype)
+    return _build_design_epsilon(delta_eps, bg, design_transfer)
+
+
 def pipeline(
     theta: jax.Array,
     H: jax.Array | None = None,
@@ -1023,43 +1157,19 @@ def pipeline(
         :func:`vpi_lpi_v_cm`.
     """
     if background_epsilon is None:
-        background_epsilon = _DEFAULT_BACKGROUND_EPSILON
+        background_epsilon = DEFAULT_BACKGROUND_EPSILON
     if components is None:
         components = _DEFAULT_COMPONENTS
 
-    # 1. Density filter: theta -> theta_tilde (linear; regularizes junction width)
-    if H is not None:
-        if H_sum is None:
-            H_sum = jnp.sum(H, axis=1)
-        theta_tilde = _filter_jax(theta, H, H_sum)
-    else:
-        theta_tilde = theta
-
-    # 2. Signed doping mapping: theta_tilde -> N(theta) [cm^-3]
-    doping = doping_from_theta(theta_tilde)
-
-    # 3. ChargeTransport at equilibrium (0 V)
-    n0, p0 = components.chargetransport(doping, 0.0, mesh_ref)
-
-    # 4. ChargeTransport at reverse bias (-5 V)
-    n1, p1 = components.chargetransport(doping, REVERSE_BIAS_V, mesh_ref)
-
-    # CT reports carrier densities in cm^-3 (same unit system as the doping
-    # input); Soref-Bennett consumes m^-3 per CarrierDensityField. Convert
-    # at the component boundary (ticket 17).
-    n0 = n0 * _CM3_TO_M3
-    p0 = p0 * _CM3_TO_M3
-    n1 = n1 * _CM3_TO_M3
-    p1 = p1 * _CM3_TO_M3
-
-    # 5. Soref-Bennett coupling (equilibrium-subtracted)
-    delta_eps, _ = _sb_jax(n1, p1, n0, p0)
-
-    # 6. gyptis eigenmode solves on the design-region permittivity field. The
-    # perturbation keeps its full spatial structure (no mean-collapse): a
-    # topology change that redistributes carriers at fixed mean now moves neff.
-    bg = jnp.asarray(background_epsilon, dtype=delta_eps.dtype)
-    epsilon_bg, epsilon_pert = _build_design_epsilon(delta_eps, bg, design_transfer)
+    epsilon_bg, epsilon_pert = design_epsilon_from_theta(
+        theta,
+        H=H,
+        H_sum=H_sum,
+        mesh_ref=mesh_ref,
+        background_epsilon=background_epsilon,
+        design_transfer=design_transfer,
+        components=components,
+    )
 
     # Background epsilon does not depend on rho. Cache its eigenmode while
     # keeping the perturbed solve and eigen-adjoint live for every rho.

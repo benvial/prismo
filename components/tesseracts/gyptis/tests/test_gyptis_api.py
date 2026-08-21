@@ -369,3 +369,53 @@ def test_unified_mesh_has_no_orphan_nodes(tmp_path: Path) -> None:
         f"{sorted(topology['orphan_nodes'])}; they leave zero rows in the "
         "eigenproblem and false contact geometry for ChargeTransport"
     )
+
+
+# ---------------------------------------------------------------------------
+# Mode field (ticket 07 headline figure)
+# ---------------------------------------------------------------------------
+
+
+def test_mode_field_requires_a_design_field() -> None:
+    with pytest.raises(ValueError, match="design_epsilon is required"):
+        apply(InputSchema(operation="mode_field"))
+
+
+@pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
+def test_mode_field_returns_a_guided_profile_on_the_rib() -> None:
+    """|E| peaks in the rib and carries most of its energy there."""
+    outputs = apply(
+        InputSchema(operation="mode_field", design_epsilon=_sized_design(0.0))
+    )
+    abs_e = np.asarray(outputs.mode_abs_e)
+    coords = np.asarray(outputs.mode_coordinates)
+
+    assert abs_e.shape == (coords.shape[0],)
+    assert abs_e.min() >= 0.0
+    assert np.isclose(abs_e.max(), 1.0), "the profile is normalized to its peak"
+
+    neff = float(np.sqrt(outputs.neff_sq))
+    assert _api.N_OXIDE < neff < _api.N_SILICON, f"mode is not guided (neff={neff})"
+
+    peak = coords[int(np.argmax(abs_e))]
+    y0 = -0.5 * sum(_api._LAYER_THICKNESS.values()) + (
+        _api._LAYER_THICKNESS["substrate"] + _api._LAYER_THICKNESS["slab"]
+    )
+    assert abs(peak[0]) < _api._RIB_HALF_WIDTH, f"|E| peaks off the rib at {peak}"
+    assert y0 - _api._LAYER_THICKNESS["slab"] < peak[1] < y0 + _api._LAYER_THICKNESS["rib"]
+
+    in_rib_column = np.abs(coords[:, 0]) < _api._RIB_HALF_WIDTH
+    energy = abs_e**2
+    assert energy[in_rib_column].sum() / energy.sum() > 0.5
+
+
+@pytest.mark.skipif(not _gyptis_available(), reason="gyptis/FEniCS not installed")
+def test_mode_field_does_not_advance_the_tracked_branch() -> None:
+    """A field query is read-only: it must not redirect the tracked mode."""
+    design = _sized_design(0.0)
+    apply(make_inputs(design))
+    tracked = dict(_api._tracked_lam)
+    assert tracked, "the forward solve records a tracked eigenvalue"
+
+    apply(InputSchema(operation="mode_field", design_epsilon=design))
+    assert _api._tracked_lam == tracked

@@ -11,13 +11,15 @@ import pytest
 from _doubles import stub_components
 from prismo.outputs import (
     GradientValidationResult,
+    ModeField,
     generate_outputs,
     plot_convergence,
-    plot_delta_neff_breakdown,
     plot_doping_field,
     plot_gradient_validation,
     plot_live_doping_field,
+    plot_mode_field,
     validate_gradient,
+    vpi_axis_is_symlog,
 )
 from prismo.pipeline import pipeline
 
@@ -70,6 +72,35 @@ class TestConvergencePlot:
             path = plot_convergence([], output_dir=tmp)
             assert Path(path).exists()
 
+    def test_survives_a_zero_objective_iteration(self):
+        """VpiLpi diverges at delta_n_eff = 0; the curve must still render."""
+        history = _make_history()
+        history[0]["delta_n_eff"] = 0.0
+        with tempfile.TemporaryDirectory() as tmp:
+            assert plot_convergence(history, output_dir=tmp).exists()
+
+    def test_survives_a_near_zero_objective_iteration(self):
+        """A near-zero start puts VpiLpi orders of magnitude off the converged value."""
+        history = _make_history()
+        history[0]["delta_n_eff"] = 1e-12
+        with tempfile.TemporaryDirectory() as tmp:
+            assert plot_convergence(history, output_dir=tmp).exists()
+
+    def test_vpi_axis_is_linear_over_a_narrow_span(self):
+        """A run that starts converged spans little; symlog would label no ticks."""
+        assert not vpi_axis_is_symlog([3.57, 3.59])
+
+    def test_vpi_axis_is_symlog_over_a_wide_span(self):
+        """A run starting near zero spans decades; linear would flatten it."""
+        assert vpi_axis_is_symlog([3.57, 3.9e5])
+
+    def test_survives_a_sign_change_in_the_objective(self):
+        """VpiLpi carries the objective's sign, so the axis must span both."""
+        history = _make_history()
+        history[0]["delta_n_eff"] = -1e-4
+        with tempfile.TemporaryDirectory() as tmp:
+            assert plot_convergence(history, output_dir=tmp).exists()
+
 
 class TestDopingFieldPlot:
     def test_generates_pdf(self):
@@ -102,19 +133,6 @@ class TestDopingFieldPlot:
             path = plot_doping_field(
                 rho_initial, rho_opt, coords, geometry=geometry, output_dir=tmp,
             )
-            assert Path(path).exists()
-
-
-class TestBreakdownPlot:
-    def test_generates_pdf(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = plot_delta_neff_breakdown(0.001, 0.0001, output_dir=tmp)
-            assert Path(path).exists()
-            assert Path(path).suffix == ".pdf"
-
-    def test_zero_values(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = plot_delta_neff_breakdown(0.0, 0.0, output_dir=tmp)
             assert Path(path).exists()
 
 
@@ -264,16 +282,67 @@ class TestValidateGradient:
         assert all(e >= 0.0 for e in result.best_rel_errors)
 
 
+class TestModeFieldPlot:
+    @staticmethod
+    def _mode(**overrides) -> ModeField:
+        xs, ys = np.meshgrid(np.linspace(-1.0, 1.0, 12), np.linspace(-0.5, 0.5, 9))
+        coords = np.stack([xs.ravel(), ys.ravel()], axis=1)
+        abs_e = np.exp(-(coords[:, 0] ** 2 + coords[:, 1] ** 2) / 0.05)
+        fields = dict(abs_e=abs_e / abs_e.max(), coords_um=coords)
+        fields.update(overrides)
+        return ModeField(**fields)
+
+    def test_generates_pdf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = plot_mode_field(self._mode(), output_dir=tmp)
+            assert Path(path).exists()
+            assert path.name == "mode_field.pdf"
+
+    def test_draws_rib_outline(self):
+        mode = self._mode(rib_bounds=(-0.25, 0.25, -0.06, 0.16))
+        with tempfile.TemporaryDirectory() as tmp:
+            assert plot_mode_field(mode, output_dir=tmp).exists()
+
+    def test_rejects_mismatched_lengths(self):
+        with pytest.raises(ValueError, match="one magnitude per vertex"):
+            ModeField(abs_e=np.ones(4), coords_um=np.zeros((3, 2)))
+
+
 class TestGenerateOutputs:
-    def test_includes_breakdown_plot(self):
+    def test_emits_the_headline_figures(self):
+        """The four headline figures, and no retired panel (ticket 07)."""
+        import jax.numpy as jnp
+
+        coords = _make_coords()
+        mode = ModeField(
+            abs_e=np.linspace(0.0, 1.0, N_NODES), coords_um=coords * 1e6,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = generate_outputs(
+                np.full(N_NODES, 0.25), RNG.random(N_NODES), _make_history(),
+                coords,
+                pipeline_fn=_stub_pipeline,
+                gradient_validation_rho=jnp.full(N_NODES, 0.25),
+                mode_field=mode,
+                output_dir=tmp,
+            )
+            assert {path.name for path in paths} == {
+                "convergence.pdf",
+                "doping_field.pdf",
+                "gradient_validation.pdf",
+                "mode_field.pdf",
+            }
+
+    def test_skips_mode_figure_without_a_mode(self):
         coords = _make_coords()
         with tempfile.TemporaryDirectory() as tmp:
             paths = generate_outputs(
                 np.full(N_NODES, 0.25), RNG.random(N_NODES), _make_history(),
                 coords, output_dir=tmp,
             )
-            assert {"convergence.pdf", "doping_field.pdf", "breakdown.pdf"} <= {
-                path.name for path in paths
+            assert {path.name for path in paths} == {
+                "convergence.pdf",
+                "doping_field.pdf",
             }
 
     def test_custom_directions(self):

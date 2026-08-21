@@ -13,9 +13,9 @@ from prismo.density_filter import assemble_filter_matrix  # noqa: E402
 from prismo.mesh_transfer import build_mesh_transfer_operator  # noqa: E402
 from prismo.pipeline import (  # noqa: E402
     _CT_MESH_MOUNT,
+    _JUNCTION_SEED_THETA,
     DOPING_LOG10_SPAN,
     DOPING_REFERENCE_CM3,
-    _JUNCTION_SEED_THETA,
     REVERSE_BIAS_V,
     PipelineComponents,
     _build_design_epsilon,
@@ -28,9 +28,10 @@ from prismo.pipeline import (  # noqa: E402
     doping_from_theta,
     init_tesseract_containers,
     pipeline,
-    write_gyptis_mesh,
     read_gyptis_design_cell_centroids,
+    read_gyptis_mode_field,
     vpi_lpi_v_cm,
+    write_gyptis_mesh,
 )
 from prismo.soref_bennett import soref_bennett as _sb_numpy  # noqa: E402
 from prismo_shared.schemas import CarrierDensityField, MeshRef  # noqa: E402
@@ -332,7 +333,7 @@ class TestPipelineStub:
         dN = 1e18  # cm^-3 depletion
         exp_dn = coeffs.A_e * dN**coeffs.B_e + coeffs.A_h * dN**coeffs.B_h
         exp_deps = 2.0 * coeffs.background_index * exp_dn
-        bg = pl._DEFAULT_BACKGROUND_EPSILON
+        bg = pl.DEFAULT_BACKGROUND_EPSILON
         # No mean-collapse: the uniform depletion perturbs the whole design
         # field, and the effective-medium stub averages it back to bg + exp_deps.
         exp_result = float(np.sqrt(bg + exp_deps) - np.sqrt(bg))
@@ -545,6 +546,50 @@ class TestContainerPipeline:
 
         assert gyptis.inputs == {"operation": "design_cell_centroids"}
         np.testing.assert_allclose(centroids, [[-0.1, 0.2], [0.1, 0.2]])
+
+    def test_reads_mode_field_from_gyptis_container(self):
+        class FakeGyptis:
+            def __init__(self):
+                self.inputs = None
+
+            def apply(self, inputs):
+                self.inputs = inputs
+                return {
+                    "mode_abs_e": [0.5, 1.0, 0.25],
+                    "mode_coordinates": [[0.0, 0.0], [0.1, 0.0], [0.2, 0.0]],
+                }
+
+        gyptis = FakeGyptis()
+        abs_e, coords = read_gyptis_mode_field(
+            np.array([12.0, 12.1]), 11.5, container=gyptis
+        )
+
+        assert gyptis.inputs["operation"] == "mode_field"
+        np.testing.assert_allclose(gyptis.inputs["design_epsilon"], [12.0, 12.1])
+        # The background must match the solve components': it keys the tracked
+        # mode branch as well as the device being solved (ticket 13).
+        assert gyptis.inputs["core_epsilon"] == 11.5
+        np.testing.assert_allclose(abs_e, [0.5, 1.0, 0.25])
+        np.testing.assert_allclose(coords, [[0.0, 0.0], [0.1, 0.0], [0.2, 0.0]])
+
+    def test_mode_field_rejects_mismatched_payload(self):
+        class FakeGyptis:
+            def apply(self, inputs):
+                return {
+                    "mode_abs_e": [0.5, 1.0, 0.25],
+                    "mode_coordinates": [[0.0, 0.0], [0.1, 0.0]],
+                }
+
+        with pytest.raises(ValueError, match="one magnitude per mesh vertex"):
+            read_gyptis_mode_field(np.array([12.0]), container=FakeGyptis())
+
+    def test_mode_field_rejects_an_empty_payload(self):
+        class FakeGyptis:
+            def apply(self, inputs):
+                return {}
+
+        with pytest.raises(RuntimeError, match="no field payload"):
+            read_gyptis_mode_field(np.array([12.0]), container=FakeGyptis())
 
     def test_background_eigenmode_is_cached_across_pipeline_calls(self):
         """Only the rho-independent background solve survives a callback."""

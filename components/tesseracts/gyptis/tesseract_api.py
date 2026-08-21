@@ -94,6 +94,9 @@ class InputSchema(BaseModel):
             returns the static design-cell geometry needed to construct a mesh
             transfer operator. ``"write_mesh"`` emits the shared unified ``.msh``
             (as text) for the ChargeTransport container and the transfer operator.
+            ``"mode_field"`` solves and returns the tracked mode's ``|E|``
+            profile sampled at the mesh vertices, for the headline mode figure
+            (ticket 07).
         design_epsilon: Relative permittivity per design cell -- the modulated
             silicon on the rib interior, one value per DG0 cell (order given by
             :func:`design_cell_centroids`). This is the only differentiated input.
@@ -103,7 +106,9 @@ class InputSchema(BaseModel):
         substrate_epsilon: Substrate (oxide) permittivity (constant).
     """
 
-    operation: Literal["solve", "design_cell_centroids", "write_mesh"] = "solve"
+    operation: Literal[
+        "solve", "design_cell_centroids", "write_mesh", "mode_field"
+    ] = "solve"
     design_epsilon: Differentiable[Array[(None,), Float64]] | None = None
     core_epsilon: float = DEFAULT_CORE_EPSILON
     clad_epsilon: float = DEFAULT_CLAD_EPSILON
@@ -126,12 +131,20 @@ class OutputSchema(BaseModel):
             design cell, in ``design_epsilon`` order, returned by ``write_mesh``.
             The host matches these to shared-mesh node indices to assemble the
             exact node->DG0-cell restriction operator (ticket 05).
+        mode_abs_e: ``(n_vertices,)`` magnitude ``|E|`` of the tracked mode at
+            every mesh vertex, normalized to a peak of 1, returned by the
+            ``mode_field`` operation. The eigenvector carries an arbitrary
+            complex scale, so only the normalized profile is meaningful.
+        mode_coordinates: ``(n_vertices, 2)`` mesh vertex coordinates in
+            micrometres, in ``mode_abs_e`` order.
     """
 
     neff_sq: Differentiable[Array[(), Float64]] | None = None
     design_cell_centroids: Array[(None, 2), Float64] | None = None
     mesh_text: str | None = None
     design_cell_vertices: Array[(None, 3, 2), Float64] | None = None
+    mode_abs_e: Array[(None,), Float64] | None = None
+    mode_coordinates: Array[(None, 2), Float64] | None = None
 
 
 #
@@ -740,42 +753,19 @@ def _field_sensitivity(
     return 2.0 * state["neff"] * dneff
 
 
-#
-# Required endpoint
-#
+def _forward_solve(
+    inputs: InputSchema,
+) -> tuple[np.ndarray, Any, Any, np.ndarray, float, dict[str, Any], tuple[float, float, float]]:
+    """Validate a design field, build the waveguide, and run the tracked solve.
 
-
-def apply(inputs: InputSchema) -> OutputSchema:
-    """Forward field-epsilon eigenmode solve.
-
-    Args:
-        inputs: Design-region permittivity field plus constant surroundings.
+    Shared by ``apply`` and the ``mode_field`` operation so both reach the same
+    eigenpair from the same inputs. The tracked eigenvalue is *read* here but not
+    written: only ``apply`` -- the forward a VJP can be taken against -- advances
+    the tracked branch, so an out-of-band field query cannot redirect tracking.
 
     Returns:
-        Squared effective index of the tracked mode.
+        ``(design, simu, dg0, mask, k0, state, geometry_key)``.
     """
-    if inputs.operation == "design_cell_centroids":
-        try:
-            centroids = design_cell_centroids(
-                inputs.core_epsilon, inputs.clad_epsilon, inputs.substrate_epsilon
-            )
-        except ImportError as exc:
-            raise RuntimeError(
-                "design-cell centroids require a gyptis/FEniCS backend"
-            ) from exc
-        return OutputSchema(design_cell_centroids=centroids)
-
-    if inputs.operation == "write_mesh":
-        try:
-            mesh_text, vertices = write_mesh(
-                inputs.core_epsilon, inputs.clad_epsilon, inputs.substrate_epsilon
-            )
-        except ImportError as exc:
-            raise RuntimeError(
-                "the unified mesh requires a gyptis/FEniCS backend"
-            ) from exc
-        return OutputSchema(mesh_text=mesh_text, design_cell_vertices=vertices)
-
     if inputs.design_epsilon is None:
         raise ValueError("design_epsilon is required for a gyptis solve")
     design = np.asarray(inputs.design_epsilon, dtype=float)
@@ -821,6 +811,87 @@ def apply(inputs: InputSchema) -> OutputSchema:
         inputs.clad_epsilon,
         ref_lam=_tracked_lam.get(geometry),
     )
+    return design, simu, dg0, mask, k0, state, geometry
+
+
+def _vertex_abs_e(form: Any, state: dict[str, Any]) -> np.ndarray:
+    """``|E|`` of the tracked mode at every mesh vertex.
+
+    The eigenvector of the real doubled system is itself complex, ``rx + i cx``,
+    and each of those halves already packs the complex 3-vector E as six real
+    components ``[Re E0..2, Im E0..2]``. So the physical field is
+
+        ``E = (rx[:3] - cx[3:]) + i (rx[3:] + cx[:3])``
+
+    and ``|E|`` is the pointwise magnitude of that 3-vector. It is invariant
+    under the eigenvector's arbitrary global phase; its arbitrary scale is
+    removed by normalizing to a peak of 1.
+    """
+    from gyptis.utils.helpers import array2function
+
+    fs = form.function_space
+    mesh = fs.mesh()
+
+    def components(vec: Any) -> np.ndarray:
+        fn = array2function(vec.getArray(), fs)
+        return np.asarray(fn.compute_vertex_values(mesh)).reshape(6, -1)
+
+    a, b = components(state["rx"]), components(state["cx"])
+    e_real, e_imag = a[:3] - b[3:], a[3:] + b[:3]
+    magnitude = np.sqrt((e_real**2 + e_imag**2).sum(axis=0))
+    peak = float(magnitude.max())
+    if peak == 0.0:
+        raise RuntimeError("tracked eigenmode has an identically zero field")
+    return magnitude / peak
+
+
+#
+# Required endpoint
+#
+
+
+def apply(inputs: InputSchema) -> OutputSchema:
+    """Forward field-epsilon eigenmode solve.
+
+    Args:
+        inputs: Design-region permittivity field plus constant surroundings.
+
+    Returns:
+        Squared effective index of the tracked mode.
+    """
+    if inputs.operation == "design_cell_centroids":
+        try:
+            centroids = design_cell_centroids(
+                inputs.core_epsilon, inputs.clad_epsilon, inputs.substrate_epsilon
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "design-cell centroids require a gyptis/FEniCS backend"
+            ) from exc
+        return OutputSchema(design_cell_centroids=centroids)
+
+    if inputs.operation == "write_mesh":
+        try:
+            mesh_text, vertices = write_mesh(
+                inputs.core_epsilon, inputs.clad_epsilon, inputs.substrate_epsilon
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "the unified mesh requires a gyptis/FEniCS backend"
+            ) from exc
+        return OutputSchema(mesh_text=mesh_text, design_cell_vertices=vertices)
+
+    if inputs.operation == "mode_field":
+        _design, simu, _dg0, _mask, _k0, state, _geometry = _forward_solve(inputs)
+        return OutputSchema(
+            neff_sq=state["neff"] * state["neff"],
+            mode_abs_e=_vertex_abs_e(simu.formulation, state),
+            mode_coordinates=np.asarray(
+                simu.formulation.function_space.mesh().coordinates(), dtype=float
+            ),
+        )
+
+    design, simu, dg0, mask, k0, state, geometry = _forward_solve(inputs)
     _tracked_lam[geometry] = state["lam"]
 
     _session_registry.open(

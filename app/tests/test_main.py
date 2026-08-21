@@ -132,17 +132,28 @@ def test_run_gradient_validation_passes_for_real_gradient(
 
 
 @pytest.mark.slow
-def test_cli_run_without_backend_errors() -> None:
+def test_cli_run_without_backend_errors(tmp_path: Path) -> None:
     """Ticket 04: a no-backend `prismo run` fails loudly, never fabricating a result.
 
     Without a container (no Julia/gyptis solver), the deleted physics-free
     stubs used to let the synthetic run "succeed" with fabricated carriers and
     an effective-medium neff. It must now surface the missing solver backend.
+
+    Mesh and output paths are pinned to ``tmp_path``: on the defaults this run
+    authors the *local* rib mesh over ``outputs/waveguide.msh``, the shared mesh
+    a container run hands ChargeTransport, so running the suite would leave the
+    next ``make run-containers`` reading a stale, differently-sized mesh.
     """
     main_module = import_module("prismo.main")
     result = runner.invoke(
         main_module.app,
-        ["run", "--max-iter", "3", "--no-jit"],
+        [
+            "run",
+            "--max-iter", "3",
+            "--no-jit",
+            "--mesh-path", str(tmp_path / "waveguide.msh"),
+            "--output-dir", str(tmp_path),
+        ],
     )
     assert result.exit_code != 0
     assert result.exception is not None
@@ -228,6 +239,178 @@ def test_container_run_seeds_signed_junction_for_optimization(
         output_captured["gradient_validation_rho"],
         [0.3, 0.3, -0.3],
     )
+
+
+def test_container_run_figures_probe_the_optimized_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The gradient figure binds the optimized function; the mode figure lands.
+
+    The finite differences behind ``gradient_validation.pdf`` must run the same
+    pipeline the optimizer drove -- filter, ``mesh_ref`` and transfer bound --
+    not an unfiltered one on ChargeTransport's 1D fallback device (ticket 15).
+    """
+    import jax.numpy as jnp
+    import prismo.main as main_module
+    import prismo.optimizer as optimizer_module
+    import prismo.outputs as outputs_module
+    import prismo.waveguide_mesh as mesh_module
+    from prismo.pipeline import PipelineComponents
+
+    coords = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+    output_captured: dict[str, object] = {}
+    history = [
+        {
+            "iteration": index,
+            "delta_n_eff": 1e-3,
+            "delta_rho": 1e-3,
+            "grad_norm": 1e-4,
+            "wall_time": 0.1,
+        }
+        for index in range(1, 6)
+    ]
+    mode_calls: list[np.ndarray] = []
+
+    def mode_field(design_epsilon, core_epsilon):
+        mode_calls.append((np.asarray(design_epsilon), core_epsilon))
+        return np.asarray([0.25, 1.0]), np.asarray([[-0.1, 0.0], [0.1, 0.0]])
+
+    base = _container_components([[0.5, 0.0], [1.5, 0.0]])
+    components = PipelineComponents(
+        chargetransport=lambda doping, bias, mesh_ref=None: (doping, doping),
+        gyptis=lambda design_epsilon, core_epsilon=None: jnp.mean(design_epsilon),
+        gyptis_background=lambda design_epsilon, core_epsilon=None: jnp.mean(
+            design_epsilon
+        ),
+        design_cell_centroids=base.design_cell_centroids,
+        design_cell_vertices=base.design_cell_vertices,
+        write_mesh=base.write_mesh,
+        mode_field=mode_field,
+    )
+
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        optimizer_module,
+        "optimize_doping",
+        lambda **_: (np.asarray([0.2, 0.3, 0.4]), history),
+    )
+    monkeypatch.setattr(
+        outputs_module,
+        "generate_outputs",
+        lambda **kwargs: (output_captured.update(kwargs) or []),
+    )
+    _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
+
+    main_module._run_pipeline(
+        r_min=50e-9,
+        max_iter=5,
+        ftol_rel=1e-5,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        no_jit=True,
+        use_containers=True,
+        components=components,
+    )
+
+    bound = output_captured["pipeline_fn"].keywords
+    assert bound["H"] is not None
+    assert bound["H_sum"] is not None
+    assert bound["mesh_ref"] is not None
+    assert bound["design_transfer"] is not None
+
+    # The mode is queried once, on the design-cell permittivity field, against
+    # the same background the solve components were given.
+    from prismo.pipeline import DEFAULT_BACKGROUND_EPSILON
+
+    assert len(mode_calls) == 1
+    queried_design, queried_background = mode_calls[0]
+    assert queried_design.shape == (2,)
+    assert queried_background == DEFAULT_BACKGROUND_EPSILON
+    mode = output_captured["mode_field"]
+    np.testing.assert_allclose(mode.abs_e, [0.25, 1.0])
+    # The rib outline is the bounding box of the design cells.
+    assert mode.rib_bounds == (0.5, 1.5, 0.0, 0.0)
+
+
+def test_container_run_survives_a_failing_mode_query(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A backend that cannot answer the mode query costs one figure, not all four.
+
+    The query runs after a multi-minute optimization has already succeeded -- an
+    image predating the ``mode_field`` operation, say, answers it with an error
+    -- so it must degrade to a skipped figure rather than sink the run.
+    """
+    import jax.numpy as jnp
+    import prismo.main as main_module
+    import prismo.optimizer as optimizer_module
+    import prismo.outputs as outputs_module
+    import prismo.waveguide_mesh as mesh_module
+    from prismo.pipeline import PipelineComponents
+
+    coords = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+    output_captured: dict[str, object] = {}
+    history = [
+        {
+            "iteration": 1,
+            "delta_n_eff": 1e-3,
+            "delta_rho": 1e-3,
+            "grad_norm": 1e-4,
+            "wall_time": 0.1,
+        }
+    ]
+
+    def failing_mode_field(design_epsilon, core_epsilon):
+        raise RuntimeError("422 unknown operation 'mode_field'")
+
+    base = _container_components([[0.5, 0.0], [1.5, 0.0]])
+    components = PipelineComponents(
+        chargetransport=lambda doping, bias, mesh_ref=None: (doping, doping),
+        gyptis=lambda design_epsilon, core_epsilon=None: jnp.mean(design_epsilon),
+        gyptis_background=lambda design_epsilon, core_epsilon=None: jnp.mean(
+            design_epsilon
+        ),
+        design_cell_centroids=base.design_cell_centroids,
+        design_cell_vertices=base.design_cell_vertices,
+        write_mesh=base.write_mesh,
+        mode_field=failing_mode_field,
+    )
+
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        optimizer_module,
+        "optimize_doping",
+        lambda **_: (np.asarray([0.2, 0.3, 0.4]), history),
+    )
+    monkeypatch.setattr(
+        outputs_module,
+        "generate_outputs",
+        lambda **kwargs: (output_captured.update(kwargs) or []),
+    )
+    _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
+
+    main_module._run_pipeline(
+        r_min=50e-9,
+        max_iter=5,
+        ftol_rel=1e-5,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        no_jit=True,
+        use_containers=True,
+        components=components,
+    )
+
+    # The other figures were still requested, with no mode field.
+    assert output_captured["mode_field"] is None
+    assert output_captured["pipeline_fn"] is not None
 
 
 def test_container_run_rejects_near_zero_objective(

@@ -1,8 +1,10 @@
 """Paper-ready visualization outputs for the PRISMO pipeline.
 
-Ref: ticket 16 — produce convergence plots, doping-field visualizations,
-delta_n_eff breakdown, and gradient-validation plots for the hackathon
-submission.
+Ref: rethink ticket 07 — the headline figure set. ``generate_outputs`` emits
+four: the MMA convergence curve carrying both the optimized signed Δneff and
+the reported VπLπ, the adjoint-vs-finite-difference gradient validation
+(ticket 06), the initial-vs-optimized signed θ field, and the optical mode |E|
+on the rib cross-section. Panels that serve none of those were dropped.
 """
 
 from __future__ import annotations
@@ -33,6 +35,25 @@ plt.rcParams.update({
 })
 
 _OUTPUT_DIR = Path("outputs")
+
+# Dynamic range at which the convergence figure's VpiLpi axis switches from
+# linear to symlog. VpiLpi goes as 1/delta_n_eff, so a run that starts near zero
+# spans many decades and a linear axis flattens everything after the first
+# iteration; a run that starts already converged spans almost nothing, and
+# symlog's locator would place no ticks across it. Two decades separates the two.
+_VPI_SYMLOG_SPAN: float = 100.0
+
+
+def vpi_axis_is_symlog(magnitudes: list[float]) -> bool:
+    """Whether the convergence figure's VpiLpi axis should be symlog, not linear.
+
+    symlog exists to compress a wide span. VpiLpi goes as ``1/delta_n_eff``, so a
+    run that starts near zero spans many decades and a linear axis flattens
+    every iteration after the first. A run that starts already converged spans
+    almost nothing, and there symlog's locator places no ticks at all, leaving a
+    labelled axis with no numbers on it. Switch at two decades.
+    """
+    return max(magnitudes) > _VPI_SYMLOG_SPAN * min(magnitudes)
 
 
 def _ensure_output_dir(output_dir: str | Path | None = None) -> Path:
@@ -75,7 +96,7 @@ def plot_convergence(
     output_dir: str | Path | None = None,
     ftol_rel: float | None = None,
 ) -> Path:
-    """Convergence plot: delta_n_eff vs iteration.
+    """Convergence plot: signed delta_n_eff and reported VpiLpi vs iteration.
 
     Args:
         history: Per-iteration records from ``optimize_doping``.
@@ -87,6 +108,7 @@ def plot_convergence(
     """
     out = _ensure_output_dir(output_dir)
     fig, ax = plt.subplots(figsize=(6, 4))
+    ax_vpi = None
 
     if not history:
         ax.text(
@@ -94,12 +116,14 @@ def plot_convergence(
             transform=ax.transAxes, fontsize=14,
         )
     else:
+        from prismo.pipeline import vpi_lpi_v_cm
+
         iters = [h["iteration"] for h in history]
         values = [h["delta_n_eff"] for h in history]
 
         ax.plot(
             iters, values, "o-", markersize=3, color="#2c7bb6",
-            label=r"$\Delta n_{\mathrm{eff}}$",
+            label=r"$\Delta n_{\mathrm{eff}}$ (optimized)",
         )
         ax.axhline(
             y=values[-1], color="#d7191c", linestyle="--", alpha=0.6,
@@ -119,10 +143,36 @@ def plot_convergence(
                     label=f"ftol_rel={ftol_rel:.0e}",
                 )
 
+        # VpiLpi is the field-standard headline but is *reported*, not optimized
+        # (ticket 03). It goes as 1/delta_n_eff, so an early iteration near zero
+        # is orders of magnitude above the converged value and on a linear axis
+        # would flatten the whole curve; an iteration exactly at zero is infinite
+        # and cannot be drawn at all. So it rides a twin *symlog* axis -- signed,
+        # since a wrong-polarity optimum reads negative -- with the finite points
+        # only.
+        vpi = ((i, vpi_lpi_v_cm(v)) for i, v in zip(iters, values, strict=True))
+        finite = [(i, v) for i, v in vpi if np.isfinite(v)]
+        if finite:
+            magnitudes = [abs(v) for _, v in finite if v != 0.0]
+            ax_vpi = ax.twinx()
+            ax_vpi.plot(
+                [i for i, _ in finite], [v for _, v in finite],
+                "s--", markersize=3, color="#1a9641", alpha=0.8,
+                label=r"$V_\pi L_\pi$ (reported)",
+            )
+            if magnitudes and vpi_axis_is_symlog(magnitudes):
+                ax_vpi.set_yscale("symlog", linthresh=min(magnitudes))
+            ax_vpi.set_ylabel(r"$V_\pi L_\pi$ [V$\cdot$cm]", color="#1a9641")
+            ax_vpi.tick_params(axis="y", labelcolor="#1a9641")
+
     ax.set_xlabel("Iteration")
     ax.set_ylabel(r"$\Delta n_{\mathrm{eff}}$")
     ax.set_title("MMA Convergence")
-    ax.legend()
+    handles, labels = ax.get_legend_handles_labels()
+    if ax_vpi is not None:
+        extra_handles, extra_labels = ax_vpi.get_legend_handles_labels()
+        handles, labels = handles + extra_handles, labels + extra_labels
+    ax.legend(handles, labels, loc="best")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
 
@@ -274,43 +324,87 @@ def _overlay_geometry(ax: plt.Axes, geometry: object) -> None:
     )
 
 
-def plot_delta_neff_breakdown(
-    delta_n: float,
-    delta_alpha: float,
+@dataclass(frozen=True)
+class ModeField:
+    """The tracked optical mode's ``|E|`` profile on the shared mesh.
+
+    ``abs_e`` is the peak-normalized magnitude at each mesh vertex and
+    ``coords_um`` the matching ``(n_vertices, 2)`` vertex coordinates. Unlike the
+    doping-field plots -- which take SI node coordinates and scale them -- these
+    come straight off the gyptis mesh and are already in **micrometres**, so the
+    plot uses them unscaled. ``rib_bounds`` is the optional
+    ``(x_min, x_max, y_min, y_max)`` rectangle of the silicon rib interior, in
+    the same micrometre frame, drawn as an outline so the mode can be read
+    against the guiding core.
+    """
+
+    abs_e: np.ndarray
+    coords_um: np.ndarray
+    rib_bounds: tuple[float, float, float, float] | None = None
+
+    def __post_init__(self) -> None:
+        coords = np.asarray(self.coords_um, dtype=float)
+        abs_e = np.asarray(self.abs_e, dtype=float)
+        if coords.ndim != 2 or coords.shape[1] != 2:
+            raise ValueError("mode coordinates must have shape (n_vertices, 2)")
+        if abs_e.ndim != 1 or abs_e.shape[0] != coords.shape[0]:
+            raise ValueError(
+                "the mode field needs one magnitude per vertex "
+                f"({abs_e.shape} values for {coords.shape[0]} vertices)"
+            )
+        object.__setattr__(self, "abs_e", abs_e)
+        object.__setattr__(self, "coords_um", coords)
+
+
+def plot_mode_field(
+    mode: ModeField,
     output_dir: str | Path | None = None,
 ) -> Path:
-    """Stacked bar chart: delta_n_eff from delta_n vs delta_alpha.
+    """Optical mode ``|E|`` on the rib cross-section.
+
+    The eigensolver's mode is what turns the doping design into a phase shift,
+    so the headline set shows it directly: whichever mode the solve tracked, on
+    the same cross-section as the doping figure (ticket 07).
 
     Args:
-        delta_n: Effective-index change from real-index perturbation.
-        delta_alpha: Effective-index change from absorption perturbation.
-        output_dir: Directory to write ``breakdown.pdf``.
+        mode: The tracked mode's normalized ``|E|`` and vertex coordinates.
+        output_dir: Directory to write ``mode_field.pdf``.
 
     Returns:
         Path to the saved figure.
     """
     out = _ensure_output_dir(output_dir)
-    fig, ax = plt.subplots(figsize=(4, 4))
+    x, y = mode.coords_um[:, 0], mode.coords_um[:, 1]
 
-    categories = [r"$\Delta n$", r"$\Delta\alpha$"]
-    values = [abs(delta_n), abs(delta_alpha)]
-    colors = ["#2c7bb6", "#d7191c"]
+    # Rendered on the solver's own triangulation rather than resampled onto a
+    # regular grid: the mesh is refined inside the rib, which is exactly where
+    # the mode lives, and a uniform resample throws that refinement away.
+    fig, ax = plt.subplots(figsize=(6, 4))
+    mesh = ax.tripcolor(
+        mtri.Triangulation(x, y),
+        mode.abs_e,
+        shading="gouraud",
+        cmap="inferno",
+        vmin=0.0,
+        vmax=1.0,
+    )
+    ax.set_title(r"Optical mode $|E|$ (tracked)")
+    ax.set_xlabel("x [µm]")
+    ax.set_ylabel("y [µm]")
+    ax.set_aspect("equal")
 
-    bars = ax.bar(categories, values, color=colors, width=0.5)
-    ax.set_ylabel(r"$|\Delta n_{\mathrm{eff}}|$ contribution")
-    ax.set_title(r"$\Delta n_{\mathrm{eff}}$ Breakdown")
-
-    for bar, val in zip(bars, values, strict=True):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + max(values) * 0.02,
-            f"{val:.2e}", ha="center", va="bottom", fontsize=10,
+    if mode.rib_bounds is not None:
+        x0, x1, y0, y1 = mode.rib_bounds
+        ax.plot(
+            [x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0],
+            "w--", linewidth=0.8, alpha=0.8, label="Si rib",
         )
+        ax.legend(loc="upper right", framealpha=0.6)
 
-    ax.grid(True, alpha=0.3, axis="y")
+    fig.colorbar(mesh, ax=ax, label=r"$|E|$ (normalized)")
     fig.tight_layout()
 
-    path = out / "breakdown.pdf"
+    path = out / "mode_field.pdf"
     fig.savefig(path)
     plt.close(fig)
     return path
@@ -569,9 +663,10 @@ def generate_outputs(
     gradient_validation_directions: int = 3,
     gradient_validation_steps: np.ndarray | None = None,
     gradient_validation_rho: np.ndarray | None = None,
+    mode_field: ModeField | None = None,
     output_dir: str | Path | None = None,
 ) -> list[Path]:
-    """Generate all paper-ready output plots.
+    """Generate the headline output figures (ticket 07).
 
     Args:
         rho_initial: Initial design vector.
@@ -586,6 +681,8 @@ def generate_outputs(
         gradient_validation_steps: Central-difference steps for gradient validation.
         gradient_validation_rho: Reference design for gradient validation.
             Defaults to ``rho_opt``.
+        mode_field: Tracked optical mode ``|E|`` from the gyptis backend.
+            Skipped if ``None`` (no gyptis backend bound).
         output_dir: Output directory (default: ``outputs/``).
 
     Returns:
@@ -617,11 +714,7 @@ def generate_outputs(
         )
         paths.append(gv)
 
-    breakdown = plot_delta_neff_breakdown(
-        float(history[-1]["delta_n_eff"]) if history else 0.0,
-        0.0,
-        output_dir=out,
-    )
-    paths.append(breakdown)
+    if mode_field is not None:
+        paths.append(plot_mode_field(mode_field, output_dir=out))
 
     return paths

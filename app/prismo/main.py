@@ -16,7 +16,7 @@ import numpy as np
 import typer
 
 if TYPE_CHECKING:
-    from prismo.outputs import GradientValidationResult
+    from prismo.outputs import GradientValidationResult, ModeField
 
 app = typer.Typer(name="prismo")
 
@@ -162,8 +162,10 @@ class _PipelineInputs:
 
     Assembled once from the mesh: the node coordinates, the signed-junction seed
     ``theta_init``, the density-filter matrix ``(H_dense, H_sum)``, the
-    ``mesh_ref`` that routes ChargeTransport onto the real 2D grid, and the
-    ``design_transfer`` that carries the nodal field onto the gyptis design cells.
+    ``mesh_ref`` that routes ChargeTransport onto the real 2D grid, the
+    ``design_transfer`` that carries the nodal field onto the gyptis design
+    cells, and the ``design_vertices`` those cells occupy (container path only),
+    whose bounding box outlines the silicon rib on the mode figure.
     """
 
     geometry: Any
@@ -176,6 +178,7 @@ class _PipelineInputs:
     H_sum: Any
     theta_init: Any
     design_transfer: Any | None
+    design_vertices: np.ndarray | None = None
 
 
 def _build_pipeline_inputs(
@@ -282,7 +285,60 @@ def _build_pipeline_inputs(
         H_sum=H_sum,
         theta_init=theta_init,
         design_transfer=design_transfer,
+        design_vertices=design_vertices,
     )
+
+
+def _optimized_mode_field(
+    inputs: _PipelineInputs,
+    rho_opt: np.ndarray,
+    components: Any | None,
+) -> ModeField | None:
+    """The tracked optical mode ``|E|`` at the optimized design (ticket 07).
+
+    Re-runs the pipeline's own pre-eigensolve stages at ``rho_opt`` -- filter,
+    doping, both ChargeTransport solves, Soref-Bennett, mesh transfer -- so the
+    figure shows the mode of the *reverse-biased optimized device*, the same
+    permittivity the final objective was evaluated on, rather than a
+    separately-reconstructed one. Returns ``None`` when no gyptis backend is
+    bound to answer the query.
+    """
+    import jax.numpy as jnp
+
+    from prismo.outputs import ModeField
+    from prismo.pipeline import (
+        DEFAULT_BACKGROUND_EPSILON,
+        default_components,
+        design_epsilon_from_theta,
+    )
+
+    bundle = components if components is not None else default_components()
+    if bundle.mode_field is None:
+        return None
+
+    _epsilon_bg, epsilon_pert = design_epsilon_from_theta(
+        jnp.asarray(rho_opt, dtype=jnp.float64),
+        H=inputs.H_dense,
+        H_sum=inputs.H_sum,
+        mesh_ref=inputs.mesh_ref,
+        background_epsilon=DEFAULT_BACKGROUND_EPSILON,
+        design_transfer=inputs.design_transfer,
+        components=bundle,
+    )
+    abs_e, coords_um = bundle.mode_field(
+        np.asarray(epsilon_pert), DEFAULT_BACKGROUND_EPSILON
+    )
+
+    rib_bounds = None
+    if inputs.design_vertices is not None and inputs.design_vertices.size:
+        verts = inputs.design_vertices.reshape(-1, 2)
+        rib_bounds = (
+            float(verts[:, 0].min()),
+            float(verts[:, 0].max()),
+            float(verts[:, 1].min()),
+            float(verts[:, 1].max()),
+        )
+    return ModeField(abs_e=abs_e, coords_um=coords_um, rib_bounds=rib_bounds)
 
 
 def _run_pipeline(
@@ -377,14 +433,30 @@ def _run_pipeline(
 
     typer.echo("[3/3] Generating outputs...")
     rho_initial = np.asarray(theta_init, dtype=float)
+    # The mode figure is a post-hoc query, so a backend that cannot answer it --
+    # an image predating the ``mode_field`` operation, say -- must cost one
+    # figure, not every figure of a finished multi-minute optimization.
+    try:
+        mode_field = _optimized_mode_field(inputs, rho_opt, components)
+    except Exception as exc:
+        typer.echo(f"      WARNING: mode figure skipped ({exc})")
+        mode_field = None
     plot_paths = generate_outputs(
         rho_initial=rho_initial,
         rho_opt=rho_opt,
         history=history,
         mesh_coords=coords * 1e-6,
         geometry=geometry,
+        # Bind the *same* pipeline the optimizer drove -- filter, mesh_ref and
+        # transfer included. Omitting them made the figure's finite differences
+        # probe an unfiltered pipeline with ChargeTransport on its 1D fallback
+        # device, i.e. a different function than the one that was optimized
+        # (ticket 15).
         pipeline_fn=partial(
             pipeline_fn,
+            H=H_dense,
+            H_sum=H_sum,
+            mesh_ref=mesh_ref,
             design_transfer=design_transfer,
             components=components,
         ),
@@ -392,6 +464,7 @@ def _run_pipeline(
         gradient_validation_directions=1 if use_containers else 3,
         gradient_validation_steps=(np.logspace(-4, -2, 3) if use_containers else None),
         gradient_validation_rho=rho_initial if use_containers else None,
+        mode_field=mode_field,
         output_dir=output_dir,
     )
     for p in plot_paths:
