@@ -67,23 +67,31 @@ def _pcolormesh_field(
     x: np.ndarray,
     y: np.ndarray,
     values: np.ndarray,
+    triangles: np.ndarray | None = None,
     **kwargs: object,
-) -> matplotlib.collections.QuadMesh:
-    """Render nodal values with ``pcolormesh``, resampling irregular meshes."""
+) -> matplotlib.collections.Collection:
+    """Render a nodal field at the mesh's own resolution.
+
+    With ``triangles`` -- ``(n_triangles, 3)`` node indices, e.g. the silicon
+    triangulation of the shared mesh -- the field is drawn on exactly those
+    elements with Gouraud shading (the linear FE representation), so nothing
+    is painted outside the device. Without them, an irregular point set is
+    drawn on its Delaunay triangulation: full nodal resolution, unlike the
+    coarse ``sqrt(n)``-pixel resample this function used to do, which turned a
+    555-node mesh into ~23x23 blocks and smeared silicon values across the
+    oxide. A regular grid still uses ``pcolormesh`` directly (the synthetic
+    fallback grid).
+    """
+    if triangles is not None and len(triangles):
+        return ax.tripcolor(
+            mtri.Triangulation(x, y, triangles), values, shading="gouraud", **kwargs,
+        )
+
     x_values = np.unique(x)
     y_values = np.unique(y)
     if x_values.size * y_values.size != values.size:
-        triangulation = mtri.Triangulation(x, y)
-        interpolator = mtri.LinearTriInterpolator(triangulation, values)
-        n_x = min(400, max(2, int(np.sqrt(values.size))))
-        x_grid = np.linspace(x.min(), x.max(), n_x)
-        x_span = x.max() - x.min()
-        y_span = y.max() - y.min()
-        n_y = max(2, round(n_x * y_span / x_span)) if x_span else n_x
-        y_grid = np.linspace(y.min(), y.max(), n_y)
-        xx, yy = np.meshgrid(x_grid, y_grid)
-        return ax.pcolormesh(
-            x_grid, y_grid, interpolator(xx, yy), shading="nearest", **kwargs,
+        return ax.tripcolor(
+            mtri.Triangulation(x, y), values, shading="gouraud", **kwargs,
         )
 
     order = np.lexsort((x, y))
@@ -188,6 +196,7 @@ def plot_doping_field(
     mesh_coords: np.ndarray,
     geometry: object | None = None,
     output_dir: str | Path | None = None,
+    triangles: np.ndarray | None = None,
 ) -> Path:
     """Side-by-side doping field: initial vs optimized.
 
@@ -199,6 +208,10 @@ def plot_doping_field(
             labelled in, so no conversion happens here.
         geometry: ``RibWaveguideGeometry`` for overlay (optional).
         output_dir: Directory to write ``doping_field.pdf``.
+        triangles: ``(n_triangles, 3)`` silicon triangulation of the shared
+            mesh. With it the field is drawn on the device's own elements and
+            the oxide stays blank; without it the whole point set is drawn on
+            a Delaunay triangulation.
 
     Returns:
         Path to the saved figure.
@@ -206,11 +219,14 @@ def plot_doping_field(
     out = _ensure_output_dir(output_dir)
     x, y = mesh_coords[:, 0], mesh_coords[:, 1]
 
-    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(10, 4))
+    # Constrained layout, not tight_layout: the shared colorbar's axes are the
+    # kind tight_layout cannot handle, and it repositioned the two panels over
+    # the bar (the bar landed on top of the optimized panel).
+    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(10, 4), layout="constrained")
 
     # Signed design field theta in [-1, 1]: diverging map centred on the theta=0
     # junction so the p-side (theta<0) is not clipped.
-    mesh_kw: dict = dict(vmin=-1.0, vmax=1.0, cmap="RdBu_r")
+    mesh_kw: dict = dict(vmin=-1.0, vmax=1.0, cmap="RdBu_r", triangles=triangles)
 
     _pcolormesh_field(ax0, x, y, rho_initial, **mesh_kw)
     ax0.set_title(r"Initial $\theta$")
@@ -224,6 +240,11 @@ def plot_doping_field(
     ax1.set_ylabel("y [µm]")
     ax1.set_aspect("equal")
 
+    for ax in (ax0, ax1):
+        # Distinguish the undrawn surroundings from theta = 0 (white on the
+        # diverging map) when only the silicon elements are painted.
+        ax.set_facecolor("0.92")
+
     if geometry is not None:
         _overlay_geometry(ax0, geometry)
         _overlay_geometry(ax1, geometry)
@@ -231,7 +252,6 @@ def plot_doping_field(
     cbar = fig.colorbar(sc1, ax=[ax0, ax1], shrink=0.7, label=r"$\theta$ (signed)")
     cbar.set_ticks([-1.0, -0.5, 0.0, 0.5, 1.0])
 
-    fig.tight_layout()
     path = out / "doping_field.pdf"
     fig.savefig(path)
     plt.close(fig)
@@ -245,13 +265,15 @@ def plot_live_doping_field(
     geometry: object | None = None,
     output_dir: str | Path | None = None,
     name: str | None = None,
+    triangles: np.ndarray | None = None,
 ) -> Path:
     """Write the optimizer's current signed doping-field image.
 
     One image per optimizer callback, named by ``name``; callers pass the
     iteration number so a long run leaves a snapshot per iteration rather than
     one file overwritten in place. ``mesh_coords`` is in micrometres, as
-    everywhere else in the app.
+    everywhere else in the app. ``triangles`` is the silicon triangulation, as
+    in :func:`plot_doping_field`.
     """
     out = _ensure_output_dir(output_dir)
     doping = np.asarray(doping, dtype=float)
@@ -265,9 +287,11 @@ def plot_live_doping_field(
         x,
         y,
         doping,
+        triangles=triangles,
         cmap="RdBu_r",
         norm=SymLogNorm(linthresh=1e14, vmin=-limit, vmax=limit, base=10),
     )
+    ax.set_facecolor("0.92")
     ax.set_title(f"Net doping — optimizer iteration {iteration}")
     ax.set_xlabel("x [µm]")
     ax.set_ylabel("y [µm]")
@@ -283,6 +307,37 @@ def plot_live_doping_field(
     fig.savefig(path)
     plt.close(fig)
     return path
+
+
+@dataclass(frozen=True)
+class OverlayGeometry:
+    """The overlay frame of :func:`_overlay_geometry`, as plain values.
+
+    ``RibWaveguideGeometry`` satisfies the same duck-typed contract but can
+    only describe the mesh the *local* author builds (y from 0 at the
+    substrate bottom, 0.5 µm substrate). The gyptis author centres its layer
+    stack on y = 0 with a 0.35 µm substrate, so drawing the local frame on
+    container figures put the rib outline off the device entirely (ticket 16).
+    The container path builds one of these from the gyptis mesh itself instead.
+
+    ``substrate_top`` is the y of the substrate/slab interface -- the value the
+    local geometry exposes as ``substrate_thickness``, which only equals it in
+    a frame whose substrate starts at y = 0.
+    """
+
+    rib_left: float
+    rib_right: float
+    slab_top: float
+    rib_top: float
+    substrate_top: float
+    half_width: float
+    contact_offset: float
+    contact_width: float
+
+    @property
+    def substrate_thickness(self) -> float:
+        """Alias for the duck-typed attribute ``_overlay_geometry`` reads."""
+        return self.substrate_top
 
 
 def _overlay_geometry(ax: plt.Axes, geometry: object) -> None:
@@ -460,6 +515,29 @@ def _sample_directions(
     return sampled
 
 
+# Nodes this close to the ±1 rails count as pinned during gradient validation.
+# An optimized design rails many nodes exactly at the bounds, so a dense random
+# direction leaves the central stencil no feasible step at all; projecting the
+# direction onto the interior nodes keeps the check meaningful (every unpinned
+# variable is still validated) instead of raising after a finished run.
+_RAIL_CLEARANCE = 1e-3
+
+
+def _interior_direction(rho: jax.Array, direction: jax.Array) -> jax.Array | None:
+    """Project a direction off rail-pinned components and renormalize.
+
+    Returns ``None`` when every component with direction weight is pinned --
+    there is nothing left for a central stencil to probe.
+    """
+    rho_np = np.asarray(rho)
+    dir_np = np.asarray(direction)
+    projected = np.where(np.abs(rho_np) < 1.0 - _RAIL_CLEARANCE, dir_np, 0.0)
+    norm = float(np.linalg.norm(projected))
+    if norm == 0.0:
+        return None
+    return jnp.asarray(projected / norm, dtype=np.asarray(direction).dtype)
+
+
 def _feasible_steps(
     rho: jax.Array, direction: jax.Array, step_sizes: np.ndarray
 ) -> np.ndarray:
@@ -498,7 +576,15 @@ def _gradient_validation_curves(
     for i, direction in enumerate(directions):
         feasible_steps = _feasible_steps(rho, direction, step_sizes)
         if len(feasible_steps) == 0:
-            continue
+            # A design railed at ±1 leaves no room for the central stencil in
+            # a dense random direction; validate the interior subspace instead.
+            interior = _interior_direction(rho, direction)
+            if interior is None:
+                continue
+            direction = interior
+            feasible_steps = _feasible_steps(rho, direction, step_sizes)
+            if len(feasible_steps) == 0:
+                continue
         exact_val = jnp.dot(grad_exact, direction)
         denom = max(float(abs(exact_val)), 1e-30)
         errors = []
@@ -523,7 +609,9 @@ def _render_gradient_validation(
         label = f"direction {i+1}" if n_directions > 1 else "FD"
         ax.loglog(feasible_steps, errors, "o-", markersize=3, label=label)
 
-    ax.plot(step_sizes, step_sizes, "k--", alpha=0.4, label=r"$O(h)$")
+    # Central differences of a smooth pipeline converge at second order (see
+    # GRADIENT_VALIDATION_TOLERANCE above), so the guide line is h^2, not h.
+    ax.plot(step_sizes, step_sizes**2, "k--", alpha=0.4, label=r"$O(h^2)$")
     if tolerance is not None:
         ax.axhline(
             tolerance, color="crimson", ls=":", lw=1.5, label=f"tol = {tolerance:g}"
@@ -668,6 +756,7 @@ def generate_outputs(
     gradient_validation_rho: np.ndarray | None = None,
     mode_field: ModeField | None = None,
     output_dir: str | Path | None = None,
+    mesh_triangles: np.ndarray | None = None,
 ) -> list[Path]:
     """Generate the headline output figures (ticket 07).
 
@@ -676,6 +765,9 @@ def generate_outputs(
         rho_opt: Optimized design vector.
         history: Optimization history from ``optimize_doping``.
         mesh_coords: Node coordinates ``(n_nodes, 2)`` in micrometres.
+        mesh_triangles: ``(n_triangles, 3)`` silicon triangulation of the
+            shared mesh, so the doping figure draws the device's own elements
+            rather than a Delaunay fill of the whole domain.
         geometry: ``RibWaveguideGeometry`` instance.
         pipeline_fn: Differentiable pipeline function for gradient
             validation. Skipped if ``None``.
@@ -698,24 +790,34 @@ def generate_outputs(
     paths.append(conv)
 
     doping = plot_doping_field(
-        rho_initial, rho_opt, mesh_coords, geometry, output_dir=out,
+        rho_initial,
+        rho_opt,
+        mesh_coords,
+        geometry,
+        output_dir=out,
+        triangles=mesh_triangles,
     )
     paths.append(doping)
 
     if pipeline_fn is not None:
-        import jax.numpy as jnp
-
         rho_jax = jnp.asarray(
             rho_opt if gradient_validation_rho is None else gradient_validation_rho,
         )
-        gv = plot_gradient_validation(
-            pipeline_fn,
-            rho_jax,
-            n_directions=gradient_validation_directions,
-            step_sizes=gradient_validation_steps,
-            output_dir=out,
-        )
-        paths.append(gv)
+        # Post-hoc diagnostic on a finished multi-minute optimization: a
+        # failure here (e.g. a fully railed design with no feasible FD step)
+        # must cost this one figure, not every figure of the run.
+        try:
+            gv = plot_gradient_validation(
+                pipeline_fn,
+                rho_jax,
+                n_directions=gradient_validation_directions,
+                step_sizes=gradient_validation_steps,
+                output_dir=out,
+            )
+        except Exception as exc:
+            print(f"WARNING: gradient validation figure skipped ({exc})", flush=True)
+        else:
+            paths.append(gv)
 
     if mode_field is not None:
         paths.append(plot_mode_field(mode_field, output_dir=out))

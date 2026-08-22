@@ -594,3 +594,64 @@ def test_design_variables_live_on_the_silicon_nodes_only(tmp_path: Path) -> None
     np.testing.assert_allclose(
         full[inputs.design_nodes.indices], np.asarray(inputs.theta_init)
     )
+
+
+def test_container_overlay_geometry_follows_the_gyptis_frame() -> None:
+    """Container figures draw the overlay in the gyptis mesh's own frame.
+
+    The gyptis author centres its layer stack on y = 0 with a 0.35 um
+    substrate; RibWaveguideGeometry describes the local author's frame (y from
+    0, 0.5 um substrate), so drawing it over container node coordinates put
+    the rib outline off the device (ticket 16). The overlay must instead be
+    derived from the design-cell vertices and node coordinates.
+    """
+    from prismo.main import PipelineInputs, _container_overlay_geometry
+    from prismo.waveguide_mesh import RibWaveguideGeometry
+
+    # gyptis-like frame: 500 nm x 220 nm rib sitting on the slab top at
+    # y = -0.06, domain (incl. PML) spanning x in [-1.5, 1.5].
+    vertices = np.asarray(
+        [
+            [[-0.25, -0.06], [0.25, -0.06], [0.25, 0.16]],
+            [[-0.25, -0.06], [0.25, 0.16], [-0.25, 0.16]],
+        ]
+    )
+    coords = np.asarray([[-1.5, -0.51], [1.5, 0.51], [0.0, 0.0]])
+    inputs = PipelineInputs(
+        geometry=RibWaveguideGeometry(),
+        coords=coords,
+        n_nodes=coords.shape[0],
+        real_mesh=True,
+        actual_mesh=Path("unused.msh"),
+        mesh_ref=None,
+        H_dense=None,
+        H_sum=None,
+        theta_init=None,
+        design_transfer=None,
+        design_vertices=vertices,
+    )
+
+    overlay = _container_overlay_geometry(inputs)
+    assert overlay.rib_left == pytest.approx(-0.25)
+    assert overlay.rib_right == pytest.approx(0.25)
+    assert overlay.slab_top == pytest.approx(-0.06)
+    assert overlay.rib_top == pytest.approx(0.16)
+    # substrate/slab interface: slab_top minus the shared 100 nm slab.
+    assert overlay.substrate_thickness == pytest.approx(-0.16)
+    assert overlay.half_width == pytest.approx(1.5)
+
+    # Without vertices there is nothing to derive from: keep the local frame.
+    inputs_no_vertices = PipelineInputs(
+        geometry=inputs.geometry,
+        coords=coords,
+        n_nodes=coords.shape[0],
+        real_mesh=True,
+        actual_mesh=Path("unused.msh"),
+        mesh_ref=None,
+        H_dense=None,
+        H_sum=None,
+        theta_init=None,
+        design_transfer=None,
+        design_vertices=None,
+    )
+    assert _container_overlay_geometry(inputs_no_vertices) is inputs.geometry

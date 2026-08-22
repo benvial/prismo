@@ -226,6 +226,25 @@ class TestGradientValidationPlot:
             np.all(values >= -1.0) and np.all(values <= 1.0) for values in received
         )
 
+    def test_projects_directions_off_railed_nodes(self):
+        import jax.numpy as jnp
+
+        # An optimized design rails nodes at the ±1 bounds, so a dense random
+        # direction leaves the central stencil no feasible step at all. The
+        # validation must fall back to the interior subspace (the unpinned
+        # node here) rather than raising after a finished optimization.
+        theta = jnp.asarray([-1.0, 0.2])
+        direction = jnp.asarray([np.sqrt(0.5), np.sqrt(0.5)])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = plot_gradient_validation(
+                lambda theta: jnp.sum(theta**2),
+                theta,
+                directions=[direction],
+                step_sizes=np.asarray([1e-3, 1e-2]),
+                output_dir=tmp,
+            )
+            assert Path(path).exists()
+
     def test_rejects_gradient_validation_without_feasible_steps(self):
         import jax.numpy as jnp
 

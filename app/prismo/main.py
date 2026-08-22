@@ -194,9 +194,12 @@ class PipelineInputs:
     design_transfer: Any | None
     design_nodes: Any | None = None
     design_vertices: np.ndarray | None = None
+    silicon_triangles: np.ndarray | None = None
 
 
-def _silicon_design_nodes(actual_mesh: Path, n_nodes: int, real_mesh: bool) -> Any:
+def _silicon_design_nodes(
+    actual_mesh: Path, n_nodes: int, real_mesh: bool
+) -> tuple[Any, np.ndarray | None]:
     """The design set: the shared mesh's silicon nodes, else every node.
 
     Reads the ``slab`` + ``rib_silicon`` triangles -- the same pair
@@ -204,12 +207,16 @@ def _silicon_design_nodes(actual_mesh: Path, n_nodes: int, real_mesh: bool) -> A
     fallback grid has no physical groups at all, and a mesh whose silicon
     groups cannot be read would silently shrink the design to nothing, so both
     fall back to one variable per node rather than guessing.
+
+    Returns ``(design_nodes, silicon_triangles)``; the triangulation (``None``
+    when unavailable) is what the doping figures draw the field on, so they
+    paint the device's own elements rather than a Delaunay fill of the domain.
     """
     from prismo.pipeline import DesignNodes
     from prismo.waveguide_mesh import read_mesh_silicon_triangulation
 
     if not real_mesh:
-        return DesignNodes.all_nodes(n_nodes)
+        return DesignNodes.all_nodes(n_nodes), None
 
     triangles = read_mesh_silicon_triangulation(actual_mesh)
     if triangles.size == 0:
@@ -217,10 +224,10 @@ def _silicon_design_nodes(actual_mesh: Path, n_nodes: int, real_mesh: bool) -> A
             "      WARNING: no silicon physical groups in the mesh; "
             "keeping one design variable per node."
         )
-        return DesignNodes.all_nodes(n_nodes)
+        return DesignNodes.all_nodes(n_nodes), None
 
     indices = np.unique(triangles.ravel()).astype(np.intp)
-    return DesignNodes(indices=indices, n_mesh_nodes=n_nodes)
+    return DesignNodes(indices=indices, n_mesh_nodes=n_nodes), triangles
 
 
 def _local_geometry(geometry_cls: Any, mesh_size: float | None) -> Any:
@@ -327,7 +334,9 @@ def build_pipeline_inputs(
     # or -- within r_min of silicon -- dopes the device from outside it. Both
     # are parameterizations with no physical referent, so the design set is the
     # silicon nodes and the dense filter shrinks with it.
-    design_nodes = _silicon_design_nodes(actual_mesh, n_nodes, real_mesh)
+    design_nodes, silicon_triangles = _silicon_design_nodes(
+        actual_mesh, n_nodes, real_mesh
+    )
     design_coords = coords[design_nodes.indices]
     typer.echo(
         f"      {len(design_nodes)} design variables on silicon nodes "
@@ -378,6 +387,41 @@ def build_pipeline_inputs(
         design_transfer=design_transfer,
         design_nodes=design_nodes,
         design_vertices=design_vertices,
+        silicon_triangles=silicon_triangles,
+    )
+
+
+def _container_overlay_geometry(inputs: PipelineInputs) -> Any:
+    """The figure overlay frame for a container run, from the gyptis mesh itself.
+
+    ``RibWaveguideGeometry`` describes the local mesh author's frame: y from 0
+    at the substrate bottom, 0.5 µm substrate. The gyptis author centres its
+    layer stack on y = 0 with a 0.35 µm substrate, so drawing the local frame
+    over container figures put the rib outline and shading off the device
+    (ticket 16). Derive the rib rectangle from the design-cell vertices (the
+    rib-interior triangles of the shared mesh), the domain half-width from the
+    node coordinates, and the slab/contact dimensions from the values both mesh
+    authors share. Falls back to the local geometry when the vertices are
+    unavailable.
+    """
+    from prismo.outputs import OverlayGeometry
+
+    if inputs.design_vertices is None or inputs.design_vertices.size == 0:
+        return inputs.geometry
+    verts = inputs.design_vertices.reshape(-1, 2)
+    local = inputs.geometry
+    slab_top = float(verts[:, 1].min())
+    return OverlayGeometry(
+        rib_left=float(verts[:, 0].min()),
+        rib_right=float(verts[:, 0].max()),
+        slab_top=slab_top,
+        rib_top=float(verts[:, 1].max()),
+        # Slab thickness and contact footprint are the same in both authors;
+        # only the vertical origin and substrate thickness differ.
+        substrate_top=slab_top - local.slab_thickness,
+        half_width=float(np.abs(inputs.coords[:, 0]).max()),
+        contact_offset=local.contact_offset,
+        contact_width=local.contact_width,
     )
 
 
@@ -457,7 +501,12 @@ def _run_pipeline(
     inputs = build_pipeline_inputs(
         r_min, mesh_path, use_containers, components, mesh_size=mesh_size
     )
-    geometry = inputs.geometry
+    # Container figures draw the gyptis frame, not the local author's
+    # (ticket 16): the two meshes differ in vertical origin and substrate
+    # thickness, and the overlay must describe the mesh the nodes came from.
+    geometry = (
+        _container_overlay_geometry(inputs) if use_containers else inputs.geometry
+    )
     coords = inputs.coords
     mesh_ref = inputs.mesh_ref
     H_dense = inputs.H_dense
@@ -472,17 +521,25 @@ def _run_pipeline(
         optimization_ftol_rel = ftol_rel
         on_iteration = None
         if use_containers:
+            H_np = np.asarray(H_dense)
+            H_sum_np = np.asarray(H_sum)
 
             def on_iteration(iteration: int, theta: np.ndarray) -> None:
-
+                # Snapshot the doping the solvers actually see: the optimizer
+                # hands back the raw design vector, but the physics runs on the
+                # density-filtered field, so filter before mapping to doping.
+                theta_tilde = H_np @ theta / H_sum_np
                 name = f"doping_field_{iteration}"
                 plot_live_doping_field(
-                    np.asarray(doping_from_theta(design_nodes.scatter_numpy(theta))),
+                    np.asarray(
+                        doping_from_theta(design_nodes.scatter_numpy(theta_tilde))
+                    ),
                     coords,
                     iteration,
                     geometry=geometry,
                     output_dir=output_dir,
                     name=name,
+                    triangles=inputs.silicon_triangles,
                 )
 
         rho_opt, history = optimize_doping(
@@ -578,6 +635,10 @@ def _run_pipeline(
         gradient_validation_rho=rho_initial if use_containers else rho_opt,
         mode_field=mode_field,
         output_dir=output_dir,
+        # The silicon triangulation: the doping figure paints the device's own
+        # mesh elements, leaving the oxide blank instead of Delaunay-smearing
+        # the design field across it.
+        mesh_triangles=inputs.silicon_triangles,
     )
     for p in plot_paths:
         typer.echo(f"      {p}")
