@@ -557,3 +557,44 @@ def test_a_first_non_guided_solve_records_nothing() -> None:
         tracked, geometry, {"lam": _lam_for(0.4), "guided": False}
     )
     assert geometry not in tracked
+
+
+# ---------------------------------------------------------------------------
+# Shift-invert factorisation (ticket 23)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _gyptis_available(), reason="requires the PETSc/SLEPc backend")
+def test_shift_invert_uses_a_pivoting_factorisation_at_the_stated_tolerance() -> None:
+    """The eigensolve must not fall back to PETSc's native non-pivoting LU.
+
+    On the indefinite waveguide system that LU is accurate to ~1e-5, which
+    made lambda a non-smooth function of the design and put a 2e-3 relative
+    noise floor under Delta_neff (ticket 23). The configured pivoting solver
+    and the tolerance are what keep the eigenvalue smooth; pin both on a tiny
+    diagonal problem whose eigenvalues are known exactly.
+    """
+    from petsc4py import PETSc
+
+    n = 12
+    A = PETSc.Mat().createAIJ([n, n], nnz=1)
+    B = PETSc.Mat().createAIJ([n, n], nnz=1)
+    for i in range(n):
+        A.setValue(i, i, float(i + 1))
+        B.setValue(i, i, 1.0)
+    A.assemble()
+    B.assemble()
+
+    shift = 6.4
+    solver, nconv = _api._attempt_two_sided_solve(A, B, shift, 4)
+    assert nconv >= 1
+
+    pc = solver.getST().getKSP().getPC()
+    assert pc.getFactorSolverType() == _api._SHIFT_INVERT_FACTOR_SOLVER
+    assert pc.getFactorSolverType() != "petsc"
+    assert solver.getTolerances()[0] == pytest.approx(_api._EIGENSOLVER_TOLERANCE)
+
+    nearest = min(
+        (solver.getEigenvalue(i) for i in range(nconv)), key=lambda lam: abs(lam - shift)
+    )
+    assert nearest.real == pytest.approx(6.0, abs=1e-10)

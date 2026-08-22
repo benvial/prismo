@@ -555,3 +555,31 @@ class TestObjectiveLineScan:
         assert kept.min() == offsets.min()
         assert kept.max() == pytest.approx(1e-3)
         assert np.all(np.abs(np.asarray(rho)[None, :] + kept[:, None] * np.asarray(d)) <= 1.0)
+
+    def test_probe_direction_returns_the_gradient_it_used(self):
+        import jax.numpy as jnp
+        from prismo.outputs import probe_direction, scan_objective_line
+
+        rho = jnp.asarray([0.2, -0.1, 0.0, 0.999])
+        a = jnp.asarray([1.0, 2.0, 3.0, 4.0])
+        calls: list[int] = []
+
+        def f(x):
+            calls.append(1)
+            return jnp.dot(a, x)
+
+        d, grad = probe_direction(f, rho, "gradient")
+        assert grad is not None
+        # Projected off the rail-pinned last variable and unit length.
+        assert float(d[3]) == 0.0
+        assert float(jnp.linalg.norm(d)) == pytest.approx(1.0)
+        n_calls_after_direction = len(calls)
+        scan = scan_objective_line(f, rho, d, self._offsets(n=5), gradient=grad)
+        # Only the 5 samples ran: no second adjoint.
+        assert len(calls) == n_calls_after_direction + 5
+        assert scan.adjoint_slope == pytest.approx(float(jnp.dot(a, d)))
+        d_random, grad_random = probe_direction(f, rho, "random")
+        assert grad_random is None
+        assert float(jnp.linalg.norm(d_random)) == pytest.approx(1.0)
+        with pytest.raises(ValueError, match="gradient"):
+            probe_direction(f, rho, "sideways")

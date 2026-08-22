@@ -886,13 +886,57 @@ def feasible_offsets(
     return offsets[(offsets >= t_min) & (offsets <= t_max)]
 
 
-def _render_objective_line_scan(scan_values: np.ndarray, offsets: np.ndarray,
-                                fit: np.ndarray, residuals: np.ndarray,
-                                out: Path, name: str) -> Path:
+def probe_direction(
+    pipeline_fn: Callable[..., jax.Array],
+    rho: jax.Array,
+    kind: str,
+    before_evaluation: Callable[[], None] | None = None,
+) -> tuple[jax.Array, jax.Array | None]:
+    """Unit direction for a line scan through ``rho``, plus the gradient used.
+
+    ``"gradient"`` is the normalized adjoint gradient at ``rho`` (the direction
+    the optimizer would step); ``"random"`` is the first seeded unit vector
+    :func:`validate_gradient` also samples. Either way the direction is
+    projected off rail-pinned variables so the scan can move both ways inside
+    the ``[-1, 1]`` box. Returns ``(direction, gradient)`` -- the gradient is
+    ``None`` for a random direction -- so :func:`scan_objective_line` can take
+    its adjoint slope from the same adjoint solve instead of running a second
+    one. Raises ``ValueError`` for an unknown ``kind`` and ``RuntimeError`` when
+    there is nothing to scan (zero gradient, or every weighted variable pinned).
+    """
+    rho = jnp.asarray(rho)
+    gradient = None
+    if kind == "gradient":
+        if before_evaluation is not None:
+            before_evaluation()
+        gradient = jax.grad(pipeline_fn)(rho)
+        d = gradient
+        if float(jnp.linalg.norm(d)) == 0.0:
+            raise RuntimeError(
+                "the gradient is identically zero at the centre design; scan a "
+                "random direction instead (--direction random)"
+            )
+    elif kind == "random":
+        d = _sample_directions(rho, None, 1)[0]
+    else:
+        raise ValueError("direction must be 'gradient' or 'random'")
+    interior = _interior_direction(rho, d / jnp.linalg.norm(d))
+    if interior is None:
+        raise RuntimeError("every variable with direction weight is rail-pinned")
+    return interior, gradient
+
+
+def _render_objective_line_scan(
+    values: np.ndarray,
+    offsets: np.ndarray,
+    fit: np.ndarray,
+    residuals: np.ndarray,
+    out: Path,
+) -> Path:
     fig, (ax_f, ax_r) = plt.subplots(
         2, 1, figsize=(6, 6), sharex=True, height_ratios=[2, 1]
     )
-    ax_f.plot(offsets, scan_values, "o", markersize=4, label="f(θ₀ + t·d)")
+    ax_f.plot(offsets, values, "o", markersize=4, label="f(θ₀ + t·d)")
     ax_f.plot(offsets, np.polyval(fit, offsets), "-", alpha=0.7, label="quadratic fit")
     ax_f.set_ylabel(r"$\Delta n_{\rm eff}$")
     ax_f.set_title("Objective line scan")
@@ -904,7 +948,7 @@ def _render_objective_line_scan(scan_values: np.ndarray, offsets: np.ndarray,
     ax_r.set_ylabel("residual")
     ax_r.grid(True, alpha=0.3)
     fig.tight_layout()
-    path = out / f"{name}.pdf"
+    path = out / "objective_line_scan.pdf"
     fig.savefig(path)
     plt.close(fig)
     return path
@@ -917,7 +961,7 @@ def scan_objective_line(
     offsets: np.ndarray,
     output_dir: str | Path | None = None,
     before_evaluation: Callable[[], None] | None = None,
-    name: str = "objective_line_scan",
+    gradient: jax.Array | None = None,
 ) -> ObjectiveLineScan:
     """Sample ``pipeline_fn`` along ``direction`` and fit a quadratic (ticket 23).
 
@@ -927,10 +971,12 @@ def scan_objective_line(
         direction: Unit direction ``d``.
         offsets: Signed steps ``t``; every ``rho + t*d`` is evaluated as given
             (filter with :func:`feasible_offsets` first to respect the box).
-        output_dir: When given, write ``<name>.pdf`` and ``<name>.json`` there.
+        output_dir: When given, write ``objective_line_scan.pdf`` and
+            ``objective_line_scan.json`` there.
         before_evaluation: Hook run before the gradient and before every
             sample (ticket 20's cold-start reset).
-        name: Stem of the figure and JSON files.
+        gradient: The adjoint gradient at ``rho`` if the caller already has it
+            (e.g. from :func:`probe_direction`); computed here when ``None``.
 
     Returns:
         An :class:`ObjectiveLineScan`.
@@ -945,8 +991,10 @@ def scan_objective_line(
         if before_evaluation is not None:
             before_evaluation()
 
-    _prepare()
-    adjoint_slope = float(jnp.dot(jax.grad(pipeline_fn)(rho), direction))
+    if gradient is None:
+        _prepare()
+        gradient = jax.grad(pipeline_fn)(rho)
+    adjoint_slope = float(jnp.dot(jnp.asarray(gradient), direction))
 
     values = np.empty(offsets.shape, dtype=float)
     for i, t in enumerate(offsets):
@@ -964,10 +1012,8 @@ def scan_objective_line(
     figure_path = json_path = None
     if output_dir is not None:
         out = _ensure_output_dir(output_dir)
-        figure_path = _render_objective_line_scan(
-            values, offsets, fit, residuals, out, name
-        )
-        json_path = out / f"{name}.json"
+        figure_path = _render_objective_line_scan(values, offsets, fit, residuals, out)
+        json_path = out / "objective_line_scan.json"
         json_path.write_text(
             json.dumps(
                 {

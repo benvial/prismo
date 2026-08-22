@@ -1129,3 +1129,72 @@ def test_objective_probe_zero_gradient_points_at_random_direction(
             components=stub_components(),
             cold=False,
         )
+
+
+def test_container_run_survives_a_failing_cold_resolve(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A design that solves only warm loses its cold number, not the run.
+
+    After the reset the ChargeTransport double raises (a cold ramp that does
+    not converge); the run prints a warning, reports the warm value, and still
+    generates the figures (ticket 23).
+    """
+    from dataclasses import replace
+
+    import prismo.main as main_module
+    import prismo.optimizer as optimizer_module
+    import prismo.outputs as outputs_module
+    import prismo.waveguide_mesh as mesh_module
+
+    coords = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+    output_captured: dict[str, object] = {}
+    calls: list[str] = []
+    history = [
+        {"iteration": 1, "delta_n_eff": 1e-3, "delta_rho": 0.0, "grad_norm": 1e-4,
+         "wall_time": 0.1},
+    ]
+    base = _container_components([[0.5, 0.0], [1.5, 0.0]])
+    components = _solve_components_with_reset(base, calls)
+
+    def cold_fails(doping, bias, mesh_ref=None):
+        if "reset" in calls:
+            raise RuntimeError("biased solve at -5.0 V failed: ConvergenceError")
+        return doping, doping
+
+    components = replace(components, chargetransport=cold_fails)
+
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        optimizer_module,
+        "optimize_doping",
+        lambda **kwargs: (np.asarray([0.2, 0.3, 0.4]), history),
+    )
+    monkeypatch.setattr(
+        outputs_module,
+        "generate_outputs",
+        lambda **kwargs: (output_captured.update(kwargs) or []),
+    )
+    _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
+
+    main_module._run_pipeline(
+        r_min=50e-9,
+        max_iter=5,
+        ftol_rel=1e-5,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        no_jit=True,
+        use_containers=True,
+        components=components,
+    )
+
+    assert calls == ["reset"]
+    assert output_captured["cold_reevaluation"] is None
+    out = capsys.readouterr().out
+    assert "WARNING: cold re-solve of the reported design FAILED" in out
+    assert "Best Delta_n_eff (warm) = +1.000000e-03" in out

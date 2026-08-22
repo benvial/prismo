@@ -545,7 +545,10 @@ def _cold_reevaluation(
     The headline Δneff must be a property of the design, not of the solve
     history that produced it (ticket 20): the ChargeTransport worker's warm
     state is dropped, the best design evaluated once more, and both numbers
-    reported. Returns ``None`` (with a note) when no reset seam is bound.
+    reported. Returns ``None`` (with a note) when no reset seam is bound, and
+    ``None`` with a warning when the cold solve itself fails: a design that
+    only solves from a warm start is a finding worth the headline figures, not
+    a crash after a finished optimization (ticket 23).
     """
     from prismo.outputs import ColdReevaluation
 
@@ -554,7 +557,16 @@ def _cold_reevaluation(
             "      Cold re-evaluation skipped: no ChargeTransport reset seam bound."
         )
         return None
-    cold_value = float(bound_pipeline(np.asarray(rho_opt, dtype=float)))
+    try:
+        cold_value = float(bound_pipeline(np.asarray(rho_opt, dtype=float)))
+    except Exception as exc:
+        typer.echo(
+            "      WARNING: cold re-solve of the reported design FAILED "
+            f"({type(exc).__name__}); the warm value is reported, but this "
+            "design solved only from a warm start -- its objective is "
+            "path-dependent until the cold solve succeeds."
+        )
+        return None
     result = ColdReevaluation(
         warm_delta_neff=float(warm_delta_neff), cold_delta_neff=cold_value
     )
@@ -675,6 +687,18 @@ def _run_pipeline(
         components=components,
     )
 
+    # The mode figure is a post-hoc query, so a backend that cannot answer it --
+    # an image predating the ``mode_field`` operation, say -- must cost one
+    # figure, not every figure of a finished multi-minute optimization. It runs
+    # before the cold re-evaluation so it sees the worker still warm at the
+    # reported design: a design that solves only warm would otherwise lose its
+    # mode figure to the reset (ticket 23).
+    try:
+        mode_field = _optimized_mode_field(inputs, rho_opt, components)
+    except Exception as exc:
+        typer.echo(f"      WARNING: mode figure skipped ({exc})")
+        mode_field = None
+
     cold = None
     if history:
         # The reported design is the best one whose physics solved; its warm
@@ -717,14 +741,6 @@ def _run_pipeline(
     # which is what oxide means anyway.
     plot_initial = design_nodes.scatter_numpy(rho_initial)
     plot_opt = design_nodes.scatter_numpy(rho_opt)
-    # The mode figure is a post-hoc query, so a backend that cannot answer it --
-    # an image predating the ``mode_field`` operation, say -- must cost one
-    # figure, not every figure of a finished multi-minute optimization.
-    try:
-        mode_field = _optimized_mode_field(inputs, rho_opt, components)
-    except Exception as exc:
-        typer.echo(f"      WARNING: mode figure skipped ({exc})")
-        mode_field = None
     plot_paths = generate_outputs(
         rho_initial=plot_initial,
         rho_opt=plot_opt,
@@ -932,15 +948,9 @@ def _run_objective_probe(
     cold: bool = False,
 ) -> ObjectiveLineScan:
     """Line-scan the bound pipeline around a design (ticket 23)."""
-    import jax
     import jax.numpy as jnp
 
-    from prismo.outputs import (
-        _interior_direction,
-        _sample_directions,
-        feasible_offsets,
-        scan_objective_line,
-    )
+    from prismo.outputs import feasible_offsets, probe_direction, scan_objective_line
     from prismo.pipeline import pipeline as pipeline_fn
 
     if spacing <= 0.0:
@@ -983,24 +993,7 @@ def _run_objective_probe(
     )
 
     typer.echo(f"[2/2] Scanning along the {direction} direction...")
-    if direction == "gradient":
-        if before_evaluation is not None:
-            before_evaluation()
-        d = jax.grad(bound_pipeline)(rho)
-        if float(jnp.linalg.norm(d)) == 0.0:
-            raise RuntimeError(
-                "the gradient is identically zero at the centre design; scan a "
-                "random direction instead (--direction random)"
-            )
-    else:
-        d = _sample_directions(rho, None, 1)[0]
-    d = d / jnp.linalg.norm(d)
-    # An optimized design rails many variables at ±1; the scan must stay in the
-    # box on both sides, so probe the interior subspace of the direction.
-    interior = _interior_direction(rho, d)
-    if interior is None:
-        raise RuntimeError("every variable with direction weight is rail-pinned")
-    d = interior
+    d, gradient = probe_direction(bound_pipeline, rho, direction, before_evaluation)
 
     half = n_points // 2
     offsets = spacing * np.arange(-half, n_points - half, dtype=float)
@@ -1017,10 +1010,13 @@ def _run_objective_probe(
         kept,
         output_dir=output_dir,
         before_evaluation=before_evaluation,
+        gradient=gradient,
     )
 
-    for t, f_val, r in zip(scan.offsets, scan.values, scan.residuals, strict=True):
-        typer.echo(f"      t={t:+.3e}  f={f_val:+.9e}  residual={r:+.3e}")
+    for offset, value, residual in zip(
+        scan.offsets, scan.values, scan.residuals, strict=True
+    ):
+        typer.echo(f"      t={offset:+.3e}  f={value:+.9e}  residual={residual:+.3e}")
     typer.echo(
         f"      Quadratic-fit residual: rms {scan.rms_rel_residual:.2e}, "
         f"max {scan.max_rel_residual:.2e} (relative to |f(θ₀)|)"
