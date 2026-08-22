@@ -365,6 +365,23 @@ def read_mesh_node_coordinates(mesh_path: str | Path) -> np.ndarray:
         if len(node_tags) == 0:
             return np.empty((0, 2))
 
+        # The whole pipeline addresses nodal fields by position in this array
+        # while ChargeTransport addresses them by ExtendableGrids' 1..N
+        # renumbering of the gmsh node tags (``invperm(node_tags)``,
+        # docs/research/chargetransport-gmsh-mesh.md). The two coincide exactly
+        # when the tags are 1..N in order -- which both mesh authors produce --
+        # so assert it here with a clear message rather than letting a
+        # renumbered mesh silently scramble the doping the Julia solver reads.
+        tags = np.asarray(node_tags, dtype=np.int64)
+        if not np.array_equal(tags, np.arange(1, tags.size + 1)):
+            raise ValueError(
+                f"{mesh_path} has non-contiguous or reordered gmsh node tags; "
+                "the pipeline's positional node order (MeshRef "
+                "node_ordering='gmsh') only matches ChargeTransport's "
+                "ExtendableGrids renumbering when getNodes returns tags 1..N "
+                "in order"
+            )
+
         n_nodes = len(node_tags)
         coords_3d = np.array(node_coords, dtype=float).reshape(n_nodes, 3)
         return np.ascontiguousarray(coords_3d[:, :2])
