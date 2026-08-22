@@ -41,6 +41,62 @@ const PRISMO_DOPING_TO_CT = -1.0e6
 # coefficients expect.
 const CT_DENSITY_TO_CM3 = 1.0e-6
 
+# Shockley-Read-Hall parameters (ticket 17): mid-gap traps, 100 ns lifetime for
+# both carriers, trap density of order n_i. Applied per region in
+# ``build_ct_system``, which also records why SRH is on.
+const CT_SRH_LIFETIME_S = 1.0e-7
+const CT_SRH_TRAP_DENSITY_M3 = 1.0e16
+
+# Wall-clock budget for one worker request (ticket 18). The continuation loops
+# below (doping magnitude, bias ramp, doping homotopy) are each bounded in
+# retries, but a hard design can still chain hundreds of Newton solves, and the
+# Python side used to kill the whole Julia process on its own 25 s timeout --
+# dropping every warm solution and paying a cold sysimage start plus a cold
+# equilibrium continuation on the next request. The budget lives here instead:
+# every loop checks it and the solve returns a descriptive error, so a hard
+# design costs the optimizer one evaluation and the worker survives. The Python
+# request timeout (``PRISMO_CT_JULIA_TIMEOUT_S`` in tesseract_api.py) is only a
+# backstop for a truly hung process and must stay well above this.
+const CT_SOLVE_BUDGET_S = parse(Float64, get(ENV, "PRISMO_CT_SOLVE_BUDGET_S", "120"))
+
+struct SolveBudgetExceeded <: Exception
+    elapsed::Float64
+    budget::Float64
+    stage::String
+end
+
+function Base.showerror(io::IO, e::SolveBudgetExceeded)
+    print(
+        io,
+        "SolveBudgetExceeded: $(e.stage) exceeded the $(e.budget) s wall-clock " *
+        "solve budget (PRISMO_CT_SOLVE_BUDGET_S) after $(round(e.elapsed; digits = 1)) s",
+    )
+end
+
+const _solve_deadline = Ref(Inf)
+const _solve_started = Ref(0.0)
+
+"""Start the wall-clock budget for the request being served."""
+function start_solve_budget!(budget_s = CT_SOLVE_BUDGET_S)
+    _solve_started[] = time()
+    _solve_deadline[] = _solve_started[] + budget_s
+    return nothing
+end
+
+"""Throw ``SolveBudgetExceeded`` once the request has used up its budget."""
+function check_solve_budget(stage::String)
+    now = time()
+    if now > _solve_deadline[]
+        throw(SolveBudgetExceeded(now - _solve_started[], _solve_deadline[] - _solve_started[], stage))
+    end
+    return nothing
+end
+
+# The continuation loops retry on these and only these: Newton exceeded its
+# iteration budget, or assembled a NaN from a Boltzmann overflow during an
+# overshoot. Anything else (a budget exhaustion included) propagates.
+recoverable_solve_error(e) = e isa VoronoiFVM.ConvergenceError || e isa VoronoiFVM.AssemblyError
+
 # ExtendableSparse is a transitive dep (via VoronoiFVM), not in Project.toml,
 # so it can only be reached through qualified access.
 const ExtendableSparse = VoronoiFVM.ExtendableSparse
@@ -247,16 +303,27 @@ function build_ct_system(doping, mesh_path)
     data = Data(grid, 2)
     data.modelType = Stationary
 
-    # Auger, radiative and Shockley-Read-Hall all stay off: at depletion-modulator
-    # bias the carrier profile is set by the electrostatics and the contacts, not
-    # by recombination. Switching SRH on was measured to leave the whole 0 -> -5 V
-    # ramp unchanged to five digits, while nudging a few design nodes off pure
-    # depletion (ticket 14).
+    # Shockley-Read-Hall recombination is ON; Auger and radiative stay off.
+    #
+    # Not for the seeded junction: there the reverse-bias carrier profile is set
+    # by the electrostatics and the contacts, and SRH was measured to leave the
+    # whole 0 -> -5 V ramp unchanged to five digits (ticket 14). It is on because
+    # the free-form designs the optimizer proposes after ~10 MMA iterations
+    # (rail-level doping, a dozen junction sign-flips, floating p-pockets inside
+    # the rib) make the generation-free drift-diffusion steady state NON-UNIQUE:
+    # the same doping at the same -5 V solved to depletion on a cold ramp and to
+    # injection (max |dpsi| = 5.4 V) on a warm start from the neighbouring
+    # design, and the composed objective read two different values for one
+    # theta. Thermal generation through mid-gap traps pins the minority
+    # quasi-Fermi level in depleted and floating regions, which removes the
+    # spurious branch: the failing design then solves on the first default ramp
+    # and a warm start that used to land on the wrong branch fails Newton and
+    # falls through to the ramp instead (ticket 17, diagnosis 2026-08-22).
     data.bulkRecombination = set_bulk_recombination(
         iphin = 1, iphip = 2,
         bulk_recomb_Auger = false,
         bulk_recomb_radiative = false,
-        bulk_recomb_SRH = false,
+        bulk_recomb_SRH = true,
     )
 
     n_bregions = grid[NumBFaceRegions]
@@ -293,6 +360,15 @@ function build_ct_system(doping, mesh_path)
         params.bandEdgeEnergy[2, ireg] = 0.0
         params.mobility[1, ireg] = mu_n
         params.mobility[2, ireg] = mu_p
+        # SRH through mid-gap traps: tau_n = tau_p = 100 ns (a clean silicon
+        # lifetime), trap density ~ n_i (1e10 cm^-3 = 1e16 m^-3) so the
+        # recombination rate R = (np - n_i^2) / (tau_p (n + n_t) + tau_n (p + p_t))
+        # saturates at the textbook mid-gap form. Same in every silicon region;
+        # see the bulkRecombination note above for why it is on at all.
+        for icc in 1:2
+            params.recombinationSRHLifetime[icc, ireg] = CT_SRH_LIFETIME_S
+            params.recombinationSRHTrapDensity[icc, ireg] = CT_SRH_TRAP_DENSITY_M3
+        end
     end
 
     data.params = params
@@ -416,6 +492,7 @@ function solve_equilibrium(ctsys, data, doping, control)
     t = t0
     failures = 0
     while t < 0.0
+        check_solve_budget("equilibrium doping continuation")
         t_next = min(t + step, 0.0)
         set_doping!(data, doping .* 10.0^t_next)
         try
@@ -423,7 +500,7 @@ function solve_equilibrium(ctsys, data, doping, control)
             t = t_next
             step = min(step * 1.5, 1.0)
         catch e
-            if (e isa VoronoiFVM.ConvergenceError || e isa VoronoiFVM.AssemblyError) &&
+            if recoverable_solve_error(e) &&
                failures < CT_DOPING_MAX_FAILURES && step / 2 >= CT_DOPING_STEP_MIN
                 failures += 1
                 step /= 2
@@ -446,12 +523,13 @@ function solve_equilibrium_with_warm_start(ctsys, data, doping, control, warm_st
 
     set_doping!(data, doping)
     configure_equilibrium!(ctsys, data)
+    check_solve_budget("equilibrium warm start")
     try
         sol = VoronoiFVM.solve(ctsys.fvmsys, inival = warm_start, control = control)
         store_equilibrium_contact_data!(ctsys, data, sol)
         return sol
     catch e
-        if e isa VoronoiFVM.ConvergenceError || e isa VoronoiFVM.AssemblyError
+        if recoverable_solve_error(e)
             return solve_equilibrium(ctsys, data, doping, control)
         end
         rethrow()
@@ -503,6 +581,7 @@ function solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregion
     v_applied = 0.0
     sol = u0
     while v_applied != bias_voltage
+        check_solve_budget("bias ramp")
         v_next = v_applied +
                  sign(bias_voltage) * min(step, abs(bias_voltage - v_applied))
         set_contact!(ctsys, cathode_breg, Δu = v_next)
@@ -514,7 +593,7 @@ function solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregion
             # ConvergenceError: Newton exceeded maxiters.
             # AssemblyError: NaN in flux assembly (Boltzmann overflow during
             # a Newton overshoot). Both are retried with a smaller step.
-            if (e isa VoronoiFVM.ConvergenceError || e isa VoronoiFVM.AssemblyError) &&
+            if recoverable_solve_error(e) &&
                failures < CT_BIAS_MAX_FAILURES && step / 2 >= CT_BIAS_STEP_MIN
                 failures += 1
                 step /= 2
@@ -527,8 +606,66 @@ function solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregion
     return sol
 end
 
-# Reuse a nearby bias-state Newton iterate when it converges immediately. This
-# never weakens the continuation fallback used by ``solve_at_bias``.
+# Doping homotopy at fixed bias (ticket 18): continue from the last converged
+# biased state at ``warm_doping`` to the requested ``doping`` along
+# ``d(t) = warm_doping + t (doping - warm_doping)``, warm-starting each step.
+# This is the natural continuation for an optimizer that moves the design a
+# little per iteration: the bias stays where the warm solution already is, and
+# only the doping moves. The cold bias ramp from equilibrium stays the recovery
+# behind it.
+#
+# The system's equilibrium contact data (``bψEQ``, ``bDensityEQ``) belongs to
+# ``doping``, so the intermediate states are warm starts, not physical
+# solutions; the final step solves the requested system exactly.
+const CT_HOMOTOPY_STEP_MIN = 1e-3
+const CT_HOMOTOPY_MAX_FAILURES = 100
+
+function solve_at_bias_by_doping_homotopy(
+    ctsys, data, control, warm_sol, warm_doping, doping, bias_voltage, cathode_breg,
+)
+    length(warm_doping) == length(doping) || error("homotopy doping length mismatch")
+    ctsys.fvmsys.physics.data.calculationType = ChargeTransport.OutOfEquilibrium
+    set_contact!(ctsys, cathode_breg, Δu = bias_voltage)
+    t = 0.0
+    step = 1.0
+    failures = 0
+    sol = warm_sol
+    try
+        while t < 1.0
+            check_solve_budget("doping homotopy")
+            t_next = min(t + step, 1.0)
+            set_doping!(data, warm_doping .+ t_next .* (doping .- warm_doping))
+            try
+                sol = solve(ctsys; inival = sol, control = control)
+                t = t_next
+                step = min(step * 1.5, 1.0)
+            catch e
+                if recoverable_solve_error(e) &&
+                   failures < CT_HOMOTOPY_MAX_FAILURES && step / 2 >= CT_HOMOTOPY_STEP_MIN
+                    failures += 1
+                    step /= 2
+                else
+                    rethrow()
+                end
+            end
+        end
+    finally
+        # Whatever happened, leave the system describing the requested doping.
+        set_doping!(data, doping)
+    end
+    return sol
+end
+
+# Biased solve with the fallback chain of ticket 18:
+#
+#   1. direct Newton from the nearby biased warm solution (``warm_start``);
+#   2. doping homotopy at fixed bias from that solution (needs ``warm_doping``,
+#      the silicon doping the warm solution was converged on);
+#   3. the cold bias ramp from the equilibrium solution ``u0``.
+#
+# Each stage is tried only when the previous one fails with a recoverable
+# Newton error; the ramp's own continuation never weakens. A budget exhaustion
+# propagates from whichever stage it hits.
 function solve_at_bias_with_warm_start(
     ctsys,
     control,
@@ -536,7 +673,10 @@ function solve_at_bias_with_warm_start(
     bias_voltage,
     cathode_breg,
     n_bregions,
-    warm_start,
+    warm_start;
+    data = nothing,
+    doping = nothing,
+    warm_doping = nothing,
 )
     if abs(bias_voltage) == 0.0 || cathode_breg > n_bregions
         return u0
@@ -546,14 +686,25 @@ function solve_at_bias_with_warm_start(
         ctsys, control, u0, bias_voltage, cathode_breg, n_bregions,
     )
 
+    check_solve_budget("biased warm start")
     set_contact!(ctsys, cathode_breg, Δu = bias_voltage)
     try
         return solve(ctsys; inival = warm_start, control = control)
     catch e
-        if e isa VoronoiFVM.ConvergenceError || e isa VoronoiFVM.AssemblyError
-            set_contact!(ctsys, cathode_breg, Δu = 0.0)
-            return solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregions)
-        end
-        rethrow()
+        recoverable_solve_error(e) || rethrow()
     end
+
+    if data !== nothing && doping !== nothing && warm_doping !== nothing
+        try
+            return solve_at_bias_by_doping_homotopy(
+                ctsys, data, control, warm_start, warm_doping, doping, bias_voltage,
+                cathode_breg,
+            )
+        catch e
+            recoverable_solve_error(e) || rethrow()
+        end
+    end
+
+    set_contact!(ctsys, cathode_breg, Δu = 0.0)
+    return solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregions)
 end

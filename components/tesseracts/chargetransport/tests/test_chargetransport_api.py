@@ -498,6 +498,127 @@ def test_vjp_propagates_julia_timeout(
 
 
 # ---------------------------------------------------------------------------
+# Worker survives hard designs (ticket 18)
+# ---------------------------------------------------------------------------
+
+
+class _FailsOnceThenSucceedsWorker:
+    """One worker whose first solve runs out of its Julia-side budget.
+
+    Mirrors the worker after ticket 18: a solve that exceeds the wall-clock
+    budget comes back as ``ok: false`` with a descriptive error -- the process
+    is *not* killed -- and the next request on the same worker is served.
+    """
+
+    generation = 424242
+
+    def __init__(self) -> None:
+        self.requests: list[dict[str, object]] = []
+        self.closed = False
+
+    def request(self, request: dict[str, object]) -> dict[str, object]:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            return {
+                "ok": False,
+                "error": "biased solve at -5.0 V failed: SolveBudgetExceeded: bias "
+                "ramp exceeded the 120.0 s wall-clock solve budget "
+                "(PRISMO_CT_SOLVE_BUDGET_S) after 120.3 s",
+            }
+        doping = np.load(str(request["doping_path"]))
+        if request["operation"] == "forward":
+            np.savez(str(request["output_path"]), electrons=doping, holes=doping)
+        else:
+            np.save(str(request["output_path"]), np.ones_like(doping))
+        return {"ok": True}
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_failed_request_leaves_worker_alive_for_the_next(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A budget failure costs one evaluation; the next request reuses the worker."""
+    worker = _FailsOnceThenSucceedsWorker()
+    _api._session_registry.clear()
+    monkeypatch.setattr(_api, "_julia_available", lambda: True)
+    monkeypatch.setattr(_api, "_get_julia_worker", lambda: worker)
+
+    hard = InputSchema(doping=np.full(N_NODES, 9.9e18), bias_voltage=-5.0)
+    with pytest.raises(RuntimeError, match="SolveBudgetExceeded"):
+        apply(hard)
+
+    previous = InputSchema(doping=np.full(N_NODES, 1e17), bias_voltage=-5.0)
+    outputs = apply(previous)
+
+    assert not worker.closed
+    assert [r["operation"] for r in worker.requests] == ["forward", "forward"]
+    np.testing.assert_allclose(np.asarray(outputs.electrons), 1e17)
+
+
+def test_request_timeout_is_a_backstop_above_the_julia_budget() -> None:
+    """The Python timeout only fires on a hung process, never on a slow solve."""
+    assert _api._JULIA_TIMEOUT_S >= 300.0
+
+
+class _RecordingWorker:
+    generation = 4242
+
+    @staticmethod
+    def is_alive() -> bool:
+        return True
+
+    def __init__(self) -> None:
+        self.requests: list[dict[str, object]] = []
+
+    def request(self, request: dict[str, object]) -> dict[str, object]:
+        self.requests.append(request)
+        if request["operation"] == "forward":
+            doping = np.load(str(request["doping_path"]))
+            np.savez(str(request["output_path"]), electrons=doping, holes=doping)
+        return {"ok": True}
+
+
+def test_reset_operation_drops_warm_state_and_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``reset`` reaches the worker and invalidates the retained forward."""
+    worker = _RecordingWorker()
+    _api._session_registry.clear()
+    monkeypatch.setattr(_api, "_julia_available", lambda: True)
+    monkeypatch.setattr(_api, "_get_julia_worker", lambda: worker)
+    monkeypatch.setattr(_api, "_julia_worker", worker)
+
+    inputs = InputSchema(doping=np.full(N_NODES, 1e17), bias_voltage=-5.0)
+    apply(inputs)
+    outputs = apply(InputSchema(operation="reset"))
+
+    assert [r["operation"] for r in worker.requests] == ["forward", "reset"]
+    assert np.asarray(outputs.electrons).shape == (0,)
+    with pytest.raises(RuntimeError, match="preceding apply"):
+        vector_jacobian_product(
+            inputs,
+            {"doping"},
+            {"electrons", "holes"},
+            {"electrons": np.ones(N_NODES), "holes": np.ones(N_NODES)},
+        )
+
+
+def test_reset_without_a_live_worker_is_a_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_api, "_julia_worker", None)
+    outputs = apply(InputSchema(operation="reset"))
+    assert np.asarray(outputs.holes).shape == (0,)
+
+
+def test_solve_without_doping_is_rejected() -> None:
+    with pytest.raises(ValueError, match="doping"):
+        apply(InputSchema(bias_voltage=-5.0))
+
+
+# ---------------------------------------------------------------------------
 # Subprocess integration test (Julia available)
 # ---------------------------------------------------------------------------
 

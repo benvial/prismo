@@ -21,6 +21,9 @@ mutable struct WorkerState
     warm_equilibrium::Any
     forward_solutions::Dict{Float64, Any}
     warm_bias_solutions::Dict{Float64, Any}
+    # Silicon doping each warm biased solution was converged on, so a failed
+    # direct warm start can continue by doping homotopy at fixed bias (ticket 18).
+    warm_bias_dopings::Dict{Float64, Vector{Float64}}
 end
 
 WorkerState() = WorkerState(
@@ -38,7 +41,23 @@ WorkerState() = WorkerState(
     nothing,
     Dict{Float64, Any}(),
     Dict{Float64, Any}(),
+    Dict{Float64, Vector{Float64}}(),
 )
+
+# Drop every warm solution (ticket 18 ``reset``). The mesh, system and material
+# data stay: they are a deterministic function of the request, only the Newton
+# starting points carry solve history. The next request on any profile then
+# pays the full cold continuation -- equilibrium from near-intrinsic doping and
+# the bias ramp from equilibrium -- which is what a cold re-evaluation wants.
+function clear_warm_state!(state)
+    state.profile_key = ""
+    state.equilibrium_sol = nothing
+    state.warm_equilibrium = nothing
+    empty!(state.forward_solutions)
+    empty!(state.warm_bias_solutions)
+    empty!(state.warm_bias_dopings)
+    return nothing
+end
 
 read_vector(path) = Float64.(vec(npzread(path)))
 
@@ -53,11 +72,7 @@ function rebuild_context!(state, doping, mesh_path, mesh_key)
     state.n_bregions = n_bregions
     state.node_parents = node_parents
     state.control = make_solver_control()
-    state.profile_key = ""
-    state.equilibrium_sol = nothing
-    state.warm_equilibrium = nothing
-    empty!(state.forward_solutions)
-    empty!(state.warm_bias_solutions)
+    clear_warm_state!(state)
     return nothing
 end
 
@@ -87,7 +102,7 @@ function ensure_profile!(state, doping, mesh_path, mesh_key, profile_key)
             state.warm_equilibrium,
         )
     catch e
-        error("equilibrium solve failed: $(e)")
+        error("equilibrium solve failed: $(sprint(showerror, e))")
     end
     state.profile_key = profile_key
     state.equilibrium_sol = deepcopy(equilibrium_sol)
@@ -118,6 +133,7 @@ function forward_solution!(state, doping, mesh_path, mesh_key, profile_key, bias
         sol = deepcopy(state.equilibrium_sol)
         used_warm_start = !profile_changed
     else
+        silicon_doping = doping[state.node_parents]
         sol = try
             solve_at_bias_with_warm_start(
                 state.ctsys,
@@ -126,12 +142,18 @@ function forward_solution!(state, doping, mesh_path, mesh_key, profile_key, bias
                 bias_voltage,
                 state.cathode_breg,
                 state.n_bregions,
-                get(state.warm_bias_solutions, bias_voltage, nothing),
+                get(state.warm_bias_solutions, bias_voltage, nothing);
+                data = state.data,
+                doping = silicon_doping,
+                warm_doping = get(state.warm_bias_dopings, bias_voltage, nothing),
             )
         catch e
-            error("biased solve at $(bias_voltage) V failed: $(e)")
+            # Labelled like the equilibrium stage; a SolveBudgetExceeded keeps
+            # its own message (it names the stage and the budget).
+            error("biased solve at $(bias_voltage) V failed: $(sprint(showerror, e))")
         end
         used_warm_start = haskey(state.warm_bias_solutions, bias_voltage)
+        state.warm_bias_dopings[bias_voltage] = copy(silicon_doping)
     end
 
     state.forward_solutions[bias_voltage] = deepcopy(sol)
@@ -154,6 +176,7 @@ function carrier_fields(sol, data, node_parents, n_nodes)
 end
 
 function process_forward!(state, request)
+    start_solve_budget!()
     doping = read_vector(String(request["doping_path"]))
     bias_voltage = Float64(JSON.parsefile(String(request["bias_path"]))["bias_voltage"])
     mesh_path = String(request["mesh_path"])
@@ -179,6 +202,7 @@ function process_forward!(state, request)
 end
 
 function process_vjp!(state, request)
+    start_solve_budget!()
     doping = read_vector(String(request["doping_path"]))
     bias_voltage = Float64(JSON.parsefile(String(request["bias_path"]))["bias_voltage"])
     mesh_path = String(request["mesh_path"])
@@ -234,6 +258,9 @@ function main()
                 reply(process_forward!(state, request))
             elseif operation == "vjp"
                 reply(process_vjp!(state, request))
+            elseif operation == "reset"
+                clear_warm_state!(state)
+                reply(Dict("ok" => true))
             else
                 error("unknown worker operation: $operation")
             end

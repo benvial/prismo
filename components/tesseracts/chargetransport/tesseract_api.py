@@ -22,6 +22,7 @@ import tempfile
 from pathlib import Path
 from threading import RLock
 from time import monotonic
+from typing import Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -32,11 +33,17 @@ from tesseract_core.runtime import Array, Differentiable, Float64
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
 
-# Wall-clock budget for one Julia subprocess call. The tesseract apply()
-# endpoint must return within ~30s (ticket 17); the Julia solve itself takes
-# ~12s after the precompile-warmed image build, so 25s leaves headroom while
-# guaranteeing no hang. Override via env for slower hosts.
-_JULIA_TIMEOUT_S = float(os.environ.get("PRISMO_CT_JULIA_TIMEOUT_S", "25"))
+# Backstop wall-clock limit for one Julia worker request (ticket 18). The solve
+# itself is bounded *inside* Julia: ``ct_common.jl`` checks a wall-clock budget
+# (``PRISMO_CT_SOLVE_BUDGET_S``, default 120 s) in every continuation loop and
+# returns ``ok: false`` with a descriptive error when it runs out, so a hard
+# design costs the optimizer one evaluation and the worker -- with every warm
+# solution it holds -- survives. This Python timeout therefore only fires when
+# the process is truly hung (no response at all), and when it fires the worker
+# is killed and restarted cold. Keep it well above the Julia budget; override
+# via env for slower hosts. (Used to be 25 s, which killed the worker on every
+# hard-but-solvable design, 12-70 s on the shared mesh.)
+_JULIA_TIMEOUT_S = float(os.environ.get("PRISMO_CT_JULIA_TIMEOUT_S", "600"))
 
 # Precompile-warmed PackageCompiler sysimage baked into the Julia base image
 # (ticket 17). Without it the first solve pays ~22s of JIT compilation.
@@ -54,13 +61,19 @@ class InputSchema(BaseModel):
     """Inputs to the ChargeTransport.jl drift-diffusion solve.
 
     Attributes:
+        operation: ``"solve"`` runs the drift-diffusion solve. ``"reset"`` drops
+            the persistent worker's warm solutions (equilibrium and biased
+            Newton starting points) so the next solve is cold, i.e. a function
+            of the doping alone rather than of the solve history -- the cold
+            re-evaluation of ticket 20. ``reset`` needs no ``doping``.
         doping: Net doping concentration at every mesh node [cm⁻³].
-            Positive = n-type, negative = p-type.
+            Positive = n-type, negative = p-type. Required for ``"solve"``.
         mesh_ref: Reference to the shared Gmsh 2D mesh file.
         bias_voltage: Applied bias voltage in volts. Default 0 (equilibrium).
     """
 
-    doping: Differentiable[Array[(None,), Float64]]
+    operation: Literal["solve", "reset"] = "solve"
+    doping: Differentiable[Array[(None,), Float64]] | None = None
     mesh_ref: MeshRef | None = None
     bias_voltage: float = Field(default=0.0, ge=-50.0, le=50.0)
 
@@ -69,8 +82,9 @@ class OutputSchema(BaseModel):
     """Outputs of the ChargeTransport.jl drift-diffusion solve.
 
     Attributes:
-        electrons: Electron concentration per mesh node [cm⁻³].
-        holes: Hole concentration per mesh node [cm⁻³].
+        electrons: Electron concentration per mesh node [cm⁻³]. Empty for the
+            ``reset`` operation.
+        holes: Hole concentration per mesh node [cm⁻³]. Empty for ``reset``.
     """
 
     electrons: Differentiable[Array[(None,), Float64]]
@@ -172,6 +186,10 @@ class _JuliaWorker:
         self.generation = generation
         self._lock = RLock()
 
+    def is_alive(self) -> bool:
+        """Whether the Julia process is still running."""
+        return self._process.poll() is None
+
     def request(self, request: dict[str, object]) -> dict[str, object]:
         """Send one request and wait for its JSON response within the budget."""
         with self._lock:
@@ -268,7 +286,7 @@ def _get_julia_worker() -> _JuliaWorker:
     """Return a live worker, invalidating state when a process is replaced."""
     global _julia_worker, _worker_generation
     with _worker_lock:
-        if _julia_worker is not None and _julia_worker._process.poll() is None:
+        if _julia_worker is not None and _julia_worker.is_alive():
             return _julia_worker
         if _julia_worker is not None:
             _julia_worker.close()
@@ -290,6 +308,27 @@ def shutdown() -> None:
 
 
 atexit.register(shutdown)
+
+
+def reset_worker() -> None:
+    """Drop the Julia worker's warm solutions without restarting the process.
+
+    The mesh, system and material data stay resident (they are a function of
+    the request); only the Newton starting points that carry solve history go.
+    The retained forward sessions go with them: a VJP must follow a forward on
+    the reset worker. A worker that is not running has nothing warm to drop.
+    """
+    with _worker_lock:
+        worker = _julia_worker
+        _session_registry.clear()
+        if worker is None or not worker.is_alive():
+            return
+        response = worker.request({"operation": "reset"})
+    if response.get("ok") is not True:
+        raise RuntimeError(
+            "Julia worker reset failed: "
+            f"{response.get('error', 'unknown worker error')}"
+        )
 
 
 def _run_julia_forward(
@@ -404,6 +443,13 @@ def apply(inputs: InputSchema) -> OutputSchema:
     Returns:
         Electron and hole concentrations per mesh node [cm⁻³].
     """
+    if inputs.operation == "reset":
+        reset_worker()
+        empty = np.zeros(0, dtype=float)
+        return OutputSchema(electrons=empty, holes=empty)
+
+    if inputs.doping is None:
+        raise ValueError("ChargeTransport solve requires a doping array")
     doping = np.asarray(inputs.doping, dtype=float)
 
     if not (_julia_available() and (_SCRIPTS_DIR / "worker.jl").exists()):
@@ -469,6 +515,8 @@ def vector_jacobian_product(
     electrons_cot = np.asarray(cotangent_vector.get("electrons", 0.0), dtype=float)
     holes_cot = np.asarray(cotangent_vector.get("holes", 0.0), dtype=float)
 
+    if inputs.doping is None:
+        raise ValueError("ChargeTransport VJP requires a doping array")
     n = len(np.asarray(inputs.doping))
     if electrons_cot.ndim == 0:
         electrons_cot = np.full(n, float(electrons_cot))

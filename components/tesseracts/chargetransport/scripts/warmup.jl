@@ -13,6 +13,8 @@
 #   - build_ct_system on the 1D fallback grid AND on a Gmsh 2D mesh file
 #     (different grid types -> different method specializations)
 #   - equilibrium_solve! + solve_at_bias with a reverse-bias ramp
+#   - the warm-start chain of ticket 18 (direct warm Newton, doping homotopy
+#     at fixed bias, solve budget bookkeeping)
 #   - get_density extraction and the contracted discrete-adjoint VJP
 #   - NPZ / JSON I/O
 
@@ -61,10 +63,29 @@ const MINIMAL_DEVICE_MSH = """
 """
 
 function exercise(doping, mesh_path, bias_voltage)
+    start_solve_budget!()
     ctsys, data, cathode_breg, n_bregions, node_parents = build_ct_system(doping, mesh_path)
     control = make_solver_control()
     silicon_doping = doping[node_parents]
     u0 = solve_equilibrium(ctsys, data, silicon_doping, control)
+    sol = solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregions)
+
+    # Warm-start chain (ticket 18): a nearby profile through the direct warm
+    # Newton solve and the doping homotopy, so neither path JITs at runtime.
+    nearby = silicon_doping .* 1.01
+    u0_warm = solve_equilibrium_with_warm_start(ctsys, data, nearby, control, deepcopy(u0))
+    solve_at_bias_with_warm_start(
+        ctsys, control, deepcopy(u0_warm), bias_voltage, cathode_breg, n_bregions,
+        deepcopy(sol); data = data, doping = nearby, warm_doping = silicon_doping,
+    )
+    if abs(bias_voltage) > 0.0 && cathode_breg <= n_bregions
+        solve_at_bias_by_doping_homotopy(
+            ctsys, data, control, deepcopy(sol), silicon_doping, nearby, bias_voltage,
+            cathode_breg,
+        )
+    end
+    # Back to the profile the rest of this exercise reports on.
+    u0 = solve_equilibrium_with_warm_start(ctsys, data, silicon_doping, control, deepcopy(u0))
     sol = solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregions)
 
     electrons = [get_density(sol, data, 1, 1; inode = i) for i in eachindex(node_parents)]
