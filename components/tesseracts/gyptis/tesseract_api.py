@@ -360,22 +360,41 @@ def _rib_box_pml_2d() -> Any:
     return RibBoxPML2D
 
 
+# One built waveguide per constant-surroundings key. The geometry depends only
+# on the three constant permittivities, so rebuilding it on every operation
+# both remeshed the identical geometry and leaked its ``tempfile.mkdtemp`` mesh
+# directory once per objective evaluation -- several hundred directories over a
+# long optimization (ticket 16). Reuse is safe: ``_assemble_AB`` rebuilds the
+# formulation's property dict from the scalar background before overwriting the
+# rib field, so successive solves on one simulation are idempotent, and the
+# adjoint/mode readers touch only epsilon-independent state (function space,
+# measures, stored eigenvectors). Requests are served sequentially -- the
+# module already assumes that for ``_tracked_lam`` and the session registry.
+_waveguide_cache: dict[tuple[float, float, float], tuple[Any, float]] = {}
+
+
 def _build_waveguide(
     core_epsilon: float,
     clad_epsilon: float,
     substrate_epsilon: float,
 ) -> tuple[Any, float]:
-    """Build the unified SOI rib waveguide (rib + slab + oxide + PML + contacts).
+    """Build (or reuse) the unified SOI rib waveguide.
 
     The geometry is the single source of truth shared with ChargeTransport
     (ticket 05). ``build()`` meshes and writes the ``.msh`` into a per-build temp
     directory (uid-9999-writable), recorded on ``geom.msh_file`` for the
-    ``write_mesh`` operation to read back.
+    ``write_mesh`` operation to read back. Built once per constant-surroundings
+    key and cached (see ``_waveguide_cache``).
 
     Returns:
         Tuple of (Waveguide simulation, free-space wavenumber k0).
     """
     import tempfile
+
+    key = (float(core_epsilon), float(clad_epsilon), float(substrate_epsilon))
+    cached = _waveguide_cache.get(key)
+    if cached is not None:
+        return cached
 
     gyptis = _ensure_gyptis()
     _ensure_dolfin()
@@ -407,6 +426,11 @@ def _build_waveguide(
         "clad": float(clad_epsilon),
     }
     simu = gyptis.Waveguide(geom, epsilon=eps_bg, wavenumber=k0)
+    # One live geometry at a time: the surroundings are constants in practice,
+    # so a changed key means the old simulation (and its eigenstate sessions)
+    # is stale. Live sessions keep their references; only the cache lets go.
+    _waveguide_cache.clear()
+    _waveguide_cache[key] = (simu, k0)
     return simu, k0
 
 
