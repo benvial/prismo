@@ -17,6 +17,7 @@ from prismo.pipeline import (  # noqa: E402
     DOPING_LOG10_SPAN,
     DOPING_REFERENCE_CM3,
     REVERSE_BIAS_V,
+    DesignNodes,
     PipelineComponents,
     _build_design_epsilon,
     _container_mesh_ref,
@@ -1187,3 +1188,68 @@ class TestChargeTransportMeshDelivery:
         ]
         # The mount directory is created so the bind mount always resolves.
         assert mesh_dir.exists()
+
+
+class TestDesignNodes:
+    """The design set spans the silicon nodes, not every node of the mesh."""
+
+    def test_scatter_places_variables_and_zeroes_the_rest(self):
+        """Non-design nodes read theta = 0, i.e. net-intrinsic."""
+        nodes = DesignNodes(indices=np.asarray([1, 3]), n_mesh_nodes=5)
+        full = nodes.scatter(jnp.asarray([0.4, -0.7]))
+        np.testing.assert_allclose(full, [0.0, 0.4, 0.0, -0.7, 0.0])
+
+    def test_scatter_numpy_keeps_the_design_entries_in_place(self):
+        """The plotting path places the same values at the same node indices."""
+        nodes = DesignNodes(indices=np.asarray([0, 2]), n_mesh_nodes=4)
+        design = np.asarray([0.2, -0.5])
+        full = nodes.scatter_numpy(design)
+        np.testing.assert_allclose(full[nodes.indices], design)
+        np.testing.assert_allclose(full, [0.2, 0.0, -0.5, 0.0])
+
+    def test_all_nodes_is_the_identity_design_set(self):
+        """The fallback keeps one variable per mesh node."""
+        nodes = DesignNodes.all_nodes(3)
+        assert len(nodes) == 3
+        np.testing.assert_allclose(nodes.scatter(jnp.asarray([1.0, 2.0, 3.0])), [1, 2, 3])
+
+    def test_pipeline_matches_the_scattered_full_field(self):
+        """Restricting the design set changes the variables, not the physics.
+
+        A design vector on a subset must produce exactly the objective the
+        equivalent full-length field produces, so the smaller MMA problem
+        optimizes the same function.
+        """
+        def fake_ct(doping, bias_voltage, mesh_ref=None):
+            carriers = jnp.where(bias_voltage == 0.0, doping, jnp.zeros_like(doping))
+            return carriers, carriers
+
+        components = _components_with(
+            chargetransport=fake_ct, gyptis=lambda eps, *s: jnp.sum(eps**2)
+        )
+        nodes = DesignNodes(indices=np.asarray([0, 2]), n_mesh_nodes=4)
+        design = jnp.asarray([0.3, -0.4])
+
+        restricted = pipeline(design, design_nodes=nodes, components=components)
+        full = pipeline(nodes.scatter(design), components=components)
+        assert float(restricted) != 0.0
+        assert float(restricted) == pytest.approx(float(full))
+
+    def test_gradient_has_one_entry_per_design_node(self):
+        """The adjoint comes back on the design set, not the full mesh."""
+
+        def fake_ct(doping, bias_voltage, mesh_ref=None):
+            # Depletion under bias, so a structured design field moves neff.
+            carriers = jnp.where(bias_voltage == 0.0, doping, jnp.zeros_like(doping))
+            return carriers, carriers
+
+        structure_sensitive = lambda eps, *s: jnp.sum(eps**2)
+        components = _components_with(
+            chargetransport=fake_ct, gyptis=structure_sensitive
+        )
+        nodes = DesignNodes(indices=np.asarray([0, 2]), n_mesh_nodes=4)
+        grad = jax.grad(
+            lambda t: pipeline(t, design_nodes=nodes, components=components)
+        )(jnp.asarray([0.3, -0.4]))
+        assert grad.shape == (2,)
+        assert float(jnp.linalg.norm(grad)) > 0.0

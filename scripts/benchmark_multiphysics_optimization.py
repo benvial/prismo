@@ -253,6 +253,9 @@ def main() -> None:
     try:
         inputs = _prepare_full_pipeline(args, components)
         n_nodes = inputs.n_nodes
+        # The callback's argument is the design vector, which spans the silicon
+        # nodes rather than every mesh node (``pipeline.DesignNodes``).
+        n_design = len(inputs.design_nodes)
 
         def objective(theta: Any) -> Any:
             # ``mesh_ref`` included: without it ChargeTransport falls back to
@@ -264,6 +267,7 @@ def main() -> None:
                 H_sum=inputs.H_sum,
                 mesh_ref=inputs.mesh_ref,
                 design_transfer=inputs.design_transfer,
+                design_nodes=inputs.design_nodes,
                 components=components,
             )
 
@@ -271,7 +275,7 @@ def main() -> None:
         if not args.no_jit:
             callback = jax.jit(callback)
         initial_rho = jnp.asarray(inputs.theta_init, dtype=jnp.float64)
-        direction = jnp.linspace(-1.0, 1.0, n_nodes, dtype=jnp.float64)
+        direction = jnp.linspace(-1.0, 1.0, n_design, dtype=jnp.float64)
         direction = direction / jnp.linalg.norm(direction)
         measurements: list[dict[str, object]] = []
         for iteration in range(args.iterations):
@@ -297,6 +301,7 @@ def main() -> None:
         "metadata": {
             "mode": args.mode,
             "n_nodes": n_nodes,
+            "n_design": n_design,
             "jit": not args.no_jit,
             "python": sys.version,
             "platform": platform.platform(),

@@ -160,12 +160,18 @@ def validate_gradient(
 class PipelineInputs:
     """Everything ``pipeline()`` needs at a fixed design, shared by run/validate.
 
-    Assembled once from the mesh: the node coordinates, the signed-junction seed
-    ``theta_init``, the density-filter matrix ``(H_dense, H_sum)``, the
-    ``mesh_ref`` that routes ChargeTransport onto the real 2D grid, the
-    ``design_transfer`` that carries the nodal field onto the gyptis design
-    cells, and the ``design_vertices`` those cells occupy (container path only),
-    whose bounding box outlines the silicon rib on the mode figure.
+    Assembled once from the mesh: the node coordinates, the ``design_nodes``
+    that carry a design variable (the silicon nodes), the signed-junction seed
+    ``theta_init`` over those nodes, the density-filter matrix ``(H_dense,
+    H_sum)`` over those nodes, the ``mesh_ref`` that routes ChargeTransport onto
+    the real 2D grid, the ``design_transfer`` that carries the nodal field onto
+    the gyptis design cells, and the ``design_vertices`` those cells occupy
+    (container path only), whose bounding box outlines the silicon rib on the
+    mode figure.
+
+    ``coords`` and ``n_nodes`` stay full-mesh -- they key the solvers and the
+    figures -- while ``theta_init``, ``H_dense`` and ``H_sum`` are sized by
+    ``len(design_nodes)``.
     """
 
     geometry: Any
@@ -178,7 +184,35 @@ class PipelineInputs:
     H_sum: Any
     theta_init: Any
     design_transfer: Any | None
+    design_nodes: Any | None = None
     design_vertices: np.ndarray | None = None
+
+
+def _silicon_design_nodes(actual_mesh: Path, n_nodes: int, real_mesh: bool) -> Any:
+    """The design set: the shared mesh's silicon nodes, else every node.
+
+    Reads the ``slab`` + ``rib_silicon`` triangles -- the same pair
+    ``ct_common.jl`` collects -- and keeps the nodes they touch. The synthetic
+    fallback grid has no physical groups at all, and a mesh whose silicon
+    groups cannot be read would silently shrink the design to nothing, so both
+    fall back to one variable per node rather than guessing.
+    """
+    from prismo.pipeline import DesignNodes
+    from prismo.waveguide_mesh import read_mesh_silicon_triangulation
+
+    if not real_mesh:
+        return DesignNodes.all_nodes(n_nodes)
+
+    triangles = read_mesh_silicon_triangulation(actual_mesh)
+    if triangles.size == 0:
+        typer.echo(
+            "      WARNING: no silicon physical groups in the mesh; "
+            "keeping one design variable per node."
+        )
+        return DesignNodes.all_nodes(n_nodes)
+
+    indices = np.unique(triangles.ravel()).astype(np.intp)
+    return DesignNodes(indices=indices, n_mesh_nodes=n_nodes)
 
 
 def build_pipeline_inputs(
@@ -254,13 +288,28 @@ def build_pipeline_inputs(
         else None
     )
 
+    # Only silicon nodes carry physics: ChargeTransport gathers doping on the
+    # silicon subgrid and every gyptis design cell is a rib triangle with
+    # silicon vertices. A variable anywhere else has an exactly-zero gradient,
+    # or -- within r_min of silicon -- dopes the device from outside it. Both
+    # are parameterizations with no physical referent, so the design set is the
+    # silicon nodes and the dense filter shrinks with it.
+    design_nodes = _silicon_design_nodes(actual_mesh, n_nodes, real_mesh)
+    design_coords = coords[design_nodes.indices]
+    typer.echo(
+        f"      {len(design_nodes)} design variables on silicon nodes "
+        f"({n_nodes - len(design_nodes)} non-silicon nodes carry no variable)"
+    )
+
     typer.echo("Building density filter matrix...")
-    H_sparse = assemble_filter_matrix(coords, r_min=r_min)
+    H_sparse = assemble_filter_matrix(design_coords, r_min=r_min)
     H_dense = jnp.asarray(H_sparse.toarray())
     H_sum = jnp.sum(H_dense, axis=1)
     # Seed a signed lateral P/N junction in every run path (sign(theta) is a free
-    # design variable, so the optimizer can move or dissolve it).
-    theta_init = seed_signed_junction(coords)
+    # design variable, so the optimizer can move or dissolve it). Seeded on the
+    # design nodes, so the junction splits the silicon at its own median x
+    # rather than the whole domain's.
+    theta_init = seed_signed_junction(design_coords)
 
     design_transfer = None
     if use_containers:
@@ -294,6 +343,7 @@ def build_pipeline_inputs(
         H_sum=H_sum,
         theta_init=theta_init,
         design_transfer=design_transfer,
+        design_nodes=design_nodes,
         design_vertices=design_vertices,
     )
 
@@ -332,6 +382,7 @@ def _optimized_mode_field(
         mesh_ref=inputs.mesh_ref,
         background_epsilon=DEFAULT_BACKGROUND_EPSILON,
         design_transfer=inputs.design_transfer,
+        design_nodes=inputs.design_nodes,
         components=bundle,
     )
     abs_e, coords_um = bundle.mode_field(
@@ -372,12 +423,12 @@ def _run_pipeline(
     inputs = build_pipeline_inputs(r_min, mesh_path, use_containers, components)
     geometry = inputs.geometry
     coords = inputs.coords
-    n_nodes = inputs.n_nodes
     mesh_ref = inputs.mesh_ref
     H_dense = inputs.H_dense
     H_sum = inputs.H_sum
     theta_init = inputs.theta_init
     design_transfer = inputs.design_transfer
+    design_nodes = inputs.design_nodes
 
     typer.echo("[2/3] Running NLopt MMA optimization...")
     try:
@@ -390,7 +441,7 @@ def _run_pipeline(
 
                 name = f"doping_field_{iteration}"
                 plot_live_doping_field(
-                    np.asarray(doping_from_theta(theta)),
+                    np.asarray(doping_from_theta(design_nodes.scatter_numpy(theta))),
                     coords,
                     iteration,
                     geometry=geometry,
@@ -400,7 +451,7 @@ def _run_pipeline(
 
         rho_opt, history = optimize_doping(
             initial_rho=np.asarray(theta_init, dtype=float),
-            n_nodes=n_nodes,
+            n_nodes=len(design_nodes),
             H=H_dense,
             H_sum=H_sum,
             max_iter=optimization_max_iter,
@@ -409,6 +460,7 @@ def _run_pipeline(
             use_jit=not no_jit,
             on_iteration=on_iteration,
             design_transfer=design_transfer,
+            design_nodes=design_nodes,
             mesh_ref=mesh_ref,
             components=components,
         )
@@ -446,6 +498,11 @@ def _run_pipeline(
 
     typer.echo("[3/3] Generating outputs...")
     rho_initial = np.asarray(theta_init, dtype=float)
+    # The figures are drawn on the full mesh, so the design field goes back into
+    # full node order first; non-design nodes read theta = 0 (net-intrinsic),
+    # which is what oxide means anyway.
+    plot_initial = design_nodes.scatter_numpy(rho_initial)
+    plot_opt = design_nodes.scatter_numpy(rho_opt)
     # The mode figure is a post-hoc query, so a backend that cannot answer it --
     # an image predating the ``mode_field`` operation, say -- must cost one
     # figure, not every figure of a finished multi-minute optimization.
@@ -455,8 +512,8 @@ def _run_pipeline(
         typer.echo(f"      WARNING: mode figure skipped ({exc})")
         mode_field = None
     plot_paths = generate_outputs(
-        rho_initial=rho_initial,
-        rho_opt=rho_opt,
+        rho_initial=plot_initial,
+        rho_opt=plot_opt,
         history=history,
         # Node coordinates are micrometres on both paths (ticket 15), which is
         # what the figures plot in -- no conversion at this seam.
@@ -473,12 +530,16 @@ def _run_pipeline(
             H_sum=H_sum,
             mesh_ref=mesh_ref,
             design_transfer=design_transfer,
+            design_nodes=design_nodes,
             components=components,
         ),
         ftol_rel=optimization_ftol_rel,
         gradient_validation_directions=1 if use_containers else 3,
         gradient_validation_steps=(np.logspace(-4, -2, 3) if use_containers else None),
-        gradient_validation_rho=rho_initial if use_containers else None,
+        # Explicit on both paths: the figure's finite differences probe the
+        # bound pipeline, which takes a design-node vector, while ``rho_opt``
+        # above has already been scattered to full node order for plotting.
+        gradient_validation_rho=rho_initial if use_containers else rho_opt,
         mode_field=mode_field,
         output_dir=output_dir,
     )
@@ -522,6 +583,7 @@ def _run_gradient_validation(
         H_sum=inputs.H_sum,
         mesh_ref=inputs.mesh_ref,
         design_transfer=inputs.design_transfer,
+        design_nodes=inputs.design_nodes,
         components=components,
     )
     result = validate_gradient_fn(

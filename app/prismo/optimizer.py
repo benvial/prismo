@@ -1,7 +1,8 @@
 """NLopt MMA optimization loop for the PRISMO pipeline.
 
 Wraps the JAX-differentiable pipeline in an NLopt MMA optimizer.
-Design variables: the per-node signed design field theta in [-1, 1].
+Design variables: the signed design field theta in [-1, 1], one entry per
+design node (the silicon nodes of the shared mesh; see ``pipeline.DesignNodes``).
 Objective: maximize signed delta_n_eff (or minimize -delta_n_eff).
 Ref: ticket 15.
 """
@@ -23,6 +24,7 @@ from prismo_shared.schemas import MeshRef
 
 from prismo.density_filter import assemble_filter_matrix
 from prismo.pipeline import (
+    DesignNodes,
     PipelineComponents,
     default_components,
     pipeline,
@@ -73,23 +75,25 @@ def optimize_doping(
     use_jit: bool = True,
     on_iteration: Callable[[int, np.ndarray], None] | None = None,
     design_transfer: jax.Array | None = None,
+    design_nodes: DesignNodes | None = None,
     mesh_ref: MeshRef | None = None,
     components: PipelineComponents | None = None,
 ) -> tuple[np.ndarray, list[_HistoryEntry]]:
     """Run the NLopt MMA optimization loop.
 
     Args:
-        initial_rho: Starting signed design field ``(n_nodes,)`` in ``[-1, 1]``.
-            Defaults to a uniform 0.25 fallback; the real run seeds a signed
-            junction (``main.py``). The name is retained for call-site
-            compatibility.
-        n_nodes: Number of mesh nodes (derived from ``initial_rho`` if given,
-            else required when ``H`` / ``mesh_coords`` / ``mesh_path`` is
-            provided).
-        H: Dense filter matrix ``(n_nodes, n_nodes)``. Built from
+        initial_rho: Starting signed design field ``(n_design,)`` in ``[-1, 1]``
+            -- one entry per design node, which on a real mesh is the silicon
+            nodes rather than every mesh node. Defaults to a uniform 0.25
+            fallback; the real run seeds a signed junction (``main.py``). The
+            name is retained for call-site compatibility.
+        n_nodes: Number of design variables (derived from ``initial_rho`` if
+            given, else required when ``H`` / ``mesh_coords`` / ``mesh_path``
+            is provided).
+        H: Dense filter matrix ``(n_design, n_design)``. Built from
             ``mesh_coords`` or ``mesh_path`` if omitted.
         H_sum: Pre-computed row sums of ``H``.
-        mesh_coords: ``(n_nodes, 2)`` node coordinates for building the
+        mesh_coords: ``(n_design, 2)`` design-node coordinates for building the
             filter matrix.
         mesh_path: Path to a ``.msh`` file for building the filter matrix
             (requires ``gmsh``).
@@ -105,6 +109,10 @@ def optimize_doping(
         design_transfer: Dense ``(n_design_cells, n_nodes)`` mesh-transfer
             matrix carrying the nodal perturbation onto the gyptis design
             cells. ``None`` maps the perturbation node-for-node (identity).
+        design_nodes: Which shared-mesh nodes the design vector addresses (the
+            silicon nodes on a real mesh). Forwarded to ``pipeline``, which
+            scatters the filtered field back to full node order. ``None`` means
+            one variable per mesh node.
         mesh_ref: Shared-mesh reference forwarded to the ChargeTransport
             solves so they run on the real 2D grid. ``None`` leaves CT on its
             1D fallback device.
@@ -149,6 +157,7 @@ def optimize_doping(
             H_sum=H_sum,
             mesh_ref=mesh_ref,
             design_transfer=design_transfer,
+            design_nodes=design_nodes,
             components=components,
         )
 

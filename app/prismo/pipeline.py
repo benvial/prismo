@@ -99,6 +99,59 @@ def _doping_from_theta_jvp(
 _JUNCTION_SEED_THETA = 0.3
 
 
+@dataclass(frozen=True)
+class DesignNodes:
+    """Which shared-mesh nodes carry a design variable, and how to place them back.
+
+    The design field is defined on the *silicon* nodes (``slab`` +
+    ``rib_silicon``) rather than on every node of the shared mesh. Only silicon
+    nodes have physics attached to them: ChargeTransport gathers doping on the
+    silicon subgrid and scatters carriers back from it, and every gyptis design
+    cell is a rib triangle whose three vertices are silicon nodes. A variable on
+    an oxide, substrate, clad or PML node therefore has an exactly-zero gradient
+    unless the density filter happens to reach a silicon node, in which case it
+    dopes silicon from outside the device -- a degree of freedom with no
+    physical referent either way.
+
+    Restricting the design set drops those variables from the MMA problem and
+    shrinks the dense filter matrix quadratically (it is ``(n_design,
+    n_design)``). Downstream contracts are unchanged: :meth:`scatter` places the
+    filtered field back into full gmsh node order before the doping map, so
+    ``mesh_ref``'s node ordering and the ``(n_design_cells, n_nodes)`` transfer
+    still see a full-length nodal field. Non-design nodes scatter to ``theta =
+    0``, i.e. net-intrinsic, which is what the oxide already meant.
+
+    Attributes:
+        indices: ``(n_design,)`` node indices into full gmsh node order.
+        n_mesh_nodes: Number of nodes in the full shared mesh.
+    """
+
+    indices: np.ndarray
+    n_mesh_nodes: int
+
+    def __len__(self) -> int:
+        """Number of design variables."""
+        return int(self.indices.size)
+
+    @classmethod
+    def all_nodes(cls, n_mesh_nodes: int) -> DesignNodes:
+        """Every mesh node is a design node (the no-silicon-groups fallback)."""
+        return cls(
+            indices=np.arange(n_mesh_nodes, dtype=np.intp), n_mesh_nodes=n_mesh_nodes
+        )
+
+    def scatter(self, design_field: jax.Array) -> jax.Array:
+        """Place a design-node field into full node order, zero elsewhere."""
+        full = jnp.zeros(self.n_mesh_nodes, dtype=design_field.dtype)
+        return full.at[jnp.asarray(self.indices)].set(design_field)
+
+    def scatter_numpy(self, design_field: np.ndarray) -> np.ndarray:
+        """:meth:`scatter` for plotting and other non-traced callers."""
+        full = np.zeros(self.n_mesh_nodes, dtype=float)
+        full[self.indices] = np.asarray(design_field, dtype=float)
+        return full
+
+
 def seed_signed_junction(coords: np.ndarray) -> jax.Array:
     """Seed a signed lateral P/N junction across the mesh in every run path.
 
@@ -927,6 +980,7 @@ def design_epsilon_from_theta(
     mesh_ref: MeshRef | None = None,
     background_epsilon: float | None = None,
     design_transfer: jax.Array | None = None,
+    design_nodes: DesignNodes | None = None,
     components: PipelineComponents | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Everything ``pipeline()`` does up to the eigensolves.
@@ -945,13 +999,21 @@ def design_epsilon_from_theta(
     if components is None:
         components = _DEFAULT_COMPONENTS
 
-    # 1. Density filter: theta -> theta_tilde (linear; regularizes junction width)
+    # 1. Density filter: theta -> theta_tilde (linear; regularizes junction width).
+    # Filtering happens on the design nodes, so the filter never averages a
+    # silicon node against an oxide variable that carries no physics.
     if H is not None:
         if H_sum is None:
             H_sum = jnp.sum(H, axis=1)
         theta_tilde = _filter_jax(theta, H, H_sum)
     else:
         theta_tilde = theta
+
+    # 1b. Back to full gmsh node order for the solvers, which key off the shared
+    # mesh's node set. Non-design nodes take theta = 0 (net-intrinsic): they are
+    # oxide, and ChargeTransport reads doping on the silicon subgrid only.
+    if design_nodes is not None:
+        theta_tilde = design_nodes.scatter(theta_tilde)
 
     # 2. Signed doping mapping: theta_tilde -> N(theta) [cm^-3]
     doping = doping_from_theta(theta_tilde)
@@ -987,14 +1049,17 @@ def pipeline(
     mesh_ref: MeshRef | None = None,
     background_epsilon: float | None = None,
     design_transfer: jax.Array | None = None,
+    design_nodes: DesignNodes | None = None,
     components: PipelineComponents | None = None,
 ) -> jax.Array:
     """Signed design field theta -> Delta n_eff differentiable pipeline.
 
     Args:
-        theta: Signed design field per node in [-1, 1], shape ``(n_nodes,)``.
-            Its sign is the free P/N polarity (junction = zero-crossing).
-        H: Dense filter matrix, shape ``(n_nodes, n_nodes)``. Skip filter if
+        theta: Signed design field per design node in [-1, 1], shape
+            ``(n_design,)`` -- the silicon nodes when ``design_nodes`` is given,
+            otherwise every mesh node. Its sign is the free P/N polarity
+            (junction = zero-crossing).
+        H: Dense filter matrix, shape ``(n_design, n_design)``. Skip filter if
             ``None``.
         H_sum: Pre-computed row sums of ``H``.
         mesh_ref: ``MeshRef`` forwarded to ChargeTransport calls.
@@ -1003,6 +1068,10 @@ def pipeline(
         design_transfer: Dense ``(n_design_cells, n_nodes)`` mesh-transfer matrix
             carrying the nodal perturbation onto the gyptis design cells (ticket
             04). ``None`` maps the perturbation node-for-node (identity).
+        design_nodes: Which shared-mesh nodes ``theta`` addresses. The filtered
+            field is scattered back to full node order before the doping map, so
+            everything downstream still sees ``(n_nodes,)``. ``None`` means
+            ``theta`` already spans every mesh node.
         components: Live differentiable components to compose. Defaults to the
             in-process components built from the local tesseract apis.
 
@@ -1024,6 +1093,7 @@ def pipeline(
         mesh_ref=mesh_ref,
         background_epsilon=background_epsilon,
         design_transfer=design_transfer,
+        design_nodes=design_nodes,
         components=components,
     )
 

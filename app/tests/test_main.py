@@ -116,6 +116,14 @@ def test_run_gradient_validation_passes_for_real_gradient(
         mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
     )
     monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    # The stubbed mesh file is never written, so the silicon-group read that
+    # picks the design nodes has nothing to open: report no silicon groups, and
+    # every node of this four-node double stays a design variable.
+    monkeypatch.setattr(
+        mesh_module,
+        "read_mesh_silicon_triangulation",
+        lambda _: np.empty((0, 3), dtype=np.intp),
+    )
 
     result = main_module._run_gradient_validation(
         r_min=0.05,
@@ -490,7 +498,48 @@ def test_local_pipeline_inputs_keep_the_seeded_junction_under_the_default_filter
 
     # A local filter couples a node to a handful of neighbours, not to the
     # whole mesh; all-pairs coupling is exactly the mean-collapse failure.
-    density = float(np.count_nonzero(np.asarray(inputs.H_dense))) / (
-        inputs.n_nodes**2
-    )
+    n_design = len(inputs.design_nodes)
+    density = float(np.count_nonzero(np.asarray(inputs.H_dense))) / (n_design**2)
     assert density < 0.5
+
+
+def test_design_variables_live_on_the_silicon_nodes_only(tmp_path: Path) -> None:
+    """The MMA design set is the silicon subdomain, not the whole mesh.
+
+    Oxide, substrate, clad and PML nodes have no physics attached -- CT gathers
+    doping on the silicon subgrid and every gyptis design cell is a rib
+    triangle with silicon vertices -- so a variable there is either dead or
+    dopes the device from outside it. The filter and the seed are sized by the
+    design set, while the mesh contracts downstream stay full-length.
+    """
+    pytest.importorskip("gmsh")
+
+    main_module = import_module("prismo.main")
+    from prismo.waveguide_mesh import RibWaveguideGeometry
+
+    inputs = main_module.build_pipeline_inputs(
+        r_min=0.05,
+        mesh_path=str(tmp_path / "waveguide.msh"),
+        use_containers=False,
+        components=None,
+    )
+    geometry = RibWaveguideGeometry()
+    n_design = len(inputs.design_nodes)
+
+    assert 0 < n_design < inputs.n_nodes
+    assert inputs.theta_init.shape == (n_design,)
+    assert inputs.H_dense.shape == (n_design, n_design)
+
+    # Every design node sits in the silicon band (slab bottom to rib top);
+    # nothing in the oxide carries a variable.
+    design_coords = inputs.coords[inputs.design_nodes.indices]
+    assert design_coords[:, 1].min() >= geometry.substrate_thickness - 1e-9
+    assert design_coords[:, 1].max() <= geometry.rib_top + 1e-9
+
+    # Scattering back to full node order is what keeps the solver contracts
+    # (mesh_ref node ordering, the mesh-transfer operator) unchanged.
+    full = inputs.design_nodes.scatter_numpy(np.asarray(inputs.theta_init))
+    assert full.shape == (inputs.n_nodes,)
+    np.testing.assert_allclose(
+        full[inputs.design_nodes.indices], np.asarray(inputs.theta_init)
+    )
