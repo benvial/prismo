@@ -287,8 +287,13 @@ def optimize_doping(
             opt.set_max_objective(_obj)
             opt.set_maxeval(max_iter)
             opt.set_ftol_rel(ftol_rel)
+            # The CCSAQ fallback continues from the best design whose physics
+            # actually solved rather than restarting at the seed, so a
+            # roundoff-limited MMA run hands over its progress instead of
+            # discarding it.
+            start = best_feasible[0][1] if best_feasible else initial_rho
             try:
-                rho_opt = opt.optimize(initial_rho.copy())
+                rho_opt = opt.optimize(start.copy())
                 break
             except _StopOptimization as exc:
                 rho_opt = best_feasible[0][1]
@@ -306,7 +311,10 @@ def optimize_doping(
                         f"{min_mma_evaluations}"
                     ) from exc
                 if algorithm == nlopt.LD_CCSAQ:
-                    rho_opt = initial_rho
+                    # Roundoff-limited on the fallback too: keep the best
+                    # feasible design rather than reverting to the seed --
+                    # every entry in best_feasible is a solved improvement.
+                    rho_opt = best_feasible[0][1] if best_feasible else initial_rho
                     break
     finally:
         signal.signal(signal.SIGINT, prev_handler)
