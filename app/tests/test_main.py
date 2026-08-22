@@ -233,7 +233,10 @@ def test_container_run_seeds_signed_junction_for_optimization(
     # Reverse bias is applied to the right cathode: left nodes seed n-type and
     # right nodes p-type so -5 V widens, rather than forward-biases, junction.
     np.testing.assert_allclose(captured["initial_rho"], [0.3, 0.3, -0.3])
-    assert captured["min_mma_evaluations"] == 5
+    # The move limit and the per-evaluation checkpoint reach the optimizer
+    # (ticket 19); the checkpoint lives next to the figures.
+    assert captured["move_limit"] == pytest.approx(0.05)
+    assert Path(captured["checkpoint_path"]) == tmp_path / "checkpoint.json"
     assert callable(captured["on_iteration"])
     # The container setup feeds the assembled mesh-transfer matrix to the solve.
     assert captured["design_transfer"] is not None
@@ -463,6 +466,307 @@ def test_container_run_rejects_near_zero_objective(
             use_containers=True,
             components=_container_components([[0.5, 0.0]]),
         )
+
+
+def _solve_components_with_reset(base, resets: list[str]):
+    """Live-looking doubles: identity carriers, mean neff, and a reset seam."""
+    import jax.numpy as jnp
+    from prismo.pipeline import PipelineComponents
+
+    return PipelineComponents(
+        chargetransport=lambda doping, bias, mesh_ref=None: (doping, doping),
+        gyptis=lambda design_epsilon, core_epsilon=None: jnp.mean(design_epsilon),
+        gyptis_background=lambda design_epsilon, core_epsilon=None: jnp.mean(
+            design_epsilon
+        ),
+        design_cell_centroids=base.design_cell_centroids,
+        design_cell_vertices=base.design_cell_vertices,
+        write_mesh=base.write_mesh,
+        reset_chargetransport=lambda: resets.append("reset"),
+    )
+
+
+def test_container_run_reports_warm_and_cold_objective(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The reported optimum is re-solved cold; VπLπ comes from the cold value.
+
+    The ChargeTransport worker is reset before the best design is evaluated
+    once more, warm and cold Δneff are both printed, and a discrepancy beyond
+    the tolerance is surfaced as a warning and handed to the convergence figure
+    (ticket 20).
+    """
+    import prismo.main as main_module
+    import prismo.optimizer as optimizer_module
+    import prismo.outputs as outputs_module
+    import prismo.waveguide_mesh as mesh_module
+    from prismo.pipeline import vpi_lpi_v_cm
+
+    coords = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+    output_captured: dict[str, object] = {}
+    calls: list[str] = []
+    # The optimizer "saw" 1e-3; the doubles re-solve to something else, so the
+    # warm/cold discrepancy is far above the tolerance.
+    history = [
+        {"iteration": 1, "delta_n_eff": 5e-4, "delta_rho": 0.0, "grad_norm": 1e-4,
+         "wall_time": 0.1},
+        {"iteration": 2, "delta_n_eff": 1e-3, "delta_rho": 1e-3, "grad_norm": 1e-4,
+         "wall_time": 0.2},
+        # A rejected trial after the best: the reported warm value is the max.
+        {"iteration": 3, "delta_n_eff": 8e-4, "delta_rho": 1e-3, "grad_norm": 1e-4,
+         "wall_time": 0.3},
+    ]
+    base = _container_components([[0.5, 0.0], [1.5, 0.0]])
+    components = _solve_components_with_reset(base, calls)
+
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+
+    def fake_optimize(**kwargs):
+        calls.append("optimize")
+        return np.asarray([0.2, 0.3, 0.4]), history
+
+    monkeypatch.setattr(optimizer_module, "optimize_doping", fake_optimize)
+    monkeypatch.setattr(
+        outputs_module,
+        "generate_outputs",
+        lambda **kwargs: (output_captured.update(kwargs) or []),
+    )
+    _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
+
+    main_module._run_pipeline(
+        r_min=50e-9,
+        max_iter=5,
+        ftol_rel=1e-5,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        no_jit=True,
+        use_containers=True,
+        components=components,
+    )
+
+    # Reset happens after the optimization and before the cold solve.
+    assert calls == ["optimize", "reset"]
+    cold = output_captured["cold_reevaluation"]
+    assert cold is not None
+    assert cold.warm_delta_neff == pytest.approx(1e-3)
+    # The cold value is the bound pipeline at the reported design.
+    expected_cold = float(output_captured["pipeline_fn"](np.asarray([0.2, 0.3, 0.4])))
+    assert cold.cold_delta_neff == pytest.approx(expected_cold)
+    assert not cold.passed
+    out = capsys.readouterr().out
+    assert "Delta_n_eff (warm, optimizer) = +1.000000e-03" in out
+    assert "Delta_n_eff (cold re-solve)" in out
+    assert "WARNING: warm/cold Delta_n_eff disagree" in out
+    assert f"VpiLpi = {vpi_lpi_v_cm(expected_cold):+.4e}" in out
+
+
+def test_container_run_without_reset_seam_skips_cold_reevaluation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import prismo.main as main_module
+    import prismo.optimizer as optimizer_module
+    import prismo.outputs as outputs_module
+    import prismo.waveguide_mesh as mesh_module
+
+    coords = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+    output_captured: dict[str, object] = {}
+    history = [
+        {"iteration": 1, "delta_n_eff": 1e-3, "delta_rho": 0.0, "grad_norm": 1e-4,
+         "wall_time": 0.1},
+    ]
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        optimizer_module,
+        "optimize_doping",
+        lambda **_: (np.asarray([0.2, 0.3, 0.4]), history),
+    )
+    monkeypatch.setattr(
+        outputs_module,
+        "generate_outputs",
+        lambda **kwargs: (output_captured.update(kwargs) or []),
+    )
+    _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
+
+    main_module._run_pipeline(
+        r_min=50e-9,
+        max_iter=5,
+        ftol_rel=1e-5,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        no_jit=True,
+        use_containers=True,
+        components=_container_components([[0.5, 0.0], [1.5, 0.0]]),
+    )
+
+    assert output_captured["cold_reevaluation"] is None
+    assert "Cold re-evaluation skipped" in capsys.readouterr().out
+
+
+def test_run_clears_stale_live_doping_frames(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A run starts with no ``doping_field_<n>.png`` from a previous run (ticket 21)."""
+    import prismo.main as main_module
+    import prismo.optimizer as optimizer_module
+    import prismo.outputs as outputs_module
+    import prismo.waveguide_mesh as mesh_module
+
+    stale = [tmp_path / f"doping_field_{n}.png" for n in (1, 2, 17)]
+    for frame in stale:
+        frame.write_bytes(b"stale")
+    keep = tmp_path / "doping_field.pdf"
+    keep.write_bytes(b"headline")
+
+    coords = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+    history = [
+        {"iteration": 1, "delta_n_eff": 1e-3, "delta_rho": 0.0, "grad_norm": 1e-4,
+         "wall_time": 0.1},
+    ]
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        optimizer_module,
+        "optimize_doping",
+        lambda **_: (np.asarray([0.2, 0.3, 0.4]), history),
+    )
+    monkeypatch.setattr(outputs_module, "generate_outputs", lambda **kwargs: [])
+    _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
+
+    main_module._run_pipeline(
+        r_min=50e-9,
+        max_iter=5,
+        ftol_rel=1e-5,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        no_jit=True,
+        use_containers=True,
+        components=_container_components([[0.5, 0.0], [1.5, 0.0]]),
+    )
+
+    assert not any(frame.exists() for frame in stale)
+    assert keep.exists()
+
+
+def test_gradient_validation_cold_resets_before_every_evaluation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--cold`` resets the worker before each FD sample (and the adjoint)."""
+    import prismo.main as main_module
+    import prismo.waveguide_mesh as mesh_module
+    from _doubles import stub_components
+
+    resets: list[str] = []
+    components = stub_components(
+        reset_chargetransport=lambda: resets.append("reset")
+    )
+    coords = np.asarray(
+        [[0.0, 0.0], [1e-6, 0.0], [2e-6, 0.0], [3e-6, 0.0]], dtype=float
+    )
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        mesh_module,
+        "read_mesh_silicon_triangulation",
+        lambda _: np.empty((0, 3), dtype=np.intp),
+    )
+    step_sizes = np.asarray([1e-3, 1e-2])
+
+    result = main_module._run_gradient_validation(
+        r_min=0.05,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        tolerance=1e-2,
+        n_directions=2,
+        step_sizes=step_sizes,
+        use_containers=False,
+        components=components,
+        cold=True,
+    )
+    assert result.passed is True
+    # One reset to prove the seam, one before the adjoint, one before each of
+    # the 2 directions x 2 steps x 2 sides central-difference evaluations.
+    assert len(resets) == 1 + 1 + 2 * len(step_sizes) * 2
+
+
+def test_gradient_validation_cold_requires_a_reset_seam(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import prismo.main as main_module
+    import prismo.waveguide_mesh as mesh_module
+    from _doubles import stub_components
+
+    coords = np.asarray([[0.0, 0.0], [1e-6, 0.0]], dtype=float)
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        mesh_module,
+        "read_mesh_silicon_triangulation",
+        lambda _: np.empty((0, 3), dtype=np.intp),
+    )
+    with pytest.raises(RuntimeError, match="--cold requires"):
+        main_module._run_gradient_validation(
+            r_min=0.05,
+            mesh_path=str(tmp_path / "mesh.msh"),
+            output_dir=str(tmp_path),
+            tolerance=1e-2,
+            n_directions=1,
+            use_containers=False,
+            components=stub_components(),
+            cold=True,
+        )
+
+
+def test_gradient_validation_default_is_warm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import prismo.main as main_module
+    import prismo.waveguide_mesh as mesh_module
+    from _doubles import stub_components
+
+    resets: list[str] = []
+    components = stub_components(
+        reset_chargetransport=lambda: resets.append("reset")
+    )
+    coords = np.asarray(
+        [[0.0, 0.0], [1e-6, 0.0], [2e-6, 0.0], [3e-6, 0.0]], dtype=float
+    )
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        mesh_module,
+        "read_mesh_silicon_triangulation",
+        lambda _: np.empty((0, 3), dtype=np.intp),
+    )
+    main_module._run_gradient_validation(
+        r_min=0.05,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        tolerance=1e-2,
+        n_directions=1,
+        step_sizes=np.asarray([1e-2]),
+        use_containers=False,
+        components=components,
+    )
+    assert resets == []
 
 
 def test_local_pipeline_inputs_keep_the_seeded_junction_under_the_default_filter(

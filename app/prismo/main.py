@@ -16,13 +16,19 @@ import numpy as np
 import typer
 
 if TYPE_CHECKING:
-    from prismo.outputs import GradientValidationResult, ModeField
+    from prismo.outputs import ColdReevaluation, GradientValidationResult, ModeField
 
 app = typer.Typer(name="prismo")
 
 _DEFAULT_OUTPUT_DIR = Path("outputs")
 _DEFAULT_MESH = _DEFAULT_OUTPUT_DIR / "waveguide.msh"
 _MIN_CONTAINER_OBJECTIVE = 1e-12
+# Per-iteration move limit on theta (mirrors ``optimizer.DEFAULT_MOVE_LIMIT``;
+# kept as a literal so ``--help`` never eagerly imports jax/nlopt).
+_DEFAULT_MOVE_LIMIT = 0.05
+_CHECKPOINT_NAME = "checkpoint.json"
+# Live per-iteration doping frames: ``<prefix><iteration>.png`` in the output dir.
+_LIVE_FRAME_PREFIX = "doping_field_"
 
 
 @app.command()
@@ -30,6 +36,11 @@ def run(
     r_min: float = typer.Option(0.05, help="Density filter radius [µm]"),
     max_iter: int = typer.Option(200, help="Max MMA iterations"),
     ftol_rel: float = typer.Option(1e-5, help="Relative tolerance on objective"),
+    move_limit: float = typer.Option(
+        _DEFAULT_MOVE_LIMIT,
+        help="Per-iteration move limit on theta: no design variable moves more "
+        "than this per iteration; halved and retried after a failed solve",
+    ),
     mesh_path: str = typer.Option(
         str(_DEFAULT_MESH),
         help="Path to waveguide .msh file",
@@ -82,6 +93,7 @@ def run(
             no_jit=no_jit,
             use_containers=use_containers,
             components=components,
+            move_limit=move_limit,
         )
     finally:
         if use_containers and components is not None:
@@ -117,6 +129,13 @@ def validate_gradient(
         False,
         "--use-containers",
         help="Run tesseract components via Docker containers",
+    ),
+    cold: bool = typer.Option(
+        False,
+        "--cold",
+        help="Reset the ChargeTransport worker before every finite-difference "
+        "evaluation so the FD reference carries no warm-start path dependence "
+        "(default: warm)",
     ),
 ) -> None:
     """Validate the composed ∂(Δneff)/∂θ gradient against central FD (ticket 06).
@@ -154,6 +173,7 @@ def validate_gradient(
             step_sizes=step_sizes,
             use_containers=use_containers,
             components=components,
+            cold=cold,
         )
     finally:
         if use_containers and components is not None:
@@ -478,6 +498,73 @@ def _optimized_mode_field(
     return ModeField(abs_e=abs_e, coords_um=coords_um, rib_bounds=rib_bounds)
 
 
+def _clear_live_frames(output_dir: str | Path) -> int:
+    """Delete ``doping_field_<n>.png`` frames a previous run left behind.
+
+    The live frames are written one per optimizer iteration; a shorter run
+    after a longer one would otherwise leave stale frames that read as part of
+    its own trajectory (ticket 21). Returns the number of frames removed.
+    """
+    out = Path(output_dir)
+    if not out.is_dir():
+        return 0
+    removed = 0
+    for frame in out.glob(f"{_LIVE_FRAME_PREFIX}*.png"):
+        suffix = frame.stem[len(_LIVE_FRAME_PREFIX) :]
+        if suffix.isdigit():
+            frame.unlink()
+            removed += 1
+    return removed
+
+
+def _reset_chargetransport(components: Any | None) -> bool:
+    """Drop the ChargeTransport worker's warm solutions; ``False`` if no seam."""
+    from prismo.pipeline import default_components
+
+    bundle = components if components is not None else default_components()
+    reset = getattr(bundle, "reset_chargetransport", None)
+    if reset is None:
+        return False
+    reset()
+    return True
+
+
+def _cold_reevaluation(
+    bound_pipeline: Any,
+    rho_opt: np.ndarray,
+    warm_delta_neff: float,
+    components: Any | None,
+) -> ColdReevaluation | None:
+    """Re-solve the reported design cold and compare with the optimizer's value.
+
+    The headline Δneff must be a property of the design, not of the solve
+    history that produced it (ticket 20): the ChargeTransport worker's warm
+    state is dropped, the best design evaluated once more, and both numbers
+    reported. Returns ``None`` (with a note) when no reset seam is bound.
+    """
+    from prismo.outputs import ColdReevaluation
+
+    if not _reset_chargetransport(components):
+        typer.echo(
+            "      Cold re-evaluation skipped: no ChargeTransport reset seam bound."
+        )
+        return None
+    cold_value = float(bound_pipeline(np.asarray(rho_opt, dtype=float)))
+    result = ColdReevaluation(
+        warm_delta_neff=float(warm_delta_neff), cold_delta_neff=cold_value
+    )
+    typer.echo(f"      Delta_n_eff (warm, optimizer) = {result.warm_delta_neff:+.6e}")
+    typer.echo(f"      Delta_n_eff (cold re-solve)   = {result.cold_delta_neff:+.6e}")
+    if not result.passed:
+        typer.echo(
+            "      WARNING: warm/cold Delta_n_eff disagree by "
+            f"{result.rel_discrepancy:.2e} relative (tolerance "
+            f"{result.tolerance:.0e}); the warm optimum depended on the solve "
+            "history, not only on the design."
+        )
+    return result
+
+
 def _run_pipeline(
     r_min: float,
     max_iter: int,
@@ -488,6 +575,7 @@ def _run_pipeline(
     use_containers: bool,
     mesh_size: float | None = None,
     components: Any | None = None,
+    move_limit: float = _DEFAULT_MOVE_LIMIT,
 ) -> None:
     from prismo.optimizer import OptimizationCancelled, optimize_doping
     from prismo.outputs import generate_outputs, plot_live_doping_field
@@ -496,6 +584,10 @@ def _run_pipeline(
 
     typer.echo("=== PRISMO Pipeline ===")
     typer.echo()
+
+    removed = _clear_live_frames(output_dir)
+    if removed:
+        typer.echo(f"      Cleared {removed} live doping frame(s) from a previous run")
 
     typer.echo("[1/3] Preparing pipeline inputs...")
     inputs = build_pipeline_inputs(
@@ -529,7 +621,7 @@ def _run_pipeline(
                 # hands back the raw design vector, but the physics runs on the
                 # density-filtered field, so filter before mapping to doping.
                 theta_tilde = H_np @ theta / H_sum_np
-                name = f"doping_field_{iteration}"
+                name = f"{_LIVE_FRAME_PREFIX}{iteration}"
                 plot_live_doping_field(
                     np.asarray(
                         doping_from_theta(design_nodes.scatter_numpy(theta_tilde))
@@ -549,7 +641,8 @@ def _run_pipeline(
             H_sum=H_sum,
             max_iter=optimization_max_iter,
             ftol_rel=optimization_ftol_rel,
-            min_mma_evaluations=5 if use_containers else 0,
+            move_limit=move_limit,
+            checkpoint_path=Path(output_dir) / _CHECKPOINT_NAME,
             use_jit=not no_jit,
             on_iteration=on_iteration,
             design_transfer=design_transfer,
@@ -558,15 +651,38 @@ def _run_pipeline(
             components=components,
         )
         typer.echo(f"      Optimization complete: {len(history)} iterations")
-        if history:
-            final_delta_neff = history[-1]["delta_n_eff"]
-            typer.echo(f"      Final Delta_n_eff = {final_delta_neff:+.6e}")
-            # VπLπ headline (V·cm): the field-standard modulation efficiency,
-            # reported from Δneff at the fixed -5 V bias (smaller |VπLπ| better).
-            typer.echo(f"      VpiLpi = {vpi_lpi_v_cm(final_delta_neff):+.4e} V·cm")
     except OptimizationCancelled:
         typer.echo("      Optimization cancelled by user.")
         return
+
+    # Bind the *same* pipeline the optimizer drove -- filter, mesh_ref and
+    # transfer included -- for the cold re-evaluation and the figure's finite
+    # differences. Omitting them made the figure probe an unfiltered pipeline
+    # with ChargeTransport on its 1D fallback device, i.e. a different function
+    # than the one that was optimized (ticket 15).
+    bound_pipeline = partial(
+        pipeline_fn,
+        H=H_dense,
+        H_sum=H_sum,
+        mesh_ref=mesh_ref,
+        design_transfer=design_transfer,
+        design_nodes=design_nodes,
+        components=components,
+    )
+
+    cold = None
+    if history:
+        # The reported design is the best one whose physics solved; its warm
+        # value is the best objective in the history (the optimizer only
+        # accepts improving steps, so the last entry may be a rejected trial).
+        warm_delta_neff = max(entry["delta_n_eff"] for entry in history)
+        typer.echo(f"      Best Delta_n_eff (warm) = {warm_delta_neff:+.6e}")
+        cold = _cold_reevaluation(bound_pipeline, rho_opt, warm_delta_neff, components)
+        headline = cold.cold_delta_neff if cold is not None else warm_delta_neff
+        # VπLπ headline (V·cm): the field-standard modulation efficiency,
+        # reported from Δneff at the fixed -5 V bias (smaller |VπLπ| better),
+        # computed from the cold value when available (ticket 20).
+        typer.echo(f"      VpiLpi = {vpi_lpi_v_cm(headline):+.4e} V·cm")
 
     if use_containers:
         # This audits that the containers produced a *live* signal, not that the
@@ -612,20 +728,7 @@ def _run_pipeline(
         # what the figures plot in -- no conversion at this seam.
         mesh_coords=coords,
         geometry=geometry,
-        # Bind the *same* pipeline the optimizer drove -- filter, mesh_ref and
-        # transfer included. Omitting them made the figure's finite differences
-        # probe an unfiltered pipeline with ChargeTransport on its 1D fallback
-        # device, i.e. a different function than the one that was optimized
-        # (ticket 15).
-        pipeline_fn=partial(
-            pipeline_fn,
-            H=H_dense,
-            H_sum=H_sum,
-            mesh_ref=mesh_ref,
-            design_transfer=design_transfer,
-            design_nodes=design_nodes,
-            components=components,
-        ),
+        pipeline_fn=bound_pipeline,
         ftol_rel=optimization_ftol_rel,
         gradient_validation_directions=1 if use_containers else 3,
         gradient_validation_steps=(np.logspace(-4, -2, 3) if use_containers else None),
@@ -639,6 +742,7 @@ def _run_pipeline(
         # mesh elements, leaving the oxide blank instead of Delaunay-smearing
         # the design field across it.
         mesh_triangles=inputs.silicon_triangles,
+        cold_reevaluation=cold,
     )
     for p in plot_paths:
         typer.echo(f"      {p}")
@@ -656,6 +760,7 @@ def _run_gradient_validation(
     use_containers: bool,
     components: Any | None = None,
     step_sizes: np.ndarray | None = None,
+    cold: bool = False,
 ) -> GradientValidationResult:
     """Check the composed gradient at the seeded design and write the figure.
 
@@ -663,6 +768,8 @@ def _run_gradient_validation(
     ``mesh_ref`` (so ChargeTransport solves on the shared 2D grid, not its 1D
     fallback), and design transfer -- into the function the finite-difference
     sweep probes, so the CT adjoint is the thing being proven (audit #7).
+    ``cold`` resets the ChargeTransport worker before every evaluation
+    (ticket 20).
     """
     from prismo.outputs import validate_gradient as validate_gradient_fn
     from prismo.pipeline import pipeline as pipeline_fn
@@ -674,6 +781,15 @@ def _run_gradient_validation(
     inputs = build_pipeline_inputs(r_min, mesh_path, use_containers, components)
 
     typer.echo("[2/2] Checking adjoint against central finite differences...")
+    before_evaluation = None
+    if cold:
+        if not _reset_chargetransport(components):
+            raise RuntimeError(
+                "--cold requires a ChargeTransport backend with a reset seam"
+            )
+        before_evaluation = partial(_reset_chargetransport, components)
+        typer.echo("      Cold start: resetting the ChargeTransport worker before "
+                   "every evaluation")
     bound_pipeline = partial(
         pipeline_fn,
         H=inputs.H_dense,
@@ -690,6 +806,7 @@ def _run_gradient_validation(
         step_sizes=step_sizes,
         tolerance=tolerance,
         output_dir=output_dir,
+        before_evaluation=before_evaluation,
     )
 
     verdict = "PASS" if result.passed else "FAIL"

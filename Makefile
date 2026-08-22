@@ -1,4 +1,4 @@
-.PHONY: help new build test gen-tests data run run-containers validate-gradient validate-gradient-containers benchmark clean
+.PHONY: help new build julia-base images test gen-tests data run run-containers validate-gradient validate-gradient-containers benchmark clean
 
 PYTHON ?= python
 
@@ -7,6 +7,7 @@ help:
 	@echo "  new NAME [RECIPE=jax|pytorch] - Create a new Tesseract component (make new mytess RECIPE=jax)"
 	@echo "  build [NAME]                  - Build all components or a single tesseract (make build mytess)"
 	@echo "  julia-base NAME               - (Re)build the Julia base image for a component (only needed when its julia_env/*.toml change)"
+	@echo "  images                        - Show when each component image was built vs. when its sources last changed (STALE = rebuild)"
 	@echo "  test [NAME]                   - Test all components + app, a single component, or app only"
 	@echo "  gen-tests NAME FILE=case.json - Capture a test case by running an input payload (make gen-tests mytess FILE=in.json)"
 	@echo "  data                          - Pull example data"
@@ -87,6 +88,27 @@ build:
 			exit 1; \
 		fi; \
 	fi
+
+# Image staleness check (ticket 21): an image is STALE when a commit touching
+# its component directory (or components/shared_code) is newer than the image.
+images:
+	@for dir in components/tesseracts/*/; do \
+		name=$$(basename $$dir); \
+		[ "$$name" != ".template" ] || continue; \
+		image="prismo_$$name:latest"; \
+		built=$$(docker image inspect --format '{{.Created}}' "$$image" 2>/dev/null | cut -c1-19); \
+		if [ -z "$$built" ]; then \
+			printf '%-32s not built\n' "$$image"; \
+			continue; \
+		fi; \
+		changed=$$(git log -1 --format='%cI' -- "$$dir" components/shared_code); \
+		commit=$$(git log -1 --format='%h' -- "$$dir" components/shared_code); \
+		built_s=$$(date -d "$${built}Z" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%S' "$$built" +%s 2>/dev/null || echo ""); \
+		changed_s=$$(date -d "$$changed" +%s 2>/dev/null || date -j -f '%Y-%m-%dT%H:%M:%S%z' "$$(echo $$changed | sed 's/:\([0-9][0-9]\)$$/\1/')" +%s 2>/dev/null || echo ""); \
+		if [ -z "$$built_s" ] || [ -z "$$changed_s" ]; then verdict=UNKNOWN; \
+		elif [ "$$built_s" -ge "$$changed_s" ]; then verdict=OK; else verdict=STALE; fi; \
+		printf '%-32s built %sZ  sources last changed %s (%s)  %s\n' "$$image" "$$built" "$$changed" "$$commit" "$$verdict"; \
+	done
 
 test:
 	@run_tesseract_tests() { \

@@ -394,3 +394,67 @@ class TestGenerateOutputs:
                 _stub_pipeline, rho, directions=[d1], output_dir=tmp,
             )
             assert Path(path).exists()
+
+
+class TestColdReevaluation:
+    """Warm/cold Δneff comparison and its convergence-figure annotation (ticket 20)."""
+
+    def test_discrepancy_and_verdict(self):
+        from prismo.outputs import ColdReevaluation
+
+        same = ColdReevaluation(warm_delta_neff=3e-4, cold_delta_neff=3e-4 * (1 + 1e-9))
+        assert same.passed
+        assert same.rel_discrepancy < 1e-8
+        off = ColdReevaluation(warm_delta_neff=2.99e-4, cold_delta_neff=6.5e-5)
+        assert not off.passed
+        assert off.rel_discrepancy == pytest.approx(abs(6.5e-5 - 2.99e-4) / 2.99e-4)
+        zero = ColdReevaluation(warm_delta_neff=0.0, cold_delta_neff=0.0)
+        assert zero.rel_discrepancy == 0.0
+
+    def test_convergence_figure_accepts_the_annotation(self, tmp_path):
+        from prismo.outputs import ColdReevaluation, plot_convergence
+
+        history = [
+            {"iteration": i, "delta_n_eff": 1e-4 * i, "delta_rho": 0.0,
+             "grad_norm": 1.0, "wall_time": float(i)}
+            for i in range(1, 4)
+        ]
+        for cold in (
+            ColdReevaluation(warm_delta_neff=3e-4, cold_delta_neff=3e-4),
+            ColdReevaluation(warm_delta_neff=3e-4, cold_delta_neff=6.5e-5),
+        ):
+            path = plot_convergence(history, output_dir=tmp_path, cold_reevaluation=cold)
+            assert path.exists()
+
+
+import jax.numpy as jnp  # noqa: E402
+
+
+class TestGradientValidationColdHook:
+    """``before_evaluation`` runs before the adjoint and every FD sample."""
+
+    def test_hook_called_before_each_evaluation(self, tmp_path):
+        from prismo.outputs import validate_gradient
+
+        calls: list[str] = []
+
+        def pipeline_fn(rho):
+            calls.append("eval")
+            return jnp.sum(rho**2)
+
+        def before():
+            calls.append("reset")
+
+        steps = np.asarray([1e-3, 1e-2, 1e-1])
+        validate_gradient(
+            pipeline_fn,
+            jnp.asarray([0.1, 0.2, 0.3]),
+            n_directions=2,
+            step_sizes=steps,
+            output_dir=tmp_path,
+            before_evaluation=before,
+        )
+        # Every evaluation is preceded by a reset, and nothing else happens.
+        assert calls[0] == "reset"
+        assert calls.count("reset") == calls.count("eval")
+        assert all(a == "reset" for a, b in zip(calls[::2], calls[1::2], strict=True))

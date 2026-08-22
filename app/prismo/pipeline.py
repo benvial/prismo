@@ -241,15 +241,35 @@ def init_tesseract_containers(
     if ct_scripts_dir:
         ct_volumes.append(f"{Path(ct_scripts_dir).resolve()}:/tesseract/scripts:ro")
 
-    # A refined mesh makes each Newton solve slower, and the component's own
-    # per-request Julia deadline (25 s) is the first thing a refinement study
-    # hits. Forward the host's override into the container so the deadline can
-    # follow the mesh without an image rebuild.
+    # The Julia-side solve budget (``PRISMO_CT_SOLVE_BUDGET_S``, checked inside
+    # the continuation loops) and the Python request-timeout backstop
+    # (``PRISMO_CT_JULIA_TIMEOUT_S``) both live in the ChargeTransport
+    # container; forward the host's overrides so a refinement study can stretch
+    # them without an image rebuild.
     ct_env = {
         name: os.environ[name]
-        for name in ("PRISMO_CT_JULIA_TIMEOUT_S",)
+        for name in ("PRISMO_CT_JULIA_TIMEOUT_S", "PRISMO_CT_SOLVE_BUDGET_S")
         if name in os.environ
     }
+
+    # Dev loop (ticket 21): ``PRISMO_DEV_MOUNTS=1`` bind-mounts the host
+    # ``tesseract_api.py`` and ``prismo_shared`` over both images so a Python
+    # component edit costs a container restart, not a 4-5 GB image rebuild.
+    # See docs/agents/debugging.md.
+    dev_mounts = dev_mounts_requested()
+    gyptis_volumes: list[str] = []
+    gyptis_env: dict[str, str] = {}
+    if dev_mounts:
+        ct_dev_volumes, dev_env = _dev_mount_volumes("chargetransport")
+        gyptis_volumes, _ = _dev_mount_volumes("gyptis")
+        ct_volumes.extend(ct_dev_volumes)
+        ct_env.update(dev_env)
+        gyptis_env.update(dev_env)
+        print(
+            "      PRISMO_DEV_MOUNTS=1: running the HOST tesseract_api.py and "
+            "prismo_shared in both containers (image copies are shadowed)",
+            flush=True,
+        )
 
     closers: list[Callable[[], None]] = []
     try:
@@ -264,14 +284,13 @@ def init_tesseract_containers(
         _close_all(closers)
         raise RuntimeError("Failed to start ChargeTransport container") from exc
 
-    gyptis_env = (
-        {"PRISMO_GYPTIS_MESH_SIZE": repr(float(mesh_size))}
-        if mesh_size is not None
-        else None
-    )
+    if mesh_size is not None:
+        gyptis_env["PRISMO_GYPTIS_MESH_SIZE"] = repr(float(mesh_size))
     try:
         gyptis_tesseract = Tesseract.from_image(
-            "prismo_gyptis:latest", environment=gyptis_env
+            "prismo_gyptis:latest",
+            volumes=gyptis_volumes or None,
+            environment=gyptis_env or None,
         )
         gyptis_tesseract.serve()
         closers.append(gyptis_tesseract.teardown)
@@ -293,6 +312,9 @@ def init_tesseract_containers(
         ),
         write_mesh=partial(write_gyptis_mesh, container=gyptis_tesseract),
         mode_field=partial(read_gyptis_mode_field, container=gyptis_tesseract),
+        reset_chargetransport=partial(
+            reset_chargetransport_worker, container=ct_tesseract
+        ),
         closers=tuple(closers),
     )
 
@@ -300,6 +322,72 @@ def init_tesseract_containers(
 def teardown_containers(components: PipelineComponents) -> None:
     """Stop and remove the running tesseract containers owned by ``components``."""
     components.close()
+
+
+# -- Dev mounts (ticket 21) ------------------------------------------------------
+
+# In-container paths the dev mounts shadow. ``tesseract_api.py`` sits at the
+# image's fixed API path; ``prismo_shared`` cannot be mounted over its
+# ``site-packages`` copy (the two images run different Python versions, so the
+# path differs) and is instead mounted under a dev root that ``PYTHONPATH``
+# puts ahead of ``site-packages``.
+_DEV_API_MOUNT = "/tesseract/tesseract_api.py"
+_DEV_PYTHONPATH_ROOT = "/prismo_dev"
+_SHARED_CODE_DIR = _COMPONENTS_DIR.parent / "shared_code"
+
+
+def dev_mounts_requested() -> bool:
+    """``PRISMO_DEV_MOUNTS`` is set to a truthy value (``1``/``true``/``yes``)."""
+    return os.environ.get("PRISMO_DEV_MOUNTS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _dev_mount_volumes(component: str) -> tuple[list[str], dict[str, str]]:
+    """Bind mounts + env that run the host ``tesseract_api.py``/``prismo_shared``.
+
+    Returns ``(volumes, environment)`` for one component's container. The dev
+    ``PYTHONPATH`` is merged into the caller's env rather than replacing it.
+    """
+    api_path = (_COMPONENTS_DIR / component / "tesseract_api.py").resolve()
+    shared_path = (_SHARED_CODE_DIR / "prismo_shared").resolve()
+    if not api_path.is_file():
+        raise RuntimeError(f"PRISMO_DEV_MOUNTS: {api_path} does not exist")
+    if not shared_path.is_dir():
+        raise RuntimeError(f"PRISMO_DEV_MOUNTS: {shared_path} does not exist")
+    volumes = [
+        f"{api_path}:{_DEV_API_MOUNT}:ro",
+        f"{shared_path}:{_DEV_PYTHONPATH_ROOT}/prismo_shared:ro",
+    ]
+    return volumes, {"PYTHONPATH": _DEV_PYTHONPATH_ROOT}
+
+
+def reset_chargetransport_worker(
+    *, container: Any | None = None, local_api: Any | None = None
+) -> None:
+    """Drop the ChargeTransport worker's warm solutions (ticket 20).
+
+    The next solve is then a function of the doping alone -- the cold
+    continuation from near-intrinsic equilibrium and the bias ramp -- rather
+    than of the Newton starting points the previous designs left behind.
+    Carried as the ``reset`` operation of the component's ``apply`` endpoint.
+    """
+
+    def from_container(tess: Any) -> None:
+        tess.apply({"operation": "reset"})
+
+    def from_local(api: Any) -> None:
+        api.apply(api.InputSchema(operation="reset"))
+
+    invoke_tesseract(
+        container,
+        local_api,
+        container_call=from_container,
+        local_call=from_local,
+    )
 
 
 def _gyptis_query(
@@ -846,6 +934,9 @@ class PipelineComponents:
     mode_field: (
         Callable[[np.ndarray, float], tuple[np.ndarray, np.ndarray]] | None
     ) = None
+    # Drops the ChargeTransport worker's warm solutions so the next solve is
+    # cold (ticket 20). ``None`` when no ChargeTransport backend is bound.
+    reset_chargetransport: Callable[[], None] | None = None
     closers: tuple[Callable[[], None], ...] = field(default=())
 
     def close(self) -> None:
@@ -895,6 +986,11 @@ def build_default_components() -> PipelineComponents:
         mode_field=(
             partial(read_gyptis_mode_field, local_api=gyptis_api)
             if gyptis_api is not None
+            else None
+        ),
+        reset_chargetransport=(
+            partial(reset_chargetransport_worker, local_api=ct_api)
+            if ct_api is not None
             else None
         ),
         closers=tuple(closers),

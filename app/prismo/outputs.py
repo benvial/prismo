@@ -99,10 +99,47 @@ def _pcolormesh_field(
     return ax.pcolormesh(x_values, y_values, field, shading="nearest", **kwargs)
 
 
+# Relative warm/cold discrepancy above which the reported optimum is flagged
+# (ticket 20). The ChargeTransport Newton solves converge to 1e-10 and the
+# eigensolve is deterministic, so a warm and a cold solve of the same design
+# agree to ~1e-8 relative when the steady state is unique; anything above this
+# means the warm value depended on the solve history, not on the design.
+COLD_REEVALUATION_RTOL = 1e-4
+
+
+@dataclass(frozen=True)
+class ColdReevaluation:
+    """Warm-vs-cold Δneff of the reported design (ticket 20).
+
+    ``warm_delta_neff`` is the value the optimizer saw (solved from the
+    neighbouring designs' Newton starting points); ``cold_delta_neff`` is the
+    same design solved after the ChargeTransport worker dropped every warm
+    solution. The headline (and VπLπ) is the cold value.
+    """
+
+    warm_delta_neff: float
+    cold_delta_neff: float
+    tolerance: float = COLD_REEVALUATION_RTOL
+
+    @property
+    def rel_discrepancy(self) -> float:
+        """``|cold - warm| / max(|cold|, |warm|)`` (0 when both are zero)."""
+        scale = max(abs(self.cold_delta_neff), abs(self.warm_delta_neff))
+        if scale == 0.0:
+            return 0.0
+        return abs(self.cold_delta_neff - self.warm_delta_neff) / scale
+
+    @property
+    def passed(self) -> bool:
+        """Whether the discrepancy is within the tolerance."""
+        return self.rel_discrepancy <= self.tolerance
+
+
 def plot_convergence(
     history: list[dict],
     output_dir: str | Path | None = None,
     ftol_rel: float | None = None,
+    cold_reevaluation: ColdReevaluation | None = None,
 ) -> Path:
     """Convergence plot: signed delta_n_eff and reported VpiLpi vs iteration.
 
@@ -110,6 +147,9 @@ def plot_convergence(
         history: Per-iteration records from ``optimize_doping``.
         output_dir: Directory to write ``convergence.pdf``.
         ftol_rel: MMA relative tolerance for the marker annotation.
+        cold_reevaluation: Warm/cold Δneff of the reported design; drawn as a
+            marker at the last iteration, with a warning annotation when the
+            discrepancy exceeds its tolerance (ticket 20).
 
     Returns:
         Path to the saved figure.
@@ -137,6 +177,23 @@ def plot_convergence(
             y=values[-1], color="#d7191c", linestyle="--", alpha=0.6,
             label="final value",
         )
+
+        if cold_reevaluation is not None:
+            ax.plot(
+                [iters[-1]], [cold_reevaluation.cold_delta_neff],
+                marker="*", markersize=11, linestyle="none", color="#7b3294",
+                label=r"$\Delta n_{\mathrm{eff}}$ (cold re-evaluation)",
+                zorder=5,
+            )
+            if not cold_reevaluation.passed:
+                ax.annotate(
+                    "WARNING: warm/cold mismatch "
+                    f"{cold_reevaluation.rel_discrepancy:.1e} "
+                    f"> {cold_reevaluation.tolerance:.0e}",
+                    xy=(0.02, 0.97), xycoords="axes fraction",
+                    ha="left", va="top", fontsize=8, color="#d7191c",
+                    bbox={"boxstyle": "round", "fc": "white", "ec": "#d7191c"},
+                )
 
         if ftol_rel is not None and len(values) >= 2:
             threshold = abs(values[-1]) * ftol_rel
@@ -563,14 +620,24 @@ def _gradient_validation_curves(
     rho: jax.Array,
     directions: list[jax.Array],
     step_sizes: np.ndarray,
+    before_evaluation: Callable[[], None] | None = None,
 ) -> list[tuple[int, np.ndarray, list[float]]]:
     """Central-FD relative-error curve per direction against the JAX adjoint.
 
     Returns ``(index, feasible_steps, errors)`` for every direction that has at
     least one feasible step. The adjoint's directional derivative is
     ``grad · direction``; the finite-difference estimate is the central
-    difference at each step.
+    difference at each step. ``before_evaluation`` runs before every pipeline
+    evaluation (the adjoint one included) -- the cold-start hook of ticket 20,
+    which resets the ChargeTransport worker so no FD sample inherits the
+    previous sample's Newton starting point.
     """
+
+    def _prepare() -> None:
+        if before_evaluation is not None:
+            before_evaluation()
+
+    _prepare()
     grad_exact = jax.grad(pipeline_fn)(rho)
     curves: list[tuple[int, np.ndarray, list[float]]] = []
     for i, direction in enumerate(directions):
@@ -589,7 +656,9 @@ def _gradient_validation_curves(
         denom = max(float(abs(exact_val)), 1e-30)
         errors = []
         for h in feasible_steps:
+            _prepare()
             f_plus = pipeline_fn(rho + h * direction)
+            _prepare()
             f_minus = pipeline_fn(rho - h * direction)
             fd_val = (f_plus - f_minus) / (2.0 * h)
             errors.append(float(abs(fd_val - exact_val)) / denom)
@@ -636,6 +705,7 @@ def _gradient_validation_setup(
     n_directions: int,
     step_sizes: np.ndarray | None,
     output_dir: str | Path | None,
+    before_evaluation: Callable[[], None] | None = None,
 ) -> tuple[Path, list[tuple[int, np.ndarray, list[float]]], np.ndarray, int]:
     """Shared setup for the plotting and pass/fail entry points.
 
@@ -650,7 +720,9 @@ def _gradient_validation_setup(
     if step_sizes is None:
         step_sizes = np.logspace(-6, -1, 20)
 
-    curves = _gradient_validation_curves(pipeline_fn, rho, directions, step_sizes)
+    curves = _gradient_validation_curves(
+        pipeline_fn, rho, directions, step_sizes, before_evaluation
+    )
     if not curves:
         raise ValueError("Gradient validation has no feasible finite-difference steps")
     return out, curves, step_sizes, n_directions
@@ -699,6 +771,7 @@ def validate_gradient(
     step_sizes: np.ndarray | None = None,
     tolerance: float = GRADIENT_VALIDATION_TOLERANCE,
     output_dir: str | Path | None = None,
+    before_evaluation: Callable[[], None] | None = None,
 ) -> GradientValidationResult:
     """Check the adjoint against central FD and gate on a stated tolerance.
 
@@ -719,13 +792,22 @@ def validate_gradient(
             from ``1e-6`` to ``1e-1``.
         tolerance: Acceptance bar on the worst per-direction best relative error.
         output_dir: Directory to write ``gradient_validation.pdf``.
+        before_evaluation: Hook run before every pipeline evaluation (ticket
+            20's cold-start option: reset the ChargeTransport worker so the FD
+            reference is not polluted by warm-start path dependence).
 
     Returns:
         A :class:`GradientValidationResult` with the per-direction best errors,
         the worst of them, the pass/fail verdict, and the figure path.
     """
     out, curves, step_sizes, n_directions = _gradient_validation_setup(
-        pipeline_fn, rho, directions, n_directions, step_sizes, output_dir
+        pipeline_fn,
+        rho,
+        directions,
+        n_directions,
+        step_sizes,
+        output_dir,
+        before_evaluation,
     )
 
     best_rel_errors = [min(errors) for _, _, errors in curves]
@@ -757,6 +839,7 @@ def generate_outputs(
     mode_field: ModeField | None = None,
     output_dir: str | Path | None = None,
     mesh_triangles: np.ndarray | None = None,
+    cold_reevaluation: ColdReevaluation | None = None,
 ) -> list[Path]:
     """Generate the headline output figures (ticket 07).
 
@@ -779,6 +862,8 @@ def generate_outputs(
         mode_field: Tracked optical mode ``|E|`` from the gyptis backend.
             Skipped if ``None`` (no gyptis backend bound).
         output_dir: Output directory (default: ``outputs/``).
+        cold_reevaluation: Warm/cold Δneff of the reported design, annotated
+            on the convergence figure (ticket 20). ``None`` draws nothing.
 
     Returns:
         List of paths to the generated plot files.
@@ -786,7 +871,12 @@ def generate_outputs(
     out = _ensure_output_dir(output_dir)
     paths: list[Path] = []
 
-    conv = plot_convergence(history, output_dir=out, ftol_rel=ftol_rel)
+    conv = plot_convergence(
+        history,
+        output_dir=out,
+        ftol_rel=ftol_rel,
+        cold_reevaluation=cold_reevaluation,
+    )
     paths.append(conv)
 
     doping = plot_doping_field(

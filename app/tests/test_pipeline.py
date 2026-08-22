@@ -1102,6 +1102,7 @@ def _fake_container_env(monkeypatch) -> dict[str, object]:
                 captured["ct_volumes"] = volumes
                 captured["ct_environment"] = environment
             else:
+                captured["gyptis_volumes"] = volumes
                 captured["gyptis_environment"] = environment
             return cls(image, volumes, environment)
 
@@ -1116,6 +1117,9 @@ def _fake_container_env(monkeypatch) -> dict[str, object]:
         "tesseract_core",
         types.SimpleNamespace(Tesseract=FakeTesseract),
     )
+    # The dev-mount switch is a host-environment knob; tests opt in explicitly.
+    monkeypatch.delenv("PRISMO_DEV_MOUNTS", raising=False)
+    monkeypatch.delenv("PRISMO_CT_SOLVE_BUDGET_S", raising=False)
     # Keep the component builders from touching the fake containers further.
     monkeypatch.setattr(
         "prismo.pipeline.build_chargetransport_component",
@@ -1234,6 +1238,79 @@ class TestChargeTransportMeshDelivery:
         init_tesseract_containers(mesh_dir=tmp_path / "outputs")
 
         assert captured["ct_environment"] == {"PRISMO_CT_JULIA_TIMEOUT_S": "600"}
+
+    def test_init_forwards_the_ct_solve_budget_override(self, monkeypatch, tmp_path):
+        """The Julia-side solve budget (ticket 18) follows the host override too."""
+        captured = _fake_container_env(monkeypatch)
+        monkeypatch.setenv("PRISMO_CT_SOLVE_BUDGET_S", "300")
+
+        init_tesseract_containers(mesh_dir=tmp_path / "outputs")
+
+        assert captured["ct_environment"] == {"PRISMO_CT_SOLVE_BUDGET_S": "300"}
+
+    def test_dev_mounts_shadow_both_component_apis(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """``PRISMO_DEV_MOUNTS=1`` mounts the host api + prismo_shared (ticket 21)."""
+        import prismo.pipeline as pl
+
+        captured = _fake_container_env(monkeypatch)
+        monkeypatch.setenv("PRISMO_DEV_MOUNTS", "1")
+
+        init_tesseract_containers(mesh_dir=tmp_path / "outputs")
+
+        ct_api = (pl._COMPONENTS_DIR / "chargetransport" / "tesseract_api.py").resolve()
+        gy_api = (pl._COMPONENTS_DIR / "gyptis" / "tesseract_api.py").resolve()
+        shared = (pl._SHARED_CODE_DIR / "prismo_shared").resolve()
+        assert f"{ct_api}:{pl._DEV_API_MOUNT}:ro" in captured["ct_volumes"]
+        assert f"{shared}:{pl._DEV_PYTHONPATH_ROOT}/prismo_shared:ro" in (
+            captured["ct_volumes"]
+        )
+        assert captured["gyptis_volumes"] == [
+            f"{gy_api}:{pl._DEV_API_MOUNT}:ro",
+            f"{shared}:{pl._DEV_PYTHONPATH_ROOT}/prismo_shared:ro",
+        ]
+        # The dev PYTHONPATH joins the other knobs instead of replacing them.
+        assert captured["ct_environment"]["PYTHONPATH"] == pl._DEV_PYTHONPATH_ROOT
+        assert captured["gyptis_environment"]["PYTHONPATH"] == pl._DEV_PYTHONPATH_ROOT
+        assert "PRISMO_DEV_MOUNTS=1" in capsys.readouterr().out
+
+    def test_dev_mounts_keep_the_mesh_size_knob(self, monkeypatch, tmp_path):
+        captured = _fake_container_env(monkeypatch)
+        monkeypatch.setenv("PRISMO_DEV_MOUNTS", "1")
+
+        init_tesseract_containers(mesh_dir=tmp_path / "outputs", mesh_size=0.015)
+
+        assert captured["gyptis_environment"] == {
+            "PYTHONPATH": "/prismo_dev",
+            "PRISMO_GYPTIS_MESH_SIZE": "0.015",
+        }
+
+    def test_dev_mounts_off_by_default(self, monkeypatch):
+        from prismo.pipeline import dev_mounts_requested
+
+        monkeypatch.delenv("PRISMO_DEV_MOUNTS", raising=False)
+        assert not dev_mounts_requested()
+        monkeypatch.setenv("PRISMO_DEV_MOUNTS", "0")
+        assert not dev_mounts_requested()
+        monkeypatch.setenv("PRISMO_DEV_MOUNTS", "1")
+        assert dev_mounts_requested()
+
+    def test_reset_reaches_the_ct_container_as_an_operation(self):
+        """The reset seam sends the ``reset`` operation to the CT backend."""
+        from prismo.pipeline import reset_chargetransport_worker
+
+        class RecordingTesseract:
+            def __init__(self):
+                self.inputs = None
+
+            def apply(self, inputs):
+                self.inputs = inputs
+                return {"electrons": [], "holes": []}
+
+        recorder = RecordingTesseract()
+        reset_chargetransport_worker(container=recorder)
+        assert recorder.inputs == {"operation": "reset"}
 
 
 class TestDesignNodes:
