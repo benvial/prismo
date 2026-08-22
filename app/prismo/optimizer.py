@@ -1,10 +1,11 @@
-"""NLopt MMA optimization loop for the PRISMO pipeline.
+"""Move-limited MMA optimization loop for the PRISMO pipeline.
 
-Wraps the JAX-differentiable pipeline in an NLopt MMA optimizer.
+Wraps the JAX-differentiable pipeline in NLopt's MMA, one fresh MMA subproblem
+per outer step inside a move-limit box (ticket 19).
 Design variables: the signed design field theta in [-1, 1], one entry per
 design node (the silicon nodes of the shared mesh; see ``pipeline.DesignNodes``).
 Objective: maximize signed delta_n_eff (or minimize -delta_n_eff).
-Ref: ticket 15.
+Ref: tickets 15, 19.
 """
 
 from __future__ import annotations
@@ -32,27 +33,54 @@ from prismo.pipeline import (
 
 _HistoryEntry = dict[str, Any]
 
-# Below this the seed objective is treated as numerically indistinguishable
-# from zero and normalisation is skipped rather than amplifying noise.
+# Below this the objective is treated as numerically indistinguishable from
+# zero and relative measures (ftol, gradient scaling) fall back to absolute ones
+# rather than amplifying noise.
 _OBJECTIVE_SCALE_FLOOR = 1e-30
 
-# Consecutive evaluations at a bitwise-identical design before the loop is
-# declared stalled. MMA's inner conservative loop legitimately re-proposes a
-# point a couple of times; past that it is looping, and every repeat costs a
-# full multiphysics solve.
-_MAX_STALLED_EVALUATIONS = 5
+# Per-iteration move limit on theta (ticket 19). Every outer step runs MMA
+# inside the box ``x ± move_limit`` intersected with ``[-1, 1]``, so no design
+# variable moves more than this in one iteration whatever MMA's asymptotes
+# would do. With NLopt's unconstrained MMA the trust region grew by 1.2x per
+# consistent iteration while the conservativeness decayed 10x, and from
+# iteration ~8 every step moved every node 0.9 sigma: 13-16 junction flips per
+# iteration, max |N| from 3e17 to the 9.9e18 rail in ten iterations, and an
+# unsolvable design at iteration 11.
+DEFAULT_MOVE_LIMIT = 0.05
+
+# A failed physics solve means "step too large": the move limit is halved and
+# the step re-proposed from the same iterate. Likewise a step that does not
+# improve the objective. This bounds the consecutive halvings before the loop
+# declares the iterate stalled (0.05 / 2^8 ~ 2e-4 on theta, well below any
+# step the physics can resolve).
+DEFAULT_MAX_MOVE_HALVINGS = 8
+
+# NLopt's MMA sizes its subproblem move from the gradient relative to its
+# initial conservativeness ``rho = 1``: the step is ~sigma for ``|g|·sigma >>
+# 1`` and ~``|g|·sigma``-proportional below. The physical gradient (~1e-4 per
+# node) would produce a first step of ~1e-7 and the design would never move, so
+# the objective handed to each fresh MMA instance is scaled so that the
+# steepest variable sees ``|g|·move_limit`` equal to this target -- a
+# normalised gradient-weighted step that reaches ~70 % of the box for the
+# steepest node and proportionally less for the rest. The maximiser of a
+# positively-scaled objective is unchanged; history and printing stay physical.
+_MMA_GRADIENT_SCALE_TARGET = 10.0
+
+# One trial evaluation per outer MMA step: the instance evaluates the (cached)
+# iterate, proposes one point inside the box, and returns. Accept/shrink is
+# decided here, not by MMA's inner conservativeness loop, so every physics
+# solve is one optimizer iteration.
+_TRIALS_PER_STEP = 1
 
 
-class _StopOptimization(Exception):
-    """Internal: end the NLopt loop and keep the best feasible design.
+class _TrialFailed(Exception):
+    """Internal: the physics solve at the proposed trial point raised.
 
-    NLopt has no way to reject a trial point, so a design whose physics solve
-    diverges cannot be handed back as a value without lying to MMA about the
-    function. Feeding it a fabricated penalty poisons MMA's asymptote update and
-    it converges on whatever basin it lands in -- observed driving a run from
-    Delta_neff=+3.4e-4 to a wrong-polarity -3.8e-4 and then re-proposing an
-    identical design forever. Stopping and keeping the best feasible design is
-    the honest outcome.
+    NLopt has no way to reject a trial point, and feeding MMA a fabricated
+    penalty poisons its asymptote update (observed driving a run from
+    Delta_neff=+3.4e-4 to a wrong-polarity -3.8e-4). The step is instead
+    treated as too large: the MMA instance is abandoned, the move limit halved,
+    and a new step proposed from the same iterate.
     """
 
 
@@ -71,7 +99,9 @@ def optimize_doping(
     *,
     max_iter: int = 200,
     ftol_rel: float = 1e-3,
-    min_mma_evaluations: int = 0,
+    move_limit: float = DEFAULT_MOVE_LIMIT,
+    max_move_halvings: int = DEFAULT_MAX_MOVE_HALVINGS,
+    checkpoint_path: str | Path | None = None,
     use_jit: bool = True,
     on_iteration: Callable[[int, np.ndarray], None] | None = None,
     design_transfer: jax.Array | None = None,
@@ -79,7 +109,7 @@ def optimize_doping(
     mesh_ref: MeshRef | None = None,
     components: PipelineComponents | None = None,
 ) -> tuple[np.ndarray, list[_HistoryEntry]]:
-    """Run the NLopt MMA optimization loop.
+    """Run the move-limited MMA optimization loop.
 
     Args:
         initial_rho: Starting signed design field ``(n_design,)`` in ``[-1, 1]``
@@ -99,13 +129,20 @@ def optimize_doping(
             (requires ``gmsh``).
         r_min: Filter radius in micrometres -- the unit the shared mesh's
             coordinates are authored in (default 0.05, i.e. 50 nm).
-        max_iter: Maximum MMA iterations.
-        ftol_rel: Relative tolerance on the objective for early stopping.
-        min_mma_evaluations: Minimum objective evaluations completed by MMA
-            before falling back to CCSAQ after a roundoff-limited solve.
+        max_iter: Maximum number of physics evaluations (optimizer iterations).
+        ftol_rel: Relative tolerance on the objective: the loop stops once an
+            accepted full-move-limit step improves the objective by less than
+            this fraction.
+        move_limit: Per-iteration move limit on theta: no design variable
+            moves more than this in one iteration (ticket 19).
+        max_move_halvings: Consecutive halvings of the move limit (after failed
+            or non-improving steps) before the iterate is declared stalled.
+        checkpoint_path: Where to write ``{"rho_opt", "history", ...}`` after
+            every evaluation, so a killed run still yields a figure. ``None``
+            writes no checkpoint.
         use_jit: JIT-compile combined objective and gradient computation.
         on_iteration: Optional callback receiving an iteration number and its
-            candidate density field immediately before its solver evaluation.
+            candidate design field immediately before its solver evaluation.
         design_transfer: Dense ``(n_design_cells, n_nodes)`` mesh-transfer
             matrix carrying the nodal perturbation onto the gyptis design
             cells. ``None`` maps the perturbation node-for-node (identity).
@@ -120,12 +157,15 @@ def optimize_doping(
             in-process components (see ``pipeline``).
 
     Returns:
-        ``(rho_opt, history)`` where ``rho_opt`` is the optimized design
-        vector and ``history`` is a list of per-iteration records.
+        ``(rho_opt, history)`` where ``rho_opt`` is the best design whose
+        physics solved and ``history`` is a list of per-evaluation records.
 
     Raises:
         OptimizationCancelled: If the user interrupts with Ctrl-C.
+        ValueError: On a non-positive move limit or missing sizing inputs.
     """
+    if move_limit <= 0.0:
+        raise ValueError("move_limit must be positive")
     if initial_rho is None:
         if n_nodes is None:
             raise ValueError("initial_rho or n_nodes must be provided")
@@ -166,9 +206,9 @@ def optimize_doping(
         value_and_grad_fn = jax.jit(value_and_grad_fn)
 
     history: list[_HistoryEntry] = []
-    prev_rho: np.ndarray | None = None
     cancelled: list[bool] = [False]
     t_start = time.perf_counter()
+    checkpoint = Path(checkpoint_path) if checkpoint_path is not None else None
 
     def _sigint_handler(signum: int, frame: Any) -> None:
         cancelled[0] = True
@@ -176,169 +216,209 @@ def optimize_doping(
 
     prev_handler = signal.signal(signal.SIGINT, _sigint_handler)
 
-    try:
-        # NLopt's MMA sizes its move from the magnitude of the objective it is
-        # handed: the subproblem step scales linearly with f, so the physical
-        # Delta_n_eff (~1e-4) produces a first step of ~1e-7 and ftol_rel fires
-        # before the design has moved at all -- the run "converges" at the seed.
-        # Normalise so MMA sees an O(1) objective. ftol_rel is relative and the
-        # maximiser of a positively-scaled objective is unchanged, so this moves
-        # only the conditioning; history and printing stay physical.
-        objective_scale: list[float] = []
+    # The current iterate and its physics; ``x`` is always the best design
+    # whose physics solved, since a step is only accepted when it improves.
+    x = initial_rho.copy()
+    f_x = 0.0
+    g_x = np.zeros(n_nodes)
+    delta = float(move_limit)
+    halvings = 0
+    stop_reason = "max_iter reached"
 
-        # Best design whose physics actually solved, so a run that stops early
-        # still reports a real optimum rather than the trial that broke it.
-        best_feasible: list[tuple[float, np.ndarray]] = []
-        stalled = [0]
+    def _evaluate(
+        rho_np: np.ndarray, step_from: np.ndarray | None
+    ) -> tuple[float, np.ndarray]:
+        """One physics evaluation: history, printing, checkpoint. Raises on failure."""
+        callback_started_at = time.perf_counter()
+        iter_count = len(history) + 1
+        if on_iteration is not None:
+            on_iteration(iter_count, rho_np.copy())
+        value, grad = value_and_grad_fn(jnp.asarray(rho_np))
+        f_val = float(value)
+        grad_phys = np.asarray(grad, dtype=float)
+        callback_time = time.perf_counter() - callback_started_at
+
+        delta_rho = 0.0
+        max_step = 0.0
+        if step_from is not None:
+            delta_rho = float(np.linalg.norm(rho_np - step_from))
+            max_step = float(np.max(np.abs(rho_np - step_from)))
+        g_norm = float(np.linalg.norm(grad_phys))
+        wall = time.perf_counter() - t_start
+
+        history.append(
+            {
+                "iteration": iter_count,
+                "delta_n_eff": f_val,
+                "delta_rho": delta_rho,
+                "max_step": max_step,
+                "move_limit": delta,
+                "grad_norm": g_norm,
+                "wall_time": wall,
+                "callback_time": callback_time,
+            }
+        )
+        print(
+            f"iter {iter_count:4d}  "
+            f"Δneff={f_val:+.6e}  "
+            f"‖Δρ‖={delta_rho:.4e}  "
+            f"max|Δθ|={max_step:.3e}  "
+            f"Δ={delta:.3e}  "
+            f"‖∇f‖={g_norm:.4e}  "
+            f"callback={callback_time:.1f}s  "
+            f"wall={wall:.1f}s",
+            # Each iteration is minutes of solver time; without an explicit
+            # flush the block-buffered stream hides all progress until exit.
+            flush=True,
+        )
+        return f_val, grad_phys
+
+    def _checkpoint() -> None:
+        if checkpoint is not None:
+            _save_checkpoint(x, history, checkpoint, move_limit=delta)
+
+    def _step_objective(
+        x_k: np.ndarray,
+        f_k: float,
+        g_k: np.ndarray,
+        scale: float,
+        trial: list[tuple[np.ndarray, float, np.ndarray]],
+    ) -> Callable[[np.ndarray, np.ndarray], float]:
+        """NLopt objective for one outer step from the iterate ``x_k``.
+
+        Serves the iterate itself from cache, evaluates the physics at the one
+        trial point MMA proposes (recording it in ``trial``), and converts a
+        failed solve into ``_TrialFailed`` so the step can be shrunk.
+        """
 
         def _obj(rho_np: np.ndarray, grad_out: np.ndarray) -> float:
-            nonlocal prev_rho
-
             if cancelled[0]:
                 grad_out[:] = 0.0
                 return 0.0
-
-            # Checked before the solve: a repeat costs a full multiphysics
-            # evaluation and tells us nothing new.
-            if prev_rho is not None and np.array_equal(rho_np, prev_rho):
-                stalled[0] += 1
-                if stalled[0] >= _MAX_STALLED_EVALUATIONS:
-                    raise _StopOptimization(
-                        f"design unchanged over {stalled[0]} consecutive evaluations"
-                    )
-            else:
-                stalled[0] = 0
-
-            callback_started_at = time.perf_counter()
-            iter_count = len(history) + 1
-            if on_iteration is not None:
-                on_iteration(iter_count, rho_np.copy())
-            rho = jnp.asarray(rho_np)
+            if np.array_equal(rho_np, x_k):
+                grad_out[:] = g_k * scale
+                return f_k * scale
             try:
-                value, grad = value_and_grad_fn(rho)
+                f_val, grad_phys = _evaluate(rho_np, x_k)
             except Exception as exc:
-                # Nothing feasible to fall back to: the seed itself is broken,
-                # so surface that rather than pretending the run can continue.
-                if not best_feasible:
-                    raise
-                raise _StopOptimization(
-                    f"physics solve failed at evaluation {iter_count} "
+                raise _TrialFailed(
+                    f"physics solve failed at evaluation {len(history) + 1} "
                     f"({type(exc).__name__}: {exc})"
                 ) from exc
-
-            f_val = float(value)
-            grad_phys = np.asarray(grad)
-
-            if not objective_scale:
-                objective_scale.append(
-                    1.0 / abs(f_val) if abs(f_val) > _OBJECTIVE_SCALE_FLOOR else 1.0
-                )
-            scale = objective_scale[0]
-
+            finally:
+                _checkpoint()
+            trial.append((rho_np.copy(), f_val, grad_phys))
             grad_out[:] = grad_phys * scale
-            if not best_feasible or f_val > best_feasible[0][0]:
-                best_feasible[:] = [(f_val, rho_np.copy())]
-            callback_time = time.perf_counter() - callback_started_at
-
-            delta = 0.0
-            if prev_rho is not None:
-                delta = float(np.linalg.norm(rho_np - prev_rho))
-            g_norm = float(np.linalg.norm(grad_phys))
-            wall = time.perf_counter() - t_start
-
-            history.append(
-                {
-                    "iteration": iter_count,
-                    "delta_n_eff": float(value),
-                    "delta_rho": delta,
-                    "grad_norm": g_norm,
-                    "wall_time": wall,
-                    "callback_time": callback_time,
-                }
-            )
-            print(
-                f"iter {iter_count:4d}  "
-                f"Δneff={value:+.6e}  "
-                f"‖Δρ‖={delta:.4e}  "
-                f"‖∇f‖={g_norm:.4e}  "
-                f"callback={callback_time:.1f}s  "
-                f"wall={wall:.1f}s",
-                # Each iteration is minutes of solver time; without an explicit
-                # flush the block-buffered stream hides all progress until exit.
-                flush=True,
-            )
-
-            prev_rho = rho_np.copy()
             return f_val * scale
 
-        for algorithm in (nlopt.LD_MMA, nlopt.LD_CCSAQ):
-            opt = nlopt.opt(algorithm, n_nodes)
-            # Signed design field: sign(theta) is the free P/N polarity.
-            opt.set_lower_bounds(-1.0)
-            opt.set_upper_bounds(1.0)
-            # The default MMA step can jump most nodal densities from the
-            # near-intrinsic initial state to the upper bound in one update.
-            # ChargeTransport's continuation then has no nearby physical
-            # state to warm-start, and its reverse-bias Newton solve can
-            # fail.  Limit only the optimizer's initial move: later steps
-            # still adapt and every value in the signed [-1, 1] design
-            # space remains reachable.
-            opt.set_initial_step(0.05)
-            opt.set_max_objective(_obj)
-            opt.set_maxeval(max_iter)
-            opt.set_ftol_rel(ftol_rel)
-            # The CCSAQ fallback continues from the best design whose physics
-            # actually solved rather than restarting at the seed, so a
-            # roundoff-limited MMA run hands over its progress instead of
-            # discarding it.
-            start = best_feasible[0][1] if best_feasible else initial_rho
-            try:
-                rho_opt = opt.optimize(start.copy())
+        return _obj
+
+    try:
+        # The seed must solve: with nothing feasible to fall back to, surface
+        # the failure rather than pretending the run can continue.
+        f_x, g_x = _evaluate(x, None)
+        _checkpoint()
+
+        while len(history) < max_iter:
+            if cancelled[0]:
+                stop_reason = "cancelled"
                 break
-            except _StopOptimization as exc:
-                rho_opt = best_feasible[0][1]
+
+            # Fresh MMA subproblem inside the move-limit box (ticket 19). The
+            # objective is scaled so the steepest variable sees an O(10)
+            # gradient over the box; see ``_MMA_GRADIENT_SCALE_TARGET``.
+            g_max = float(np.max(np.abs(g_x))) if g_x.size else 0.0
+            scale = (
+                _MMA_GRADIENT_SCALE_TARGET / (g_max * delta)
+                if g_max * delta > _OBJECTIVE_SCALE_FLOOR
+                else 1.0
+            )
+            lower = np.maximum(x - delta, -1.0)
+            upper = np.minimum(x + delta, 1.0)
+            trial: list[tuple[np.ndarray, float, np.ndarray]] = []
+
+            opt = nlopt.opt(nlopt.LD_MMA, n_nodes)
+            opt.set_lower_bounds(lower)
+            opt.set_upper_bounds(upper)
+            opt.set_max_objective(_step_objective(x, f_x, g_x, scale, trial))
+            opt.set_maxeval(1 + _TRIALS_PER_STEP)
+            try:
+                opt.optimize(x.copy())
+            except _TrialFailed as exc:
                 print(
-                    f"      Optimization stopped early: {exc}. Keeping the best "
-                    f"feasible design (Delta_n_eff={best_feasible[0][0]:+.6e}).",
+                    f"      {exc}; halving the move limit to {delta / 2:.3e} and "
+                    "re-proposing from the current design.",
                     flush=True,
                 )
+            except nlopt.RoundoffLimited:
+                # The subproblem could not resolve a step at this scale; shrink
+                # like a non-improving step.
+                print(
+                    f"      MMA subproblem roundoff-limited at move limit {delta:.3e}; "
+                    "halving.",
+                    flush=True,
+                )
+
+            if cancelled[0]:
+                stop_reason = "cancelled"
                 break
-            except nlopt.RoundoffLimited as exc:
-                if algorithm == nlopt.LD_MMA and len(history) < min_mma_evaluations:
-                    raise RuntimeError(
-                        "MMA stopped after "
-                        f"{len(history)} evaluations; expected at least "
-                        f"{min_mma_evaluations}"
-                    ) from exc
-                if algorithm == nlopt.LD_CCSAQ:
-                    # Roundoff-limited on the fallback too: keep the best
-                    # feasible design rather than reverting to the seed --
-                    # every entry in best_feasible is a solved improvement.
-                    rho_opt = best_feasible[0][1] if best_feasible else initial_rho
+
+            improved = [t for t in trial if t[1] > f_x]
+            if improved:
+                x_new, f_new, g_new = max(improved, key=lambda t: t[1])
+                rel_gain = (f_new - f_x) / max(abs(f_x), _OBJECTIVE_SCALE_FLOOR)
+                x, f_x, g_x = x_new, f_new, g_new
+                halvings = 0
+                full_step = delta >= float(move_limit)
+                delta = min(delta * 2.0, float(move_limit))
+                _checkpoint()
+                # ftol only judges a step taken at the full move limit: a tiny
+                # gain from a freshly-halved box says the box is small, not that
+                # the objective has converged.
+                if full_step and rel_gain < ftol_rel:
+                    stop_reason = f"converged: relative gain {rel_gain:.2e} < ftol_rel"
                     break
+            else:
+                halvings += 1
+                if halvings > max_move_halvings:
+                    stop_reason = (
+                        f"stalled: no improving step after {max_move_halvings} "
+                        f"move-limit halvings (move limit {delta:.3e})"
+                    )
+                    break
+                delta /= 2.0
     finally:
         signal.signal(signal.SIGINT, prev_handler)
 
     if cancelled[0]:
-        saved = prev_rho if prev_rho is not None else initial_rho
-        _save_checkpoint(saved, history)
+        _checkpoint()
+        where = f" Progress saved to {checkpoint}." if checkpoint is not None else ""
         raise OptimizationCancelled(
-            f"Optimization interrupted by user at iteration {len(history)}."
-            f" Progress saved to outputs/checkpoint.json."
+            f"Optimization interrupted by user at iteration {len(history)}.{where}"
         )
 
-    return rho_opt, history
+    print(f"      Optimization ended: {stop_reason}.", flush=True)
+    return x, history
 
 
 def _save_checkpoint(
     rho: np.ndarray,
     history: list[_HistoryEntry],
+    path: str | Path = Path("outputs") / "checkpoint.json",
+    *,
+    move_limit: float | None = None,
 ) -> None:
-    """Save optimization progress to ``outputs/checkpoint.json``."""
-    out_dir = Path("outputs")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    """Save optimization progress (best design + history) to ``path``.
+
+    Written after every evaluation (ticket 19), so a killed run still yields a
+    convergence figure and a design to plot.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
-        "rho_opt": rho.tolist(),
+        "rho_opt": np.asarray(rho, dtype=float).tolist(),
         "history": [{k: v for k, v in entry.items()} for entry in history],
     }
-    (out_dir / "checkpoint.json").write_text(json.dumps(checkpoint, indent=2))
+    if move_limit is not None:
+        checkpoint["move_limit"] = float(move_limit)
+    path.write_text(json.dumps(checkpoint, indent=2))

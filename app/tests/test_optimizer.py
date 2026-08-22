@@ -3,6 +3,8 @@
 Ref: ticket 15.
 """
 
+import json
+from itertools import pairwise
 from unittest import mock
 
 import numpy as np
@@ -368,17 +370,19 @@ class TestOptimizeDopingThreadsMeshRef:
 
 
 class TestOptimizeDopingSurvivesSolverFailure:
-    """A failed physics solve ends the run on the best feasible design.
+    """A failed physics solve is "step too large": halve the move limit, retry.
 
     ChargeTransport's Newton solve diverges on some designs MMA proposes. NLopt
     cannot be told to reject a trial point, and feeding MMA a fabricated penalty
-    poisons its asymptote update, so the optimizer stops and keeps the best
-    design whose physics actually solved instead of crashing the whole run.
+    poisons its asymptote update, so the optimizer abandons that MMA instance,
+    halves the move limit and re-proposes from the same iterate (ticket 19). It
+    stops only after a bounded number of halvings, keeping the best feasible
+    design.
     """
 
     N_NODES = 4
 
-    def test_keeps_best_feasible_design(self):
+    def test_retries_with_a_smaller_step_after_a_failed_solve(self):
         target = np.full(self.N_NODES, 0.8, dtype=float)
         target_j = jnp.asarray(target)
         calls = {"n": 0}
@@ -395,7 +399,7 @@ class TestOptimizeDopingSurvivesSolverFailure:
         with mock.patch("prismo.optimizer.pipeline", side_effect=mock_pipeline):
             rho_opt, history = optimize_doping(
                 initial_rho=np.full(self.N_NODES, 0.25, dtype=float),
-                max_iter=100,
+                max_iter=60,
                 ftol_rel=1e-8,
                 # Count real evaluations: under JIT the mock is traced once and
                 # the raise would never reach the optimizer at run time.
@@ -403,14 +407,42 @@ class TestOptimizeDopingSurvivesSolverFailure:
                 on_iteration=lambda i, r: candidates.append(r),
             )
 
-        assert calls["n"] == 4, "run continued past the failed solve"
+        assert calls["n"] > 4, "run did not continue past the failed solve"
         # The failed trial is not a physics evaluation, so it stays out of
         # history -- main.py audits every entry there for a valid signal.
-        assert len(history) == 3
-        # The returned design is the best of the three that actually solved.
-        feasible = candidates[:3]
-        best = max(feasible, key=lambda r: -float(np.sum((r - target) ** 2)))
-        np.testing.assert_allclose(rho_opt, best)
+        assert len(history) == calls["n"] - 1
+        # The retry from the same iterate took a smaller step than the failure.
+        failed = candidates[3]
+        before = candidates[2]
+        retry = candidates[4]
+        assert np.max(np.abs(retry - before)) < np.max(np.abs(failed - before))
+        # And the run still reaches the optimum.
+        np.testing.assert_allclose(rho_opt, target, rtol=0.05)
+
+    def test_stops_after_bounded_halvings_keeping_the_best_design(self):
+        """Every step after the seed fails: bounded retries, seed returned."""
+        calls = {"n": 0}
+
+        def mock_pipeline(rho, **kwargs):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("Julia forward solve failed: ConvergenceError()")
+            return jnp.asarray(1.0, dtype=jnp.float64) - jnp.sum(rho**2) * 0.0
+
+        seed = np.full(self.N_NODES, 0.25, dtype=float)
+        with mock.patch("prismo.optimizer.pipeline", side_effect=mock_pipeline):
+            rho_opt, history = optimize_doping(
+                initial_rho=seed,
+                max_iter=100,
+                use_jit=False,
+                max_move_halvings=4,
+            )
+
+        # Seed + at most one failed trial per halving level (4 halvings + the
+        # first attempt), then stop.
+        assert calls["n"] <= 1 + 4 + 1
+        assert len(history) == 1
+        np.testing.assert_allclose(rho_opt, seed)
 
     def test_failure_on_the_seed_still_raises(self):
         def mock_pipeline(rho, **kwargs):
@@ -446,3 +478,115 @@ class TestOptimizeDopingSurvivesSolverFailure:
 
         assert calls["n"] < 20, f"stall guard did not fire ({calls['n']} solves)"
         assert rho_opt.shape == (self.N_NODES,)
+
+
+class TestMoveLimit:
+    """No iteration moves any design variable by more than the move limit."""
+
+    N_NODES = 6
+
+    @staticmethod
+    def _quadratic(target: np.ndarray):
+        target_j = jnp.asarray(target)
+
+        def mock_pipeline(rho, **kwargs):
+            return -jnp.sum((rho - target_j) ** 2)
+
+        return mock_pipeline
+
+    def test_every_step_respects_the_move_limit(self):
+        target = np.array([0.9, -0.9, 0.5, -0.5, 0.0, 0.25])
+        candidates: list[np.ndarray] = []
+        move_limit = 0.07
+
+        with mock.patch(
+            "prismo.optimizer.pipeline", side_effect=self._quadratic(target)
+        ):
+            rho_opt, history = optimize_doping(
+                initial_rho=np.zeros(self.N_NODES),
+                max_iter=80,
+                ftol_rel=1e-10,
+                move_limit=move_limit,
+                use_jit=False,
+                on_iteration=lambda i, r: candidates.append(r),
+            )
+
+        # Every evaluated candidate is within the box of the iterate it was
+        # proposed from; ``max_step`` records exactly that distance.
+        assert all(h["max_step"] <= move_limit + 1e-12 for h in history)
+        assert all(h["move_limit"] <= move_limit for h in history)
+        # Consecutive candidates can differ by at most two boxes (a rejected
+        # trial and the next proposal from the same iterate).
+        steps = [np.max(np.abs(b - a)) for a, b in pairwise(candidates)]
+        assert max(steps) <= 2 * move_limit + 1e-12
+        # The limit slows but does not stop progress to the optimum.
+        np.testing.assert_allclose(rho_opt, target, atol=0.03)
+        # It actually binds: the seed is > 0.5 from most targets, so the first
+        # accepted step is a full box for the steepest variables.
+        assert history[1]["max_step"] > 0.5 * move_limit
+
+    def test_move_limit_must_be_positive(self):
+        with pytest.raises(ValueError, match="move_limit"):
+            optimize_doping(
+                initial_rho=np.zeros(self.N_NODES),
+                move_limit=0.0,
+                components=_stub_components(),
+            )
+
+    def test_bounds_still_hold_at_the_rails(self):
+        target = np.full(self.N_NODES, 3.0)
+        with mock.patch(
+            "prismo.optimizer.pipeline", side_effect=self._quadratic(target)
+        ):
+            rho_opt, _ = optimize_doping(
+                initial_rho=np.full(self.N_NODES, 0.9),
+                max_iter=20,
+                move_limit=0.1,
+                use_jit=False,
+            )
+        assert np.all(rho_opt <= 1.0)
+        np.testing.assert_allclose(rho_opt, 1.0, atol=1e-6)
+
+
+class TestCheckpoint:
+    """``checkpoint.json`` (theta + history) is written after every evaluation."""
+
+    N_NODES = 4
+
+    def test_checkpoint_written_after_every_evaluation(self, tmp_path):
+        target = jnp.full(self.N_NODES, 0.8, dtype=jnp.float64)
+        snapshots: list[int] = []
+        path = tmp_path / "outputs" / "checkpoint.json"
+
+        def mock_pipeline(rho, **kwargs):
+            return -jnp.sum((rho - target) ** 2)
+
+        def on_iteration(i, rho):
+            # Before evaluation ``i`` the checkpoint holds ``i - 1`` entries.
+            snapshots.append(
+                len(json.loads(path.read_text())["history"]) if path.exists() else 0
+            )
+
+        with mock.patch("prismo.optimizer.pipeline", side_effect=mock_pipeline):
+            rho_opt, history = optimize_doping(
+                initial_rho=np.full(self.N_NODES, 0.25, dtype=float),
+                max_iter=6,
+                use_jit=False,
+                checkpoint_path=path,
+                on_iteration=on_iteration,
+            )
+
+        assert snapshots == list(range(len(history)))
+        saved = json.loads(path.read_text())
+        assert len(saved["history"]) == len(history)
+        np.testing.assert_allclose(saved["rho_opt"], rho_opt)
+        assert saved["move_limit"] > 0.0
+
+    def test_no_checkpoint_without_a_path(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        optimize_doping(
+            initial_rho=np.full(self.N_NODES, 0.25, dtype=float),
+            max_iter=2,
+            components=_stub_components(),
+        )
+        assert not (tmp_path / "outputs").exists()
