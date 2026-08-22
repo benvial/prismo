@@ -197,10 +197,20 @@ def build_rib_waveguide_mesh_via_gmsh(
 
 
 def _ensure_gmsh_ready(gmsh: object) -> None:
-    """Ensure gmsh is initialized and clear any existing models."""
+    """Ensure gmsh is initialized, cleared, and sizing meshes from our points.
+
+    The per-point characteristic lengths this module sets (``mesh_res_core`` and
+    friends) only take effect while ``Mesh.MeshSizeFromPoints`` is on. It is on
+    by gmsh's own default, but a user's ``~/.gmshrc`` can turn it off, and then
+    every requested resolution silently collapses to the same 32-node hull of
+    the geometry. Pin both sizing options so the mesh depends on the geometry
+    and nothing else.
+    """
     if not gmsh.isInitialized():
         gmsh.initialize()
     gmsh.clear()
+    gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 1)
+    gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)
 
 
 def _build_mesh_rectangles(
@@ -305,6 +315,17 @@ def _build_mesh_rectangles(
     _add_physical_group(gmsh, 1, [_top_curves[s] for s in cathode_surfs], "contact_cathode")
 
     gmsh.model.mesh.generate(2)
+
+    # ``removeAllDuplicates`` above merges the coincident CAD *points*, but some
+    # coincident curves survive as distinct entities, and each of those meshes
+    # its own nodes along the shared edge -- the same non-conforming mesh, one
+    # level down, that gives ChargeTransport's finite-volume operator a null
+    # space. Merge the coincident mesh nodes (and the elements that become
+    # duplicates) so the triangulation is conforming at any resolution. This
+    # went unnoticed while a stray ``Mesh.MeshSizeFromPoints=0`` in a user gmsh
+    # config collapsed every local mesh to the geometry's 32-node hull.
+    gmsh.model.mesh.removeDuplicateNodes()
+    gmsh.model.mesh.removeDuplicateElements()
 
     if view:
         gmsh.fltk.run()

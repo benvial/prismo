@@ -34,6 +34,11 @@ def run(
         str(_DEFAULT_MESH),
         help="Path to waveguide .msh file",
     ),
+    mesh_size: float = typer.Option(
+        None,
+        help="Silicon element size [µm]; smaller refines the shared mesh "
+        "(default: the mesh author's own, 0.04 µm in containers)",
+    ),
     output_dir: str = typer.Option(
         str(_DEFAULT_OUTPUT_DIR),
         help="Directory for output plots",
@@ -62,7 +67,9 @@ def run(
     components: PipelineComponents | None = None
     if use_containers:
         typer.echo("Starting tesseract Docker containers...")
-        components = init_tesseract_containers(mesh_dir=Path(mesh_path).parent)
+        components = init_tesseract_containers(
+            mesh_dir=Path(mesh_path).parent, mesh_size=mesh_size
+        )
 
     try:
         _run_pipeline(
@@ -70,6 +77,7 @@ def run(
             max_iter=max_iter,
             ftol_rel=ftol_rel,
             mesh_path=mesh_path,
+            mesh_size=mesh_size,
             output_dir=output_dir,
             no_jit=no_jit,
             use_containers=use_containers,
@@ -215,11 +223,31 @@ def _silicon_design_nodes(actual_mesh: Path, n_nodes: int, real_mesh: bool) -> A
     return DesignNodes(indices=indices, n_mesh_nodes=n_nodes)
 
 
+def _local_geometry(geometry_cls: Any, mesh_size: float | None) -> Any:
+    """Rib geometry at the requested silicon element size (local mesh path).
+
+    ``mesh_size`` is the core resolution, matching what the gyptis container
+    reads from ``PRISMO_GYPTIS_MESH_SIZE``; the junction and bulk sizes follow
+    it at the class defaults' own ratios (half the core at the junction, 2.5x it
+    in the bulk), so one knob refines the whole local mesh proportionally.
+    """
+    if mesh_size is None:
+        return geometry_cls()
+    if mesh_size <= 0.0:
+        raise typer.BadParameter("--mesh-size must be positive [µm]")
+    return geometry_cls(
+        mesh_res_junction=mesh_size / 2.0,
+        mesh_res_core=mesh_size,
+        mesh_res_bulk=mesh_size * 2.5,
+    )
+
+
 def build_pipeline_inputs(
     r_min: float,
     mesh_path: str,
     use_containers: bool,
     components: Any | None,
+    mesh_size: float | None = None,
 ) -> PipelineInputs:
     """Author the shared mesh and assemble the fixed pipeline inputs.
 
@@ -230,6 +258,11 @@ def build_pipeline_inputs(
     with this one (ticket 15). Container runs author the mesh via gyptis
     ``write_mesh`` and require live components; the in-process path builds the
     rib mesh locally. Lengths are micrometres throughout, ``r_min`` included.
+
+    ``mesh_size`` refines the silicon: on the container path the caller has
+    already passed it to :func:`init_tesseract_containers`, which is where the
+    mesh author lives, so here it only sizes the local rib mesh. ``None`` keeps
+    each author's default.
     """
     import jax.numpy as jnp
     from prismo_shared.schemas import MeshRef
@@ -245,7 +278,7 @@ def build_pipeline_inputs(
     mesh_path_obj = Path(mesh_path)
 
     typer.echo("Generating waveguide mesh...")
-    geometry = RibWaveguideGeometry()
+    geometry = _local_geometry(RibWaveguideGeometry, mesh_size)
     if use_containers:
         if components is None or components.write_mesh is None:
             raise RuntimeError("Container pipeline requires gyptis mesh authoring")
@@ -409,6 +442,7 @@ def _run_pipeline(
     output_dir: str,
     no_jit: bool,
     use_containers: bool,
+    mesh_size: float | None = None,
     components: Any | None = None,
 ) -> None:
     from prismo.optimizer import OptimizationCancelled, optimize_doping
@@ -420,7 +454,9 @@ def _run_pipeline(
     typer.echo()
 
     typer.echo("[1/3] Preparing pipeline inputs...")
-    inputs = build_pipeline_inputs(r_min, mesh_path, use_containers, components)
+    inputs = build_pipeline_inputs(
+        r_min, mesh_path, use_containers, components, mesh_size=mesh_size
+    )
     geometry = inputs.geometry
     coords = inputs.coords
     mesh_ref = inputs.mesh_ref

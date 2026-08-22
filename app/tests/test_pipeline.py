@@ -1078,6 +1078,59 @@ class TestPipelineShapeValidation:
         assert p_out.shape == rho.shape
 
 
+def _fake_container_env(monkeypatch) -> dict[str, object]:
+    """Stand in for tesseract_core so ``init_tesseract_containers`` runs offline.
+
+    Returns the dict the fake records into: the CT volume list plus the
+    environment each image was started with, which is how the mesh-size and
+    Julia-deadline knobs reach the containers.
+    """
+    import sys
+    import types
+
+    captured: dict[str, object] = {}
+
+    class FakeTesseract:
+        def __init__(self, image, volumes=None, environment=None):
+            self.image = image
+            self.volumes = volumes
+            self.environment = environment
+
+        @classmethod
+        def from_image(cls, image, volumes=None, environment=None):
+            if "chargetransport" in image:
+                captured["ct_volumes"] = volumes
+                captured["ct_environment"] = environment
+            else:
+                captured["gyptis_environment"] = environment
+            return cls(image, volumes, environment)
+
+        def serve(self):
+            return None
+
+        def teardown(self):
+            return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "tesseract_core",
+        types.SimpleNamespace(Tesseract=FakeTesseract),
+    )
+    # Keep the component builders from touching the fake containers further.
+    monkeypatch.setattr(
+        "prismo.pipeline.build_chargetransport_component",
+        lambda container=None, local_api=None: (lambda *a, **k: None),
+    )
+    monkeypatch.setattr(
+        "prismo.pipeline.build_gyptis_components",
+        lambda container=None, local_api=None: (
+            (lambda *a, **k: None),
+            (lambda *a, **k: None),
+        ),
+    )
+    return captured
+
+
 class TestChargeTransportMeshDelivery:
     """The shared mesh must reach the ChargeTransport container.
 
@@ -1140,45 +1193,7 @@ class TestChargeTransportMeshDelivery:
 
     def test_init_bind_mounts_mesh_dir_into_ct_container(self, monkeypatch, tmp_path):
         """init_tesseract_containers mounts the mesh dir read-only into CT."""
-        import sys
-        import types
-
-        captured: dict[str, object] = {}
-
-        class FakeTesseract:
-            def __init__(self, image, volumes=None):
-                self.image = image
-                self.volumes = volumes
-
-            @classmethod
-            def from_image(cls, image, volumes=None):
-                if "chargetransport" in image:
-                    captured["ct_volumes"] = volumes
-                return cls(image, volumes)
-
-            def serve(self):
-                return None
-
-            def teardown(self):
-                return None
-
-        monkeypatch.setitem(
-            sys.modules,
-            "tesseract_core",
-            types.SimpleNamespace(Tesseract=FakeTesseract),
-        )
-        # Keep the component builders from touching the fake containers further.
-        monkeypatch.setattr(
-            "prismo.pipeline.build_chargetransport_component",
-            lambda container=None, local_api=None: (lambda *a, **k: None),
-        )
-        monkeypatch.setattr(
-            "prismo.pipeline.build_gyptis_components",
-            lambda container=None, local_api=None: (
-                (lambda *a, **k: None),
-                (lambda *a, **k: None),
-            ),
-        )
+        captured = _fake_container_env(monkeypatch)
 
         mesh_dir = tmp_path / "outputs"
         init_tesseract_containers(mesh_dir=mesh_dir)
@@ -1188,6 +1203,37 @@ class TestChargeTransportMeshDelivery:
         ]
         # The mount directory is created so the bind mount always resolves.
         assert mesh_dir.exists()
+
+    def test_init_passes_mesh_size_to_the_gyptis_mesh_author(
+        self, monkeypatch, tmp_path
+    ):
+        """The gyptis container authors the shared mesh, so the knob goes to it."""
+        captured = _fake_container_env(monkeypatch)
+
+        init_tesseract_containers(mesh_dir=tmp_path / "outputs", mesh_size=0.015)
+
+        assert captured["gyptis_environment"] == {"PRISMO_GYPTIS_MESH_SIZE": "0.015"}
+
+    def test_init_defaults_leave_the_container_environments_alone(
+        self, monkeypatch, tmp_path
+    ):
+        """No mesh size and no host override: neither container gets an env."""
+        monkeypatch.delenv("PRISMO_CT_JULIA_TIMEOUT_S", raising=False)
+        captured = _fake_container_env(monkeypatch)
+
+        init_tesseract_containers(mesh_dir=tmp_path / "outputs")
+
+        assert captured["gyptis_environment"] is None
+        assert captured["ct_environment"] is None
+
+    def test_init_forwards_the_ct_julia_timeout_override(self, monkeypatch, tmp_path):
+        """A refined mesh needs a longer Newton deadline than the baked 25 s."""
+        monkeypatch.setenv("PRISMO_CT_JULIA_TIMEOUT_S", "600")
+        captured = _fake_container_env(monkeypatch)
+
+        init_tesseract_containers(mesh_dir=tmp_path / "outputs")
+
+        assert captured["ct_environment"] == {"PRISMO_CT_JULIA_TIMEOUT_S": "600"}
 
 
 class TestDesignNodes:

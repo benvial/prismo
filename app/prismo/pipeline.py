@@ -198,6 +198,7 @@ def _close_all(
 
 def init_tesseract_containers(
     mesh_dir: str | Path | None = None,
+    mesh_size: float | None = None,
 ) -> PipelineComponents:
     """Start tesseract Docker containers and bundle the live components.
 
@@ -212,6 +213,11 @@ def init_tesseract_containers(
             :data:`_CT_MESH_MOUNT` so its Julia solver can load the real 2D
             grid instead of the 1D fallback. The bind mount is live, so a mesh
             written after the container starts is still visible.
+        mesh_size: Characteristic element size of the silicon (rib + slab) in
+            micrometres, passed to the gyptis container as
+            ``PRISMO_GYPTIS_MESH_SIZE``. gyptis authors the shared mesh, so this
+            one knob sets the resolution both solvers see. ``None`` keeps the
+            component's own default (0.04 µm).
     """
     try:
         from tesseract_core import Tesseract  # type: ignore[import-untyped]
@@ -235,10 +241,22 @@ def init_tesseract_containers(
     if ct_scripts_dir:
         ct_volumes.append(f"{Path(ct_scripts_dir).resolve()}:/tesseract/scripts:ro")
 
+    # A refined mesh makes each Newton solve slower, and the component's own
+    # per-request Julia deadline (25 s) is the first thing a refinement study
+    # hits. Forward the host's override into the container so the deadline can
+    # follow the mesh without an image rebuild.
+    ct_env = {
+        name: os.environ[name]
+        for name in ("PRISMO_CT_JULIA_TIMEOUT_S",)
+        if name in os.environ
+    }
+
     closers: list[Callable[[], None]] = []
     try:
         ct_tesseract = Tesseract.from_image(
-            "prismo_chargetransport:latest", volumes=ct_volumes or None
+            "prismo_chargetransport:latest",
+            volumes=ct_volumes or None,
+            environment=ct_env or None,
         )
         ct_tesseract.serve()
         closers.append(ct_tesseract.teardown)
@@ -246,8 +264,15 @@ def init_tesseract_containers(
         _close_all(closers)
         raise RuntimeError("Failed to start ChargeTransport container") from exc
 
+    gyptis_env = (
+        {"PRISMO_GYPTIS_MESH_SIZE": repr(float(mesh_size))}
+        if mesh_size is not None
+        else None
+    )
     try:
-        gyptis_tesseract = Tesseract.from_image("prismo_gyptis:latest")
+        gyptis_tesseract = Tesseract.from_image(
+            "prismo_gyptis:latest", environment=gyptis_env
+        )
         gyptis_tesseract.serve()
         closers.append(gyptis_tesseract.teardown)
     except Exception as exc:

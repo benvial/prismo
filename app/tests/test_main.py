@@ -503,6 +503,57 @@ def test_local_pipeline_inputs_keep_the_seeded_junction_under_the_default_filter
     assert density < 0.5
 
 
+def test_mesh_size_refines_the_locally_authored_mesh(tmp_path: Path) -> None:
+    """``--mesh-size`` is one knob on the silicon resolution, in micrometres.
+
+    The container path hands it to the gyptis mesh author through
+    ``PRISMO_GYPTIS_MESH_SIZE``; the local path sizes its own rib mesh with it,
+    junction and bulk following at the class defaults' ratios. Halving it must
+    therefore give a mesh with strictly more nodes.
+    """
+    pytest.importorskip("gmsh")
+
+    main_module = import_module("prismo.main")
+    from prismo.waveguide_mesh import RibWaveguideGeometry
+
+    geometry = main_module._local_geometry(RibWaveguideGeometry, 0.02)
+    assert (
+        geometry.mesh_res_junction,
+        geometry.mesh_res_core,
+        geometry.mesh_res_bulk,
+    ) == (0.01, 0.02, 0.05)
+
+    coarse = main_module.build_pipeline_inputs(
+        r_min=0.05,
+        mesh_path=str(tmp_path / "coarse.msh"),
+        use_containers=False,
+        components=None,
+        mesh_size=0.04,
+    )
+    fine = main_module.build_pipeline_inputs(
+        r_min=0.05,
+        mesh_path=str(tmp_path / "fine.msh"),
+        use_containers=False,
+        components=None,
+        mesh_size=0.02,
+    )
+
+    assert coarse.real_mesh and fine.real_mesh
+    assert fine.n_nodes > coarse.n_nodes
+    assert len(fine.design_nodes) > len(coarse.design_nodes)
+
+
+def test_mesh_size_must_be_positive() -> None:
+    """A non-positive element size is a CLI mistake, not a degenerate mesh."""
+    import typer
+
+    main_module = import_module("prismo.main")
+    from prismo.waveguide_mesh import RibWaveguideGeometry
+
+    with pytest.raises(typer.BadParameter):
+        main_module._local_geometry(RibWaveguideGeometry, 0.0)
+
+
 def test_design_variables_live_on_the_silicon_nodes_only(tmp_path: Path) -> None:
     """The MMA design set is the silicon subdomain, not the whole mesh.
 

@@ -24,6 +24,7 @@
 # file) for the ChargeTransport container and the mesh-transfer operator.
 
 import itertools
+import os
 from pathlib import Path
 from typing import Any, Literal
 
@@ -67,8 +68,18 @@ _RIB_HALF_WIDTH: float = 0.25  # 500 nm rib, centred at x=0
 _CONTACT_OFFSET: float = 0.20  # gap from rib edge to the near contact edge
 _CONTACT_HALF_WIDTH: float = 0.025  # 50 nm contact line half-width
 # Refine the rib so the fundamental guided mode (n_clad < neff < n_core) is
-# resolved rather than only the coarse-mesh leaky mode.
-_CORE_MESH_SIZE: float = 0.04
+# resolved rather than only the coarse-mesh leaky mode. ``PRISMO_GYPTIS_MESH_SIZE``
+# overrides it at container start (the host sets it from ``prismo run
+# --mesh-size``) so a mesh-refinement study does not need an image rebuild. It is
+# read once, at import, so every operation of a served container -- ``write_mesh``,
+# ``solve``, the VJP, ``mode_field`` -- builds the same geometry; the shared
+# ``.msh``, the design cells, and the transfer operator therefore stay consistent.
+_DEFAULT_CORE_MESH_SIZE: float = 0.04
+_CORE_MESH_SIZE: float = float(
+    os.environ.get("PRISMO_GYPTIS_MESH_SIZE", _DEFAULT_CORE_MESH_SIZE)
+)
+if _CORE_MESH_SIZE <= 0.0:
+    raise ValueError("PRISMO_GYPTIS_MESH_SIZE must be positive [µm]")
 
 # Design region: the silicon rib interior. Every rib cell is modulated; the rib
 # is inset from the x-PML by construction and sits in the rib band away from the
