@@ -458,3 +458,100 @@ class TestGradientValidationColdHook:
         assert calls[0] == "reset"
         assert calls.count("reset") == calls.count("eval")
         assert all(a == "reset" for a, b in zip(calls[::2], calls[1::2], strict=True))
+
+
+class TestObjectiveLineScan:
+    """Ticket 23: f(rho + t*d) along one direction at uniform spacing."""
+
+    @staticmethod
+    def _offsets(n: int = 11, spacing: float = 1e-3) -> np.ndarray:
+        half = n // 2
+        return spacing * np.arange(-half, half + 1, dtype=float)
+
+    def test_exact_quadratic_has_zero_residual_and_matching_slope(self):
+        import jax.numpy as jnp
+        from prismo.outputs import scan_objective_line
+
+        rho = jnp.linspace(-0.5, 0.5, N_NODES)
+        d = jnp.ones(N_NODES) / np.sqrt(N_NODES)
+        a = jnp.arange(N_NODES, dtype=float) / N_NODES
+
+        def f(x):
+            return jnp.sum(x**2) + jnp.dot(a, x)
+
+        scan = scan_objective_line(f, rho, d, self._offsets())
+        assert scan.values.shape == (11,)
+        assert scan.rms_rel_residual < 1e-10
+        assert scan.max_rel_residual < 1e-10
+        assert scan.noise_estimate < 1e-10
+        assert scan.fitted_slope == pytest.approx(scan.adjoint_slope, rel=1e-8)
+        assert scan.figure_path is None
+        assert scan.json_path is None
+
+    def test_noisy_objective_reports_the_floor(self):
+        import jax.numpy as jnp
+        from prismo.outputs import scan_objective_line
+
+        rho = jnp.zeros(N_NODES)
+        d = jnp.ones(N_NODES) / np.sqrt(N_NODES)
+        amplitude = 1e-3
+        rng = np.random.default_rng(7)
+        noise = iter(amplitude * rng.choice([-1.0, 1.0], size=64))
+
+        def f(x):
+            # Deterministic per call but uncorrelated between neighbours.
+            return 1.0 + jnp.sum(x) + next(noise)
+
+        scan = scan_objective_line(f, rho, d, self._offsets(n=21))
+        assert 0.2 * amplitude < scan.rms_rel_residual < 2.0 * amplitude
+        assert scan.max_rel_residual >= scan.rms_rel_residual
+        assert 0.2 * amplitude < scan.noise_estimate < 2.0 * amplitude
+
+    def test_writes_figure_and_json_when_output_dir_given(self, tmp_path):
+        import json
+
+        import jax.numpy as jnp
+        from prismo.outputs import scan_objective_line
+
+        rho = jnp.zeros(4)
+        d = jnp.asarray([1.0, 0.0, 0.0, 0.0])
+        scan = scan_objective_line(
+            lambda x: jnp.sum(x**2), rho, d, self._offsets(n=5), output_dir=tmp_path
+        )
+        assert scan.figure_path == tmp_path / "objective_line_scan.pdf"
+        assert scan.json_path == tmp_path / "objective_line_scan.json"
+        assert scan.figure_path.exists()
+        payload = json.loads(scan.json_path.read_text())
+        assert len(payload["offsets"]) == 5
+        assert len(payload["values"]) == 5
+        assert payload["rms_rel_residual"] == pytest.approx(scan.rms_rel_residual)
+
+    def test_before_evaluation_runs_before_gradient_and_every_sample(self):
+        import jax.numpy as jnp
+        from prismo.outputs import scan_objective_line
+
+        calls: list[str] = []
+        rho = jnp.zeros(3)
+        d = jnp.asarray([0.0, 1.0, 0.0])
+        offsets = self._offsets(n=7)
+        scan_objective_line(
+            lambda x: jnp.sum(x),
+            rho,
+            d,
+            offsets,
+            before_evaluation=lambda: calls.append("reset"),
+        )
+        assert len(calls) == 1 + len(offsets)
+
+    def test_feasible_offsets_keep_the_box(self):
+        import jax.numpy as jnp
+        from prismo.outputs import feasible_offsets
+
+        rho = jnp.asarray([0.999, 0.0, -0.5])
+        d = jnp.asarray([1.0, 1.0, 1.0]) / np.sqrt(3.0)
+        offsets = self._offsets(n=11, spacing=1e-3)
+        kept = feasible_offsets(rho, d, offsets)
+        # +t*d_0 <= 1 - 0.999 -> t <= 1e-3*sqrt(3) ~ 1.73e-3; -t side is free.
+        assert kept.min() == offsets.min()
+        assert kept.max() == pytest.approx(1e-3)
+        assert np.all(np.abs(np.asarray(rho)[None, :] + kept[:, None] * np.asarray(d)) <= 1.0)

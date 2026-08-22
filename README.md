@@ -28,7 +28,7 @@ New to Tesseract? Start with the [Tesseract Core docs](https://docs.pasteurlabs.
 │   ├── requirements.txt             # tesseract-core
 │   ├── prismo
 │   │   ├── __init__.py
-│   │   ├── main.py                  # CLI entrypoint (typer): run, validate-gradient
+│   │   ├── main.py                  # CLI entrypoint (typer): run, validate-gradient, probe-objective
 │   │   ├── pipeline.py              # θ → Δneff, JAX-differentiable end to end
 │   │   ├── optimizer.py             # NLopt MMA loop over the signed design field
 │   │   ├── density_filter.py        # Andreassen density filter (sparse H matrix)
@@ -125,6 +125,9 @@ $ make run-containers
 
 # Validate the composed adjoint against central finite differences
 $ make validate-gradient-containers
+
+# Line-scan the objective around a checkpoint design (smoothness / noise-floor probe)
+$ make probe-objective-containers RUN_ARGS="--design outputs/checkpoint.json"
 
 # Clean build artifacts and caches
 $ make clean

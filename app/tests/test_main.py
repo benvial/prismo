@@ -959,3 +959,173 @@ def test_container_overlay_geometry_follows_the_gyptis_frame() -> None:
         design_vertices=None,
     )
     assert _container_overlay_geometry(inputs_no_vertices) is inputs.geometry
+
+
+def _probe_mesh_stubs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, n_nodes: int = 4
+) -> None:
+    import prismo.waveguide_mesh as mesh_module
+
+    coords = np.asarray([[i * 1e-6, 0.0] for i in range(n_nodes)], dtype=float)
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        mesh_module,
+        "read_mesh_silicon_triangulation",
+        lambda _: np.empty((0, 3), dtype=np.intp),
+    )
+
+
+def test_objective_probe_loads_the_checkpoint_design(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--design checkpoint.json`` probes around ``rho_opt``, not the seed."""
+    import json
+
+    import prismo.main as main_module
+    from _doubles import stub_components
+
+    _probe_mesh_stubs(monkeypatch, tmp_path)
+    rho_opt = [0.25, -0.25, 0.5, -0.5]
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(json.dumps({"rho_opt": rho_opt, "history": []}))
+
+    # Identity carriers make f == 0 with a zero gradient; a bias-dependent
+    # double gives the probe a real function and a direction to scan.
+    def ct(doping, bias_voltage, mesh_ref=None):
+        return doping * (1.0 + abs(bias_voltage)), doping
+
+    components = stub_components(chargetransport=ct)
+    scan = main_module._run_objective_probe(
+        r_min=0.05,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        design_path=str(checkpoint),
+        direction="gradient",
+        spacing=1e-4,
+        n_points=5,
+        use_containers=False,
+        components=components,
+        cold=False,
+    )
+    assert scan.values.shape == (5,)
+    assert (tmp_path / "objective_line_scan.pdf").exists()
+    assert scan.offsets[len(scan.offsets) // 2] == 0.0
+    # The centre sample is the checkpoint design, not the seed: the doubles
+    # make f a function of the filtered design field, so the two differ.
+    from functools import partial
+
+    from prismo.pipeline import pipeline
+
+    inputs = main_module.build_pipeline_inputs(
+        0.05, str(tmp_path / "mesh.msh"), False, components
+    )
+    f = partial(
+        pipeline,
+        H=inputs.H_dense,
+        H_sum=inputs.H_sum,
+        design_nodes=inputs.design_nodes,
+        components=components,
+    )
+    centre = scan.values[len(scan.offsets) // 2]
+    assert centre == pytest.approx(float(f(np.asarray(rho_opt))), rel=1e-12)
+    assert centre != pytest.approx(float(f(np.asarray(inputs.theta_init))), rel=1e-6)
+
+
+def test_objective_probe_checkpoint_size_mismatch_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import json
+
+    import prismo.main as main_module
+    from _doubles import stub_components
+
+    _probe_mesh_stubs(monkeypatch, tmp_path)
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(json.dumps({"rho_opt": [0.1, 0.2], "history": []}))
+    with pytest.raises(ValueError, match="design variables"):
+        main_module._run_objective_probe(
+            r_min=0.05,
+            mesh_path=str(tmp_path / "mesh.msh"),
+            output_dir=str(tmp_path),
+            design_path=str(checkpoint),
+            direction="gradient",
+            spacing=1e-4,
+            n_points=5,
+            use_containers=False,
+            components=stub_components(),
+            cold=False,
+        )
+
+
+def test_objective_probe_cold_resets_before_every_evaluation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import prismo.main as main_module
+    from _doubles import stub_components
+
+    _probe_mesh_stubs(monkeypatch, tmp_path)
+    resets: list[str] = []
+    main_module._run_objective_probe(
+        r_min=0.05,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        design_path=None,
+        direction="random",
+        spacing=1e-4,
+        n_points=7,
+        use_containers=False,
+        components=stub_components(
+            reset_chargetransport=lambda: resets.append("reset")
+        ),
+        cold=True,
+    )
+    # One to prove the seam, one before the gradient, one per sample.
+    assert len(resets) == 1 + 1 + 7
+
+
+def test_objective_probe_cold_requires_a_reset_seam(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import prismo.main as main_module
+    from _doubles import stub_components
+
+    _probe_mesh_stubs(monkeypatch, tmp_path)
+    with pytest.raises(RuntimeError, match="--cold requires"):
+        main_module._run_objective_probe(
+            r_min=0.05,
+            mesh_path=str(tmp_path / "mesh.msh"),
+            output_dir=str(tmp_path),
+            design_path=None,
+            direction="gradient",
+            spacing=1e-4,
+            n_points=3,
+            use_containers=False,
+            components=stub_components(),
+            cold=True,
+        )
+
+
+def test_objective_probe_zero_gradient_points_at_random_direction(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import prismo.main as main_module
+    from _doubles import stub_components
+
+    _probe_mesh_stubs(monkeypatch, tmp_path)
+    # The identity double has f == 0 everywhere, so the gradient is zero.
+    with pytest.raises(RuntimeError, match="--direction random"):
+        main_module._run_objective_probe(
+            r_min=0.05,
+            mesh_path=str(tmp_path / "mesh.msh"),
+            output_dir=str(tmp_path),
+            design_path=None,
+            direction="gradient",
+            spacing=1e-4,
+            n_points=3,
+            use_containers=False,
+            components=stub_components(),
+            cold=False,
+        )

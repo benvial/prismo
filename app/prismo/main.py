@@ -16,7 +16,12 @@ import numpy as np
 import typer
 
 if TYPE_CHECKING:
-    from prismo.outputs import ColdReevaluation, GradientValidationResult, ModeField
+    from prismo.outputs import (
+        ColdReevaluation,
+        GradientValidationResult,
+        ModeField,
+        ObjectiveLineScan,
+    )
 
 app = typer.Typer(name="prismo")
 
@@ -821,6 +826,217 @@ def _run_gradient_validation(
     typer.echo()
     typer.echo("=== Done ===")
     return result
+
+
+_DEFAULT_PROBE_SPACING = 1e-5
+_DEFAULT_PROBE_POINTS = 21
+
+
+@app.command(name="probe-objective")
+def probe_objective(
+    r_min: float = typer.Option(0.05, help="Density filter radius [µm]"),
+    design: str = typer.Option(
+        None,
+        "--design",
+        help="checkpoint.json whose rho_opt is the centre of the scan "
+        "(default: the seeded junction)",
+    ),
+    direction: str = typer.Option(
+        "gradient",
+        help="'gradient' (normalized adjoint gradient at the centre, projected "
+        "off rail-pinned variables) or 'random' (seeded unit vector)",
+    ),
+    spacing: float = typer.Option(
+        _DEFAULT_PROBE_SPACING, help="Uniform step t between samples along d"
+    ),
+    n_points: int = typer.Option(
+        _DEFAULT_PROBE_POINTS, help="Number of samples (odd keeps t = 0 centred)"
+    ),
+    mesh_path: str = typer.Option(
+        str(_DEFAULT_MESH), help="Path to waveguide .msh file"
+    ),
+    output_dir: str = typer.Option(
+        str(_DEFAULT_OUTPUT_DIR), help="Directory for objective_line_scan.{pdf,json}"
+    ),
+    use_containers: bool = typer.Option(
+        False,
+        "--use-containers",
+        help="Run tesseract components via Docker containers",
+    ),
+    cold: bool = typer.Option(
+        False,
+        "--cold",
+        help="Reset the ChargeTransport worker before every evaluation",
+    ),
+) -> None:
+    """Scan Δneff along one direction at fine spacing (ticket 23).
+
+    Separates a kink in θ → Δneff from an evaluation noise floor: samples
+    ``f(θ₀ + t·d)`` on a uniform grid, fits a quadratic, and reports the fit
+    residual and the white-noise amplitude implied by second differences,
+    alongside the adjoint's directional derivative against the fitted slope.
+    """
+    from prismo.pipeline import (
+        PipelineComponents,
+        init_tesseract_containers,
+        teardown_containers,
+    )
+
+    components: PipelineComponents | None = None
+    if use_containers:
+        typer.echo("Starting tesseract Docker containers...")
+        components = init_tesseract_containers(mesh_dir=Path(mesh_path).parent)
+    try:
+        _run_objective_probe(
+            r_min=r_min,
+            mesh_path=mesh_path,
+            output_dir=output_dir,
+            design_path=design,
+            direction=direction,
+            spacing=spacing,
+            n_points=n_points,
+            use_containers=use_containers,
+            components=components,
+            cold=cold,
+        )
+    finally:
+        if use_containers and components is not None:
+            typer.echo("Stopping tesseract containers...")
+            teardown_containers(components)
+
+
+def _load_checkpoint_design(path: str | Path, n_design: int) -> np.ndarray:
+    """``rho_opt`` from a ``checkpoint.json`` written by the optimizer."""
+    import json
+
+    payload = json.loads(Path(path).read_text())
+    rho = np.asarray(payload["rho_opt"], dtype=float)
+    if rho.shape != (n_design,):
+        raise ValueError(
+            f"{path} holds {rho.size} design variables but this mesh has "
+            f"{n_design}; probe the checkpoint on the mesh that produced it"
+        )
+    return rho
+
+
+def _run_objective_probe(
+    r_min: float,
+    mesh_path: str,
+    output_dir: str,
+    design_path: str | None,
+    direction: str,
+    spacing: float,
+    n_points: int,
+    use_containers: bool,
+    components: Any | None = None,
+    cold: bool = False,
+) -> ObjectiveLineScan:
+    """Line-scan the bound pipeline around a design (ticket 23)."""
+    import jax
+    import jax.numpy as jnp
+
+    from prismo.outputs import (
+        _interior_direction,
+        _sample_directions,
+        feasible_offsets,
+        scan_objective_line,
+    )
+    from prismo.pipeline import pipeline as pipeline_fn
+
+    if spacing <= 0.0:
+        raise typer.BadParameter("--spacing must be positive")
+    if n_points < 3:
+        raise typer.BadParameter("--n-points must be at least 3")
+    if direction not in ("gradient", "random"):
+        raise typer.BadParameter("--direction must be 'gradient' or 'random'")
+
+    typer.echo("=== PRISMO Objective Line Scan ===")
+    typer.echo()
+    typer.echo("[1/2] Preparing pipeline inputs...")
+    inputs = build_pipeline_inputs(r_min, mesh_path, use_containers, components)
+
+    rho = jnp.asarray(inputs.theta_init, dtype=jnp.float64)
+    if design_path is not None:
+        rho = jnp.asarray(_load_checkpoint_design(design_path, rho.shape[0]))
+        typer.echo(f"      Centre: rho_opt from {design_path}")
+    else:
+        typer.echo("      Centre: the seeded junction")
+
+    before_evaluation = None
+    if cold:
+        if not _reset_chargetransport(components):
+            raise RuntimeError(
+                "--cold requires a ChargeTransport backend with a reset seam"
+            )
+        before_evaluation = partial(_reset_chargetransport, components)
+        typer.echo("      Cold start: resetting the ChargeTransport worker before "
+                   "every evaluation")
+
+    bound_pipeline = partial(
+        pipeline_fn,
+        H=inputs.H_dense,
+        H_sum=inputs.H_sum,
+        mesh_ref=inputs.mesh_ref,
+        design_transfer=inputs.design_transfer,
+        design_nodes=inputs.design_nodes,
+        components=components,
+    )
+
+    typer.echo(f"[2/2] Scanning along the {direction} direction...")
+    if direction == "gradient":
+        if before_evaluation is not None:
+            before_evaluation()
+        d = jax.grad(bound_pipeline)(rho)
+        if float(jnp.linalg.norm(d)) == 0.0:
+            raise RuntimeError(
+                "the gradient is identically zero at the centre design; scan a "
+                "random direction instead (--direction random)"
+            )
+    else:
+        d = _sample_directions(rho, None, 1)[0]
+    d = d / jnp.linalg.norm(d)
+    # An optimized design rails many variables at ±1; the scan must stay in the
+    # box on both sides, so probe the interior subspace of the direction.
+    interior = _interior_direction(rho, d)
+    if interior is None:
+        raise RuntimeError("every variable with direction weight is rail-pinned")
+    d = interior
+
+    half = n_points // 2
+    offsets = spacing * np.arange(-half, n_points - half, dtype=float)
+    kept = feasible_offsets(rho, d, offsets)
+    if kept.size < offsets.size:
+        typer.echo(
+            f"      {offsets.size - kept.size} offset(s) dropped to stay inside "
+            "the [-1, 1] box"
+        )
+    scan = scan_objective_line(
+        bound_pipeline,
+        rho,
+        d,
+        kept,
+        output_dir=output_dir,
+        before_evaluation=before_evaluation,
+    )
+
+    for t, f_val, r in zip(scan.offsets, scan.values, scan.residuals, strict=True):
+        typer.echo(f"      t={t:+.3e}  f={f_val:+.9e}  residual={r:+.3e}")
+    typer.echo(
+        f"      Quadratic-fit residual: rms {scan.rms_rel_residual:.2e}, "
+        f"max {scan.max_rel_residual:.2e} (relative to |f(θ₀)|)"
+    )
+    typer.echo(
+        f"      Noise floor from second differences: {scan.noise_estimate:.2e} relative"
+    )
+    typer.echo(
+        f"      Slope along d: adjoint {scan.adjoint_slope:+.6e}, "
+        f"fitted {scan.fitted_slope:+.6e}"
+    )
+    typer.echo(f"      Figure: {scan.figure_path}")
+    typer.echo(f"      Data:   {scan.json_path}")
+    typer.echo()
+    typer.echo("=== Done ===")
+    return scan
 
 
 def entrypoint() -> None:

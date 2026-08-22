@@ -9,6 +9,7 @@ on the rib cross-section. Panels that serve none of those were dropped.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -822,6 +823,180 @@ def validate_gradient(
         tolerance=tolerance,
         passed=worst_rel_error <= tolerance,
         figure_path=path,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Objective line scan (ticket 23)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ObjectiveLineScan:
+    """``f(rho + t*d)`` sampled along one direction at uniform spacing.
+
+    The smoothness probe behind ticket 23: the optimizer's trials around the
+    ticket-22 optimum sat ~2e-3 relative below the iterate regardless of how
+    small the box became, and this scan separates a genuine kink (the residual
+    of a quadratic fit is structured and shrinks with the spacing) from an
+    evaluation noise floor (the residual is white and does not). All relative
+    quantities are relative to ``|f(rho)|`` at the centre sample.
+
+    ``noise_estimate`` is the white-noise amplitude implied by the second
+    differences of the samples, ``std(diff(values, 2)) / sqrt(6)``, relative to
+    ``|f(rho)|``: second differences of a smooth function at fine spacing are
+    ~0, so whatever is left is the per-evaluation scatter.
+    """
+
+    offsets: np.ndarray
+    values: np.ndarray
+    fit_coefficients: np.ndarray
+    residuals: np.ndarray
+    rms_rel_residual: float
+    max_rel_residual: float
+    noise_estimate: float
+    adjoint_slope: float
+    fitted_slope: float
+    figure_path: Path | None
+    json_path: Path | None
+
+
+def feasible_offsets(
+    rho: jax.Array, direction: jax.Array, offsets: np.ndarray
+) -> np.ndarray:
+    """The subset of signed ``offsets`` ``t`` with ``rho + t*direction`` in ``[-1, 1]``.
+
+    Unlike :func:`_feasible_steps` (which bounds a symmetric central stencil)
+    each side is bounded on its own, so a design pinned at +1 in the direction's
+    sense still keeps its whole negative half-line.
+    """
+    rho_np = np.asarray(rho, dtype=float)
+    dir_np = np.asarray(direction, dtype=float)
+    offsets = np.asarray(offsets, dtype=float)
+    pos = dir_np > 0.0
+    neg = dir_np < 0.0
+    t_max = min(
+        np.min((1.0 - rho_np[pos]) / dir_np[pos], initial=np.inf),
+        np.min((-1.0 - rho_np[neg]) / dir_np[neg], initial=np.inf),
+    )
+    t_min = max(
+        np.max((-1.0 - rho_np[pos]) / dir_np[pos], initial=-np.inf),
+        np.max((1.0 - rho_np[neg]) / dir_np[neg], initial=-np.inf),
+    )
+    return offsets[(offsets >= t_min) & (offsets <= t_max)]
+
+
+def _render_objective_line_scan(scan_values: np.ndarray, offsets: np.ndarray,
+                                fit: np.ndarray, residuals: np.ndarray,
+                                out: Path, name: str) -> Path:
+    fig, (ax_f, ax_r) = plt.subplots(
+        2, 1, figsize=(6, 6), sharex=True, height_ratios=[2, 1]
+    )
+    ax_f.plot(offsets, scan_values, "o", markersize=4, label="f(θ₀ + t·d)")
+    ax_f.plot(offsets, np.polyval(fit, offsets), "-", alpha=0.7, label="quadratic fit")
+    ax_f.set_ylabel(r"$\Delta n_{\rm eff}$")
+    ax_f.set_title("Objective line scan")
+    ax_f.legend()
+    ax_f.grid(True, alpha=0.3)
+    ax_r.plot(offsets, residuals, "o-", markersize=3, color="crimson")
+    ax_r.axhline(0.0, color="k", lw=0.8)
+    ax_r.set_xlabel("t (along the unit direction d)")
+    ax_r.set_ylabel("residual")
+    ax_r.grid(True, alpha=0.3)
+    fig.tight_layout()
+    path = out / f"{name}.pdf"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def scan_objective_line(
+    pipeline_fn: Callable[..., jax.Array],
+    rho: jax.Array,
+    direction: jax.Array,
+    offsets: np.ndarray,
+    output_dir: str | Path | None = None,
+    before_evaluation: Callable[[], None] | None = None,
+    name: str = "objective_line_scan",
+) -> ObjectiveLineScan:
+    """Sample ``pipeline_fn`` along ``direction`` and fit a quadratic (ticket 23).
+
+    Args:
+        pipeline_fn: Callable ``(rho) -> scalar`` differentiable by JAX.
+        rho: Centre design.
+        direction: Unit direction ``d``.
+        offsets: Signed steps ``t``; every ``rho + t*d`` is evaluated as given
+            (filter with :func:`feasible_offsets` first to respect the box).
+        output_dir: When given, write ``<name>.pdf`` and ``<name>.json`` there.
+        before_evaluation: Hook run before the gradient and before every
+            sample (ticket 20's cold-start reset).
+        name: Stem of the figure and JSON files.
+
+    Returns:
+        An :class:`ObjectiveLineScan`.
+    """
+    rho = jnp.asarray(rho)
+    direction = jnp.asarray(direction, dtype=rho.dtype)
+    offsets = np.asarray(offsets, dtype=float)
+    if offsets.size < 3:
+        raise ValueError("an objective line scan needs at least 3 offsets")
+
+    def _prepare() -> None:
+        if before_evaluation is not None:
+            before_evaluation()
+
+    _prepare()
+    adjoint_slope = float(jnp.dot(jax.grad(pipeline_fn)(rho), direction))
+
+    values = np.empty(offsets.shape, dtype=float)
+    for i, t in enumerate(offsets):
+        _prepare()
+        values[i] = float(pipeline_fn(rho + t * direction))
+
+    fit = np.polyfit(offsets, values, 2)
+    residuals = values - np.polyval(fit, offsets)
+    centre = int(np.argmin(np.abs(offsets)))
+    scale = max(abs(float(values[centre])), 1e-30)
+    rms_rel = float(np.sqrt(np.mean(residuals**2))) / scale
+    max_rel = float(np.max(np.abs(residuals))) / scale
+    noise = float(np.std(np.diff(values, n=2)) / np.sqrt(6.0)) / scale
+
+    figure_path = json_path = None
+    if output_dir is not None:
+        out = _ensure_output_dir(output_dir)
+        figure_path = _render_objective_line_scan(
+            values, offsets, fit, residuals, out, name
+        )
+        json_path = out / f"{name}.json"
+        json_path.write_text(
+            json.dumps(
+                {
+                    "offsets": offsets.tolist(),
+                    "values": values.tolist(),
+                    "fit_coefficients": fit.tolist(),
+                    "residuals": residuals.tolist(),
+                    "rms_rel_residual": rms_rel,
+                    "max_rel_residual": max_rel,
+                    "noise_estimate": noise,
+                    "adjoint_slope": adjoint_slope,
+                    "fitted_slope": float(fit[1]),
+                },
+                indent=2,
+            )
+        )
+
+    return ObjectiveLineScan(
+        offsets=offsets,
+        values=values,
+        fit_coefficients=fit,
+        residuals=residuals,
+        rms_rel_residual=rms_rel,
+        max_rel_residual=max_rel,
+        noise_estimate=noise,
+        adjoint_slope=adjoint_slope,
+        fitted_slope=float(fit[1]),
+        figure_path=figure_path,
+        json_path=json_path,
     )
 
 

@@ -616,6 +616,24 @@ def _assemble_AB(simu: Any, eps_core_field: Any) -> tuple[Any, Any]:
 _SHIFT_RETRY_OFFSETS = (0.0, 1e-6, -1e-6, 1e-4, -1e-4, 1e-2)
 
 
+# Direct solver behind the shift-invert transform, and the Krylov-Schur
+# tolerance (ticket 23). PETSc's native sparse LU has no threshold pivoting,
+# and on this indefinite saddle-point system (A carries zero diagonals) its
+# back-substitution is accurate to only ~1e-5 relative: every Ritz pair
+# "converges" in the transformed operator while its true residual stays at
+# 1e-5, lambda lands ~4e-7 relative off the eigenvalue, and -- because the
+# roundoff pattern changes with the input -- neighbouring designs whose
+# epsilon differ by 5e-11 return lambda values that jump by 5e-7 relative. That
+# was the ~2e-3 relative noise floor on Delta_neff that stalled the optimizer
+# around the ticket-22 optimum. UMFPACK, MUMPS and SuperLU all pivot, all
+# agree with an independent ARPACK solve to 1e-13, and leave lambda smooth to
+# 1e-13 along the same line; UMFPACK was the fastest of the three here. The
+# tolerance is then meaningful again: 1e-10 puts the true residual at 1e-13
+# for one extra Krylov iteration.
+_SHIFT_INVERT_FACTOR_SOLVER = "umfpack"
+_EIGENSOLVER_TOLERANCE = 1e-10
+
+
 def _attempt_two_sided_solve(A: Any, B: Any, shift: float, n: int) -> tuple[Any, int]:
     """One two-sided shift-invert SLEPc solve at a given shift."""
     from slepc4py import SLEPc
@@ -629,8 +647,11 @@ def _attempt_two_sided_solve(A: Any, B: Any, shift: float, n: int) -> tuple[Any,
     st = solver.getST()
     st.setType(SLEPc.ST.Type.SINVERT)
     st.setShift(shift)
+    pc = st.getKSP().getPC()
+    pc.setType("lu")
+    pc.setFactorSolverType(_SHIFT_INVERT_FACTOR_SOLVER)
     solver.setDimensions(n)
-    solver.setTolerances(1e-7)
+    solver.setTolerances(_EIGENSOLVER_TOLERANCE)
     solver.setTwoSided(True)
     solver.solve()
     return solver, solver.getConverged()
