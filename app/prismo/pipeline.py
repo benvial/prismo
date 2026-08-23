@@ -243,7 +243,10 @@ def _load_tesseract_api(name: str) -> Any | None:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
-    except Exception:
+    except (Exception, SystemExit):
+        # ``tesseract_core.runtime`` calls ``sys.exit`` when its optional
+        # dependencies (``tesseract-core[runtime]``) are missing; a missing
+        # in-process solver must never take the host down with it.
         return None
 
 

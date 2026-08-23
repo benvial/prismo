@@ -10,7 +10,10 @@ runs against a different dependency graph than the tested container.
 
 from pathlib import Path
 
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib
 
 _ROOT = Path(__file__).resolve().parents[2]
 _JULIA_ENV = _ROOT / "components" / "tesseracts" / "chargetransport" / "julia_env"

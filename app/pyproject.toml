@@ -26,7 +26,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    # In-process runs and the test-suite load the components' tesseract_api
+    # modules, which import tesseract_core.runtime (not in the bare wheel).
+    "tesseract-core[runtime]==1.11.0",
     "pytest>=7.0",
+    "tomli>=2.0; python_version < '3.11'",
     "pre-commit",
     "ruff",
 ]
