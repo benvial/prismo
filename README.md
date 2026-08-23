@@ -13,7 +13,7 @@ Tesseract Hackathon 2026 entry — **Track 01 · Inverse design & shape optimiza
 
 <p align="center">
   <img src="docs/figures/doping_evolution.gif" alt="Net doping at every optimizer evaluation" width="760">
-  <br><em>The net doping the two solvers saw at every evaluation of one run: red n-type, blue p-type, white the junction. The optimizer grows a curved junction that hugs the optical mode.</em>
+  <br><em>The net doping the two solvers saw at every evaluation of one run: red n-type, blue p-type, white the junction.</em>
 </p>
 
 ---
