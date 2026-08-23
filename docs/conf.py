@@ -113,6 +113,10 @@ typehints_use_signature_return = False
 
 # Napoleon
 napoleon_use_rtype = False
+# Render "Attributes:" sections as :ivar: fields instead of .. attribute::
+# directives, which would duplicate the dataclass fields autodoc already emits
+# via undoc-members (a -W build fails on the duplicate object description).
+napoleon_use_ivar = True
 
 autodoc_default_options = {
     "members": True,
