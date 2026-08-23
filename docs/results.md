@@ -1,8 +1,10 @@
 # Results
 
-All figures are from one run on the container mesh (`make run-containers` with
-a small `--loss-weight`, 200 MMA iterations); `outputs/` holds the PDFs of your
-own runs and `make figures` refreshes `docs/figures/` from them.
+All figures are from one run on the container mesh —
+`prismo run --use-containers --loss-weight 1e-5 --mesh-size 0.05 --r-min 0.1`
+(0.05 µm silicon elements, 0.1 µm filter radius), 192 MMA iterations in
+~62 min on a laptop; `outputs/` holds the PDFs of your own runs and
+`make figures` refreshes `docs/figures/` from them.
 
 ## The gradient is validated before it is trusted
 
@@ -13,7 +15,7 @@ own runs and `make figures` refreshes `docs/figures/` from them.
 
 Composed adjoint vs central finite differences through filter → doping →
 ChargeTransport (Julia, warm) → Soref–Bennett → gyptis: relative error
-$\approx 2\times10^{-6}$ at $h = 10^{-3}$, following the $O(h^2)$ slope until
+$\approx 2\times10^{-7}$ at $h = 10^{-3}$, following the $O(h^2)$ slope until
 finite-difference round-off takes over (`make validate-gradient-containers`).
 
 ## The gradients do the work
@@ -24,11 +26,12 @@ finite-difference round-off takes over (`make validate-gradient-containers`).
 ```
 
 From the seeded lateral junction, MMA raises $\Delta n_\mathrm{eff}$ at −5 V
-from $1.65\times10^{-4}$ to $2.72\times10^{-4}$ (+65 %), i.e. $V_\pi L_\pi$
-from 2.35 to **1.42 V·cm**. The star is a cold re-solve of the final design
-(worker reset, equilibrium from near-intrinsic, bias ramp) and matches the warm
-value. Dips are rejected trials of the move-limited MMA, kept in the record on
-purpose.
+from $1.19\times10^{-4}$ to $3.52\times10^{-4}$ (×3), i.e. $V_\pi L_\pi$
+from 3.26 to **1.10 V·cm**. Dips are rejected trials of the move-limited MMA,
+kept in the record on purpose. (`prismo run` also re-solves the reported
+design cold — worker reset, equilibrium from near-intrinsic, bias ramp — and
+flags any warm/cold discrepancy, so the headline is a property of the design,
+not of the solve path.)
 
 ```{image} figures/doping_evolution.gif
 :width: 720px
@@ -70,11 +73,12 @@ knows it.
 :align: center
 ```
 
-Modal free-carrier loss $\alpha$ of the unbiased device and the efficiency–loss
-figure of merit $V_\pi L_\pi\cdot\alpha$ at every iteration: $\alpha$ falls
-from 5.9 to 5.75 dB/cm while $\Delta n_\mathrm{eff}$ rises, taking
-$V_\pi L_\pi\cdot\alpha$ from 13.9 to **8.2 V·dB** (good depletion modulators
-sit at 10–30 V·dB).
+Modal free-carrier loss $\alpha$ of the unbiased device and the
+efficiency–loss figure of merit $V_\pi L_\pi\cdot\alpha$ at every iteration.
+$\alpha$ first dips (doping the mode cannot see is pruned), then the optimizer
+buys ~2 dB/cm back — 4.29 to 6.34 dB/cm — where it pays in
+$\Delta n_\mathrm{eff}$, and the figure of merit **halves, from 14.0 to
+7.0 V·dB** (good depletion modulators sit at 10–30 V·dB).
 
 ```{image} figures/tradeoff.png
 :width: 520px
