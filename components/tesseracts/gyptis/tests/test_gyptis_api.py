@@ -457,12 +457,17 @@ class _FakeSolver:
 _K0 = 2.0 * np.pi / _api.WAVELENGTH
 
 
-def _lam_for(neff: float) -> complex:
-    """The eigenvalue a mode of this effective index would come back as."""
-    return complex((neff * _K0) ** 2, 0.0)
+def _lam_for(neff: float, loss: float = 0.0) -> complex:
+    """The eigenvalue a mode of this effective index would come back as.
+
+    ``loss`` is an imaginary part relative to the real one: the PML makes the
+    converged eigenvalues complex, and each mode arrives as a conjugate pair.
+    """
+    real = (neff * _K0) ** 2
+    return complex(real, loss * real)
 
 
-def _select(neffs, ref_neff=None):
+def _select(neffs, ref_neff=None, mode_index=0):
     solver = _FakeSolver([_lam_for(n) for n in neffs])
     return _api._select_index(
         solver,
@@ -471,6 +476,7 @@ def _select(neffs, ref_neff=None):
         _api.DEFAULT_CORE_EPSILON,
         _api.DEFAULT_CLAD_EPSILON,
         None if ref_neff is None else _lam_for(ref_neff),
+        mode_index,
     )
 
 
@@ -513,6 +519,105 @@ def test_tracking_falls_back_to_nearest_when_nothing_is_guided() -> None:
     index = _api._select_index(solver, 3, _K0, core_epsilon, clad_epsilon, ref)
 
     assert index == 1
+
+
+# ---------------------------------------------------------------------------
+# Higher-order mode targeting
+# ---------------------------------------------------------------------------
+
+
+def test_mode_index_ranks_the_guided_modes_by_descending_neff() -> None:
+    # Converged order is arbitrary; the target is the k-th largest *guided* neff.
+    neffs = [0.9, 2.4, 2.9, 5.0, 2.62]
+    assert _select(neffs, mode_index=0) == 2
+    assert _select(neffs, mode_index=1) == 4
+    assert _select(neffs, mode_index=2) == 1
+
+
+def test_mode_index_counts_distinct_modes_only() -> None:
+    """The real-doubled system converges every physical mode twice.
+
+    Ranking the raw guided list would hand index 1 the fundamental's second
+    copy -- observed on the container: ``mode_index=1`` returned the same neff
+    as ``mode_index=0`` to six digits. The first higher-order mode is the next
+    *distinct* neff.
+    """
+    neffs = [2.9, 2.9 * (1.0 + 1e-9), 2.62, 2.62 * (1.0 - 1e-9), 2.4, 0.9]
+    assert _select(neffs, mode_index=0) in (0, 1)
+    assert _select(neffs, mode_index=1) in (2, 3)
+    assert _select(neffs, mode_index=2) == 4
+
+
+def test_conjugate_copies_with_pml_loss_count_as_one_mode() -> None:
+    """The copies are a conjugate pair, not equal complex numbers.
+
+    On the container the pair's imaginary parts reach ~1e-2 relative (the PML),
+    so a dedupe on complex distance missed them and index 1 was still the
+    fundamental. Equal neff is what identifies a pair.
+    """
+    solver = _FakeSolver(
+        [
+            _lam_for(2.78, 1.7e-4),
+            _lam_for(2.78, -1.7e-4),
+            _lam_for(2.48, 1.7e-5),
+            _lam_for(2.48, -1.7e-5),
+            _lam_for(2.18, 4.5e-3),
+            _lam_for(2.18, -4.5e-3),
+        ]
+    )
+    core, clad = _api.DEFAULT_CORE_EPSILON, _api.DEFAULT_CLAD_EPSILON
+    assert _api._select_index(solver, 6, _K0, core, clad, None, 0) in (0, 1)
+    assert _api._select_index(solver, 6, _K0, core, clad, None, 1) in (2, 3)
+    assert _api._select_index(solver, 6, _K0, core, clad, None, 2) in (4, 5)
+    with pytest.raises(RuntimeError, match="only 3 distinct"):
+        _api._select_index(solver, 6, _K0, core, clad, None, 3)
+
+
+def test_mode_index_beyond_the_resolved_guided_modes_raises() -> None:
+    """Silently returning a lower-order mode would optimize the wrong device."""
+    with pytest.raises(RuntimeError, match="mode_index 3 requested but only 3"):
+        _select([0.9, 2.4, 2.9, 5.0, 2.62], mode_index=3)
+    # Duplicates do not count towards the resolved modes either.
+    with pytest.raises(RuntimeError, match="only 1 distinct"):
+        _select([2.9, 2.9 * (1.0 + 1e-9)], mode_index=1)
+    with pytest.raises(RuntimeError, match="no guided mode"):
+        _select([0.9, 5.0], mode_index=1)
+
+
+def test_mode_index_does_not_override_tracking() -> None:
+    """Once a branch exists, the nearest guided eigenvalue wins, whatever the order."""
+    assert _select([2.40, 2.62, 2.90], ref_neff=2.61, mode_index=0) == 1
+    assert _select([2.40, 2.62, 2.90], ref_neff=2.89, mode_index=1) == 2
+
+
+def test_input_schema_defaults_to_the_fundamental_and_rejects_negative_orders() -> None:
+    assert InputSchema(design_epsilon=np.array([12.0])).mode_index == 0
+    with pytest.raises(ValueError):
+        InputSchema(design_epsilon=np.array([12.0]), mode_index=-1)
+
+
+def test_solve_identity_separates_mode_targets() -> None:
+    design = np.array([12.0, 12.1])
+    fundamental = _api._solve_identity(design, 12.08, 2.085, 2.085)
+    first_order = _api._solve_identity(design, 12.08, 2.085, 2.085, mode_index=1)
+    assert fundamental != first_order
+    assert fundamental == _api._solve_identity(design, 12.08, 2.085, 2.085, 0)
+
+
+def test_eigenpair_budget_grows_with_the_targeted_order() -> None:
+    assert _api._eigenpair_budget(0) == _api._BASE_EIGENPAIRS
+    assert _api._eigenpair_budget(2) > _api._eigenpair_budget(1) > _api._eigenpair_budget(0)
+
+
+@pytest.mark.skipif(not _gyptis_available(), reason="requires the gyptis backend")
+def test_first_order_mode_is_slower_than_the_fundamental() -> None:
+    design = np.full(n_design(), _api.DEFAULT_CORE_EPSILON)
+    fundamental = float(_api.apply(make_inputs(design)).neff_sq)
+    higher = float(
+        _api.apply(InputSchema(design_epsilon=design, mode_index=1)).neff_sq
+    )
+    assert higher < fundamental
+    assert _api.DEFAULT_CLAD_EPSILON < higher
 
 
 def test_is_guided_is_the_window_both_selection_and_tracking_use() -> None:

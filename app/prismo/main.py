@@ -65,6 +65,14 @@ def run(
         "--use-containers",
         help="Run tesseract components via Docker containers",
     ),
+    mode_index: int = typer.Option(
+        0,
+        "--mode-index",
+        min=0,
+        help="Guided mode whose Δneff is optimized: 0 = fundamental (largest "
+        "neff), k = k-th guided mode in descending neff; ranked on the first "
+        "eigensolve and tracked by nearest eigenvalue afterwards",
+    ),
 ) -> None:
     """Run the PRISMO differentiable pipeline end-to-end.
 
@@ -76,6 +84,7 @@ def run(
     """
     from prismo.pipeline import (
         PipelineComponents,
+        build_default_components,
         init_tesseract_containers,
         teardown_containers,
     )
@@ -84,8 +93,12 @@ def run(
     if use_containers:
         typer.echo("Starting tesseract Docker containers...")
         components = init_tesseract_containers(
-            mesh_dir=Path(mesh_path).parent, mesh_size=mesh_size
+            mesh_dir=Path(mesh_path).parent, mesh_size=mesh_size, mode_index=mode_index
         )
+    elif mode_index:
+        # The shared in-process bundle targets the fundamental; a higher-order
+        # target needs its own bundle (the mode is bound at build time).
+        components = build_default_components(mode_index=mode_index)
 
     try:
         _run_pipeline(
@@ -99,6 +112,7 @@ def run(
             use_containers=use_containers,
             components=components,
             move_limit=move_limit,
+            mode_index=mode_index,
         )
     finally:
         if use_containers and components is not None:
@@ -454,6 +468,7 @@ def _optimized_mode_field(
     inputs: PipelineInputs,
     rho_opt: np.ndarray,
     components: Any | None,
+    mode_index: int = 0,
 ) -> ModeField | None:
     """The tracked optical mode ``|E|`` at the optimized design (ticket 07).
 
@@ -462,7 +477,8 @@ def _optimized_mode_field(
     figure shows the mode of the *reverse-biased optimized device*, the same
     permittivity the final objective was evaluated on, rather than a
     separately-reconstructed one. Returns ``None`` when no gyptis backend is
-    bound to answer the query.
+    bound to answer the query. ``mode_index`` only labels the figure: the
+    bundle's ``mode_field`` query is already bound to the mode it optimized.
     """
     import jax.numpy as jnp
 
@@ -500,7 +516,9 @@ def _optimized_mode_field(
             float(verts[:, 1].min()),
             float(verts[:, 1].max()),
         )
-    return ModeField(abs_e=abs_e, coords_um=coords_um, rib_bounds=rib_bounds)
+    return ModeField(
+        abs_e=abs_e, coords_um=coords_um, rib_bounds=rib_bounds, mode_index=mode_index
+    )
 
 
 def _clear_live_frames(output_dir: str | Path) -> int:
@@ -593,6 +611,7 @@ def _run_pipeline(
     mesh_size: float | None = None,
     components: Any | None = None,
     move_limit: float = _DEFAULT_MOVE_LIMIT,
+    mode_index: int = 0,
 ) -> None:
     from prismo.optimizer import OptimizationCancelled, optimize_doping
     from prismo.outputs import generate_outputs, plot_live_doping_field
@@ -609,6 +628,10 @@ def _run_pipeline(
     typer.echo("[1/3] Preparing pipeline inputs...")
     inputs = build_pipeline_inputs(
         r_min, mesh_path, use_containers, components, mesh_size=mesh_size
+    )
+    typer.echo(
+        "      Target mode: "
+        + ("fundamental (index 0)" if mode_index == 0 else f"guided index {mode_index}")
     )
     # Container figures draw the gyptis frame, not the local author's
     # (ticket 16): the two meshes differ in vertical origin and substrate
@@ -694,7 +717,7 @@ def _run_pipeline(
     # reported design: a design that solves only warm would otherwise lose its
     # mode figure to the reset (ticket 23).
     try:
-        mode_field = _optimized_mode_field(inputs, rho_opt, components)
+        mode_field = _optimized_mode_field(inputs, rho_opt, components, mode_index)
     except Exception as exc:
         typer.echo(f"      WARNING: mode figure skipped ({exc})")
         mode_field = None

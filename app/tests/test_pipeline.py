@@ -573,6 +573,58 @@ class TestContainerPipeline:
         np.testing.assert_allclose(abs_e, [0.5, 1.0, 0.25])
         np.testing.assert_allclose(coords, [[0.0, 0.0], [0.1, 0.0], [0.2, 0.0]])
 
+    def test_mode_field_forwards_a_higher_order_target(self):
+        class FakeGyptis:
+            def __init__(self):
+                self.inputs = None
+
+            def apply(self, inputs):
+                self.inputs = inputs
+                return {"mode_abs_e": [1.0], "mode_coordinates": [[0.0, 0.0]]}
+
+        gyptis = FakeGyptis()
+        read_gyptis_mode_field(np.array([12.0]), container=gyptis, mode_index=2)
+        assert gyptis.inputs["mode_index"] == 2
+
+        read_gyptis_mode_field(np.array([12.0]), container=gyptis)
+        # The fundamental is the component default: the key stays out so the
+        # payload is what an image predating the field accepts.
+        assert "mode_index" not in gyptis.inputs
+
+    def test_gyptis_components_target_one_mode_for_solve_and_vjp(self):
+        class FakeGyptis:
+            def __init__(self):
+                self.apply_inputs: list[dict] = []
+                self.vjp_inputs: list[dict] = []
+
+            def apply(self, inputs):
+                self.apply_inputs.append(inputs)
+                return {"neff_sq": 6.0}
+
+            def vector_jacobian_product(self, inputs, vjp_inputs, vjp_outputs, cot):
+                self.vjp_inputs.append(inputs)
+                return {"design_epsilon": [0.0] * len(inputs["design_epsilon"])}
+
+        gyptis = FakeGyptis()
+        perturbed, background = build_gyptis_components(
+            container=gyptis, mode_index=1
+        )
+        eps = np.array([12.0, 12.1])
+        perturbed.forward(eps, 12.08)
+        background.forward(eps, 12.08)
+        perturbed.vjp(eps, np.asarray(1.0), 12.08)
+        assert all(call["mode_index"] == 1 for call in gyptis.apply_inputs)
+        assert gyptis.vjp_inputs[0]["mode_index"] == 1
+
+        default_gyptis = FakeGyptis()
+        perturbed, _background = build_gyptis_components(container=default_gyptis)
+        perturbed.forward(eps, 12.08)
+        assert "mode_index" not in default_gyptis.apply_inputs[0]
+
+    def test_gyptis_components_reject_a_negative_mode_index(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            build_gyptis_components(container=object(), mode_index=-1)
+
     def test_mode_field_rejects_mismatched_payload(self):
         class FakeGyptis:
             def apply(self, inputs):
@@ -1127,7 +1179,7 @@ def _fake_container_env(monkeypatch) -> dict[str, object]:
     )
     monkeypatch.setattr(
         "prismo.pipeline.build_gyptis_components",
-        lambda container=None, local_api=None: (
+        lambda container=None, local_api=None, mode_index=0: (
             (lambda *a, **k: None),
             (lambda *a, **k: None),
         ),

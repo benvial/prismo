@@ -341,6 +341,11 @@ class TestModeFieldPlot:
         with tempfile.TemporaryDirectory() as tmp:
             assert plot_mode_field(mode, output_dir=tmp).exists()
 
+    def test_labels_a_higher_order_mode(self):
+        mode = self._mode(mode_index=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            assert plot_mode_field(mode, output_dir=tmp).exists()
+
     def test_rejects_mismatched_lengths(self):
         with pytest.raises(ValueError, match="one magnitude per vertex"):
             ModeField(abs_e=np.ones(4), coords_um=np.zeros((3, 2)))

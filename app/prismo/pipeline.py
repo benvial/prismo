@@ -199,6 +199,7 @@ def _close_all(
 def init_tesseract_containers(
     mesh_dir: str | Path | None = None,
     mesh_size: float | None = None,
+    mode_index: int = 0,
 ) -> PipelineComponents:
     """Start tesseract Docker containers and bundle the live components.
 
@@ -218,6 +219,9 @@ def init_tesseract_containers(
             ``PRISMO_GYPTIS_MESH_SIZE``. gyptis authors the shared mesh, so this
             one knob sets the resolution both solvers see. ``None`` keeps the
             component's own default (0.04 µm).
+        mode_index: Guided mode the gyptis solves target and track -- ``0`` the
+            fundamental, ``k`` the ``k``-th guided mode in descending neff (see
+            :func:`build_gyptis_components`).
     """
     try:
         from tesseract_core import Tesseract  # type: ignore[import-untyped]
@@ -299,7 +303,9 @@ def init_tesseract_containers(
         raise RuntimeError("Failed to start gyptis container") from exc
 
     chargetransport = build_chargetransport_component(container=ct_tesseract)
-    gyptis, gyptis_background = build_gyptis_components(container=gyptis_tesseract)
+    gyptis, gyptis_background = build_gyptis_components(
+        container=gyptis_tesseract, mode_index=mode_index
+    )
     return PipelineComponents(
         chargetransport=chargetransport,
         gyptis=gyptis,
@@ -311,7 +317,9 @@ def init_tesseract_containers(
             read_gyptis_design_cell_vertices, container=gyptis_tesseract
         ),
         write_mesh=partial(write_gyptis_mesh, container=gyptis_tesseract),
-        mode_field=partial(read_gyptis_mode_field, container=gyptis_tesseract),
+        mode_field=partial(
+            read_gyptis_mode_field, container=gyptis_tesseract, mode_index=mode_index
+        ),
         reset_chargetransport=partial(
             reset_chargetransport_worker, container=ct_tesseract
         ),
@@ -470,12 +478,26 @@ def read_gyptis_design_cell_vertices(
     return _as_design_cell_vertices(raw)
 
 
+def _gyptis_mode_payload(mode_index: int) -> dict[str, int]:
+    """The ``mode_index`` entry of a gyptis payload, omitted for the fundamental.
+
+    The fundamental is the component's default, so leaving the key out keeps
+    a default run's payload identical to what an image predating the field
+    accepts; only a higher-order target sends it (and needs the field).
+    """
+    index = int(mode_index)
+    if index < 0:
+        raise ValueError("mode_index must be a non-negative integer")
+    return {"mode_index": index} if index else {}
+
+
 def read_gyptis_mode_field(
     design_epsilon: np.ndarray,
     core_epsilon: float = DEFAULT_BACKGROUND_EPSILON,
     *,
     container: Any | None = None,
     local_api: Any | None = None,
+    mode_index: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Read the tracked mode's ``|E|`` profile at the gyptis mesh vertices.
 
@@ -488,13 +510,16 @@ def read_gyptis_mode_field(
     ``core_epsilon`` must be the same background the solve components were given:
     it is part of the geometry key the component tracks the mode branch by, so a
     mismatched value would both solve a different device and miss the tracked
-    branch, falling back to the mode selection ticket 13 replaced.
+    branch, falling back to the mode selection ticket 13 replaced. Likewise
+    ``mode_index`` must match the solve components' target: it is part of the
+    same branch key, so the figure shows the mode that was optimized.
     """
     abs_e_raw, coords_raw = _gyptis_query(
         {
             "operation": "mode_field",
             "design_epsilon": np.asarray(design_epsilon, dtype=float),
             "core_epsilon": float(core_epsilon),
+            **_gyptis_mode_payload(mode_index),
         },
         ("mode_abs_e", "mode_coordinates"),
         container=container,
@@ -757,15 +782,27 @@ def _gyptis_background_vjp_impl(
 def build_gyptis_components(
     container: Any | None = None,
     local_api: Any | None = None,
+    mode_index: int = 0,
 ) -> tuple[DifferentiableComponent, DifferentiableComponent]:
     """Build the perturbed and background gyptis components for one backend.
 
     Both share a background eigenmode cache owned by this call, so the
     rho-independent background solve runs once per component lifecycle. The
     backend is captured here, not read from module globals.
+
+    ``mode_index`` selects the guided mode every solve of this bundle targets:
+    ``0`` the fundamental (largest neff in the guided window), ``k`` the
+    ``k``-th guided mode in descending neff. The component ranks the modes on
+    the first solve of a geometry and tracks the chosen branch by nearest
+    eigenvalue thereafter, so Δneff is the shift of *that* mode throughout an
+    optimization. The index is baked into the bundle rather than threaded
+    through ``pipeline()``: one run optimizes one mode.
     """
-    background_cache: dict[tuple[tuple[int, ...], str, bytes, float], np.ndarray] = {}
+    background_cache: dict[
+        tuple[tuple[int, ...], str, bytes, float, int], np.ndarray
+    ] = {}
     cache_lock = RLock()
+    mode_payload = _gyptis_mode_payload(mode_index)
 
     def forward(
         design_epsilon_np: np.ndarray,
@@ -778,6 +815,7 @@ def build_gyptis_components(
                 {
                     "design_epsilon": design_epsilon_np.tolist(),
                     "core_epsilon": float(core_epsilon),
+                    **mode_payload,
                 }
             )
             return np.asarray(result["neff_sq"], dtype=out_dtype)
@@ -785,7 +823,9 @@ def build_gyptis_components(
         def from_local(api: Any) -> np.ndarray:
             outputs = api.apply(
                 api.InputSchema(
-                    design_epsilon=design_epsilon_np, core_epsilon=float(core_epsilon)
+                    design_epsilon=design_epsilon_np,
+                    core_epsilon=float(core_epsilon),
+                    **mode_payload,
                 )
             )
             return np.asarray(outputs.neff_sq, dtype=out_dtype)
@@ -806,6 +846,7 @@ def build_gyptis_components(
             design_epsilon_np.dtype.str,
             design_epsilon_np.tobytes(),
             float(core_epsilon),
+            int(mode_index),
         )
         with cache_lock:
             cached = background_cache.get(key)
@@ -829,6 +870,7 @@ def build_gyptis_components(
                 {
                     "design_epsilon": design_epsilon_np.tolist(),
                     "core_epsilon": float(core_epsilon),
+                    **mode_payload,
                 },
                 ["design_epsilon"],
                 ["neff_sq"],
@@ -839,7 +881,9 @@ def build_gyptis_components(
         def from_local(api: Any) -> np.ndarray:
             vjp_result = api.vector_jacobian_product(
                 api.InputSchema(
-                    design_epsilon=design_epsilon_np, core_epsilon=float(core_epsilon)
+                    design_epsilon=design_epsilon_np,
+                    core_epsilon=float(core_epsilon),
+                    **mode_payload,
                 ),
                 {"design_epsilon"},
                 {"neff_sq"},
@@ -944,19 +988,23 @@ class PipelineComponents:
         _close_all(self.closers)
 
 
-def build_default_components() -> PipelineComponents:
+def build_default_components(mode_index: int = 0) -> PipelineComponents:
     """Build the default in-process components from the local tesseract apis.
 
     Loads each component's ``tesseract_api`` module if importable. There is no
     physics-free stub: a component whose tesseract_api has no live solver (no
     Julia, no gyptis/FEniCS) raises when called rather than fabricating carriers
     or an effective index. Used when ``pipeline()`` is called without an explicit
-    bundle (no containers running).
+    bundle (no containers running). ``mode_index`` is the guided mode the
+    gyptis solves target (see :func:`build_gyptis_components`); the shared
+    module-level bundle is built for the fundamental.
     """
     ct_api = _load_tesseract_api("chargetransport")
     gyptis_api = _load_tesseract_api("gyptis")
     chargetransport = build_chargetransport_component(local_api=ct_api)
-    gyptis, gyptis_background = build_gyptis_components(local_api=gyptis_api)
+    gyptis, gyptis_background = build_gyptis_components(
+        local_api=gyptis_api, mode_index=mode_index
+    )
 
     closers: list[Callable[[], None]] = []
     shutdown_worker = getattr(ct_api, "shutdown", None)
@@ -984,7 +1032,7 @@ def build_default_components() -> PipelineComponents:
             else None
         ),
         mode_field=(
-            partial(read_gyptis_mode_field, local_api=gyptis_api)
+            partial(read_gyptis_mode_field, local_api=gyptis_api, mode_index=mode_index)
             if gyptis_api is not None
             else None
         ),

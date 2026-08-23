@@ -451,12 +451,14 @@ class ModeField:
     plot uses them unscaled. ``rib_bounds`` is the optional
     ``(x_min, x_max, y_min, y_max)`` rectangle of the silicon rib interior, in
     the same micrometre frame, drawn as an outline so the mode can be read
-    against the guiding core.
+    against the guiding core. ``mode_index`` is the guided-mode order the solve
+    targeted (0 = fundamental), shown in the figure title.
     """
 
     abs_e: np.ndarray
     coords_um: np.ndarray
     rib_bounds: tuple[float, float, float, float] | None = None
+    mode_index: int = 0
 
     def __post_init__(self) -> None:
         coords = np.asarray(self.coords_um, dtype=float)
@@ -504,7 +506,8 @@ def plot_mode_field(
         vmin=0.0,
         vmax=1.0,
     )
-    ax.set_title(r"Optical mode $|E|$ (tracked)")
+    label = "fundamental" if mode.mode_index == 0 else f"index {mode.mode_index}"
+    ax.set_title(rf"Optical mode $|E|$ (tracked, {label})")
     ax.set_xlabel("x [µm]")
     ax.set_ylabel("y [µm]")
     ax.set_aspect("equal")

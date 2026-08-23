@@ -31,7 +31,7 @@ from typing import Any, Literal
 import numpy as np
 import numpy.typing as npt
 from prismo_shared.session import SolveSessionRegistry, array_identity
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from tesseract_core.runtime import Array, Differentiable, Float64
 
 #
@@ -115,6 +115,16 @@ class InputSchema(BaseModel):
             the design region and the slab (constant).
         clad_epsilon: Cladding (oxide) permittivity (constant).
         substrate_epsilon: Substrate (oxide) permittivity (constant).
+        mode_index: Which guided mode the solve targets. ``0`` (default) is
+            the fundamental: the largest-neff eigenpair inside the guided
+            window. ``k`` is the ``k``-th guided mode in descending neff on the
+            first solve of a geometry; every later solve of that geometry
+            tracks the chosen branch by nearest eigenvalue, exactly as for the
+            fundamental, so an optimization stays on one physical mode. The
+            index is part of the tracked-branch key and the solve identity, so
+            two mode targets on one geometry never share a branch or a VJP
+            session. A solve that resolves fewer than ``k + 1`` guided modes
+            raises rather than silently returning a lower-order one.
     """
 
     operation: Literal[
@@ -124,6 +134,7 @@ class InputSchema(BaseModel):
     core_epsilon: float = DEFAULT_CORE_EPSILON
     clad_epsilon: float = DEFAULT_CLAD_EPSILON
     substrate_epsilon: float = DEFAULT_SUBSTRATE_EPSILON
+    mode_index: int = Field(0, ge=0)
 
 
 class OutputSchema(BaseModel):
@@ -187,7 +198,10 @@ _session_registry = SolveSessionRegistry(max_sessions=_MAX_RETAINED_SOLVES)
 # in the guided window" cannot: near-degenerate modes swap rank under
 # perturbations far smaller than their spacing, so neff_sq jumps between
 # neighbouring inputs and no finite-difference reference survives (ticket 13).
-_tracked_lam: dict[tuple[float, float, float], complex] = {}
+# The key carries the targeted mode index as well as the constant
+# surroundings: a higher-order target on the same geometry is its own branch.
+GeometryKey = tuple[float, float, float, int]
+_tracked_lam: dict[GeometryKey, complex] = {}
 
 
 #
@@ -214,13 +228,15 @@ def _solve_identity(
     core_epsilon: float,
     clad_epsilon: float,
     substrate_epsilon: float,
+    mode_index: int = 0,
 ) -> tuple[Any, ...]:
-    """Hashable fingerprint of a forward solve's inputs (field + constants)."""
+    """Hashable fingerprint of a forward solve's inputs (field + constants + mode)."""
     return (
         *array_identity(design_epsilon),
         float(core_epsilon),
         float(clad_epsilon),
         float(substrate_epsilon),
+        int(mode_index),
     )
 
 
@@ -657,7 +673,24 @@ def _attempt_two_sided_solve(A: Any, B: Any, shift: float, n: int) -> tuple[Any,
     return solver, solver.getConverged()
 
 
-def _two_sided_solver(A: Any, B: Any, target: float, n: int = 12) -> tuple[Any, int]:
+# Eigenpairs requested from the two-sided solve. The shift sits at the core
+# line, so the guided modes are the first pairs below it; 12 comfortably covers
+# the fundamental and a few higher-order branches of this rib. Each further
+# targeted order adds headroom so the ranked guided list reaches it: every
+# physical mode costs two converged pairs (the real doubling), so four per
+# order is a 2x margin.
+_BASE_EIGENPAIRS = 12
+_EIGENPAIRS_PER_ORDER = 4
+
+
+def _eigenpair_budget(mode_index: int) -> int:
+    """Number of eigenpairs to converge for a given targeted mode order."""
+    return _BASE_EIGENPAIRS + _EIGENPAIRS_PER_ORDER * int(mode_index)
+
+
+def _two_sided_solver(
+    A: Any, B: Any, target: float, n: int = _BASE_EIGENPAIRS
+) -> tuple[Any, int]:
     """Two-sided shift-invert SLEPc solve; returns (solver, n_converged).
 
     The shift is retried along ``_SHIFT_RETRY_OFFSETS`` when the factorisation
@@ -703,6 +736,32 @@ def _neff_of(solver: Any, index: int, k0: float) -> float:
     return float(np.real(np.sqrt(solver.getEigenvalue(index))) / k0)
 
 
+# Two converged eigenpairs whose effective indices agree to this relative
+# tolerance are one physical mode. The real-doubled system returns each mode
+# twice as a complex-conjugate pair: equal real parts (equal neff), imaginary
+# parts of opposite sign, which the PML makes non-negligible (Im/Re up to ~1e-2
+# on this domain) -- so the copies are told apart by neff, not by the complex
+# eigenvalue. The copies agree in neff to ~1e-10; genuinely distinct guided
+# modes of this rib differ by ~1e-1 relative, so the gap is wide.
+_DEGENERATE_REL_TOL = 1e-6
+
+
+def _distinct_by_descending_neff(
+    solver: Any, indices: list[int], k0: float
+) -> list[int]:
+    """One representative index per distinct mode (by neff), largest neff first."""
+    ranked = sorted(indices, key=lambda i: _neff_of(solver, i, k0), reverse=True)
+    distinct: list[int] = []
+    for i in ranked:
+        neff = _neff_of(solver, i, k0)
+        if distinct:
+            previous = _neff_of(solver, distinct[-1], k0)
+            if abs(neff - previous) <= _DEGENERATE_REL_TOL * previous:
+                continue
+        distinct.append(i)
+    return distinct
+
+
 def _select_index(
     solver: Any,
     nconv: int,
@@ -710,6 +769,7 @@ def _select_index(
     core_epsilon: float,
     clad_epsilon: float,
     ref_lam: complex | None,
+    mode_index: int = 0,
 ) -> int:
     """Index of the tracked eigenpair.
 
@@ -717,11 +777,18 @@ def _select_index(
     -- the mode is tracked by nearest eigenvalue *among the guided candidates*,
     so every solve after the first stays on one physical branch rather than
     hopping to whichever root happened to converge closest. On the first solve
-    of a geometry there is nothing to track, so the fundamental guided mode is
-    selected: the largest-neff eigenpair inside the window. Either way, a solve
-    that resolves no guided mode at all falls back to the nearest candidate
-    over the whole converged set (a leaky mode; gradient correctness is
-    unaffected).
+    of a geometry there is nothing to track, so the targeted guided mode is
+    selected: the *distinct* eigenvalues inside the window ranked by descending
+    neff, the fundamental at ``mode_index`` 0, the first higher-order mode at
+    1, and so on. Distinct matters: the assembled system is the real doubling
+    of the complex problem, so every physical mode converges twice, as a
+    complex-conjugate eigenvalue pair with the same neff, and a naive rank
+    would return the fundamental again at index 1. A first solve that resolves fewer distinct
+    guided modes than the target needs raises -- silently returning a
+    lower-order mode would optimize the wrong device. With no target beyond the
+    fundamental, a solve that resolves no guided mode at all falls back to the
+    nearest candidate over the whole converged set (a leaky mode; gradient
+    correctness is unaffected).
     """
     guided = [
         i
@@ -735,7 +802,21 @@ def _select_index(
         return int(candidates[int(np.argmin(dists))])
 
     if guided:
-        return max(guided, key=lambda i: _neff_of(solver, i, k0))
+        ranked = _distinct_by_descending_neff(solver, guided, k0)
+        if mode_index >= len(ranked):
+            raise RuntimeError(
+                f"mode_index {mode_index} requested but only {len(ranked)} "
+                f"distinct guided mode(s) converged in the window; this "
+                f"waveguide may not support that many guided modes, or more "
+                f"eigenpairs are needed"
+            )
+        return int(ranked[mode_index])
+
+    if mode_index > 0:
+        raise RuntimeError(
+            f"mode_index {mode_index} requested but no guided mode converged "
+            f"in the window"
+        )
 
     target = complex(core_epsilon * k0 * k0, 0.0)
     dists = [abs(solver.getEigenvalue(i) - target) for i in range(nconv)]
@@ -749,6 +830,7 @@ def _solve_state(
     core_epsilon: float,
     clad_epsilon: float,
     ref_lam: complex | None = None,
+    mode_index: int = 0,
 ) -> dict[str, Any]:
     """Assemble + two-sided solve; return the tracked eigenpair state.
 
@@ -759,8 +841,12 @@ def _solve_state(
     """
     A, B = _assemble_AB(simu, eps_core_field)
     target = core_epsilon * k0 * k0
-    solver, nconv = _two_sided_solver(A, B, target)
-    idx = _select_index(solver, nconv, k0, core_epsilon, clad_epsilon, ref_lam)
+    # A higher-order target needs more converged eigenpairs below the shift to
+    # be sure of resolving it; the fundamental keeps the original budget.
+    solver, nconv = _two_sided_solver(A, B, target, n=_eigenpair_budget(mode_index))
+    idx = _select_index(
+        solver, nconv, k0, core_epsilon, clad_epsilon, ref_lam, mode_index
+    )
 
     rx, cx = A.createVecRight(), A.createVecRight()
     ry, cy = A.createVecRight(), A.createVecRight()
@@ -776,8 +862,8 @@ def _solve_state(
 
 
 def _advance_tracked_lam(
-    tracked: dict[tuple[float, float, float], complex],
-    geometry: tuple[float, float, float],
+    tracked: dict[GeometryKey, complex],
+    geometry: GeometryKey,
     state: dict[str, Any],
 ) -> None:
     """Record this solve's eigenvalue as the branch later solves track.
@@ -865,7 +951,7 @@ def _field_sensitivity(
 
 def _forward_solve(
     inputs: InputSchema,
-) -> tuple[np.ndarray, Any, Any, np.ndarray, float, dict[str, Any], tuple[float, float, float]]:
+) -> tuple[np.ndarray, Any, Any, np.ndarray, float, dict[str, Any], GeometryKey]:
     """Validate a design field, build the waveguide, and run the tracked solve.
 
     Shared by ``apply`` and the ``mode_field`` operation so both reach the same
@@ -908,10 +994,11 @@ def _forward_solve(
     # inputs -- an optimizer step, or the two sides of a finite difference --
     # return the same mode rather than whichever near-degenerate mode currently
     # ranks highest in the guided window (ticket 13).
-    geometry = (
+    geometry: GeometryKey = (
         float(inputs.core_epsilon),
         float(inputs.clad_epsilon),
         float(inputs.substrate_epsilon),
+        int(inputs.mode_index),
     )
     state = _solve_state(
         simu,
@@ -920,6 +1007,7 @@ def _forward_solve(
         inputs.core_epsilon,
         inputs.clad_epsilon,
         ref_lam=_tracked_lam.get(geometry),
+        mode_index=inputs.mode_index,
     )
     return design, simu, dg0, mask, k0, state, geometry
 
@@ -1010,6 +1098,7 @@ def apply(inputs: InputSchema) -> OutputSchema:
             inputs.core_epsilon,
             inputs.clad_epsilon,
             inputs.substrate_epsilon,
+            inputs.mode_index,
         ),
         state={"simu": simu, "dg0": dg0, "mask": mask, "k0": k0, "eigen": state},
         scope=geometry,
@@ -1071,6 +1160,7 @@ def vector_jacobian_product(
             inputs.core_epsilon,
             inputs.clad_epsilon,
             inputs.substrate_epsilon,
+            inputs.mode_index,
         )
     )
     if session is None:
