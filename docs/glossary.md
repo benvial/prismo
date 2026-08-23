@@ -110,7 +110,7 @@ Ref: Soref & Bennett, IEEE JQE 23(1):123–129, 1987. Coefficients here are for 
 
 gyptis solves on the whole domain. **ChargeTransport is restricted to the silicon subdomain** (slab + rib): its tesseract extracts the silicon grid, gathers the full-mesh doping onto the silicon nodes, and scatters the silicon carriers and gradient back onto the full node set. Mesh coordinates are µm; ChargeTransport scales them to metres on load, because it solves in SI.
 
-A run without containers has no gyptis to author the mesh, so `prismo.waveguide_mesh` writes a simpler rib mesh (no PML frame) in its place. That is a second *author*, not a second contract: ChargeTransport reads whichever file the run wrote, so the local author emits the same µm coordinates and the same `slab` / `rib_silicon` silicon groups. An earlier version authored metres under `silicon` / `oxide`, which made the µm-scaled `r_min` an all-pairs filter and left the Julia silicon lookup with no group it recognised.
+A run without a live gyptis (the unit tests' solver doubles) has nothing to author the mesh, so `prismo.waveguide_mesh` writes a simpler rib mesh (no PML frame) in its place; an in-process run with gyptis importable (Binder, `make run`) uses the gyptis author like the containers do. That is a second *author*, not a second contract: ChargeTransport reads whichever file the run wrote, so the local author emits the same µm coordinates and the same `slab` / `rib_silicon` silicon groups. An earlier version authored metres under `silicon` / `oxide`, which made the µm-scaled `r_min` an all-pairs filter and left the Julia silicon lookup with no group it recognised.
 
 See *Implementation choices*.
 
@@ -156,7 +156,7 @@ Computed as `α_mode = (n_si/neff) · Σ_cell w_cell · α_cell`, with `α_cell`
 
 ## Contact offset / domain width
 
-Geometry knobs of the shared mesh: `--contact-offset` (gap from the rib edge to the near contact edge, default 0.2 µm; foundries use 0.5–1 µm) and `--domain-width` (the physical box width the slab spans, PML excluded; default 2.0 µm in the gyptis author, 3.0 µm in the local author). On the container path they reach the gyptis mesh author as `PRISMO_GYPTIS_CONTACT_OFFSET` / `PRISMO_GYPTIS_WIDTH`, read once at import like the mesh size; the contacts must stay inside the box. Widening the contact spacing takes the contact out of the mode tail and frees the optimizer to place intermediate doping between rib and contact.
+Geometry knobs of the shared mesh: `--contact-offset` (gap from the rib edge to the near contact edge, default 0.2 µm; foundries use 0.5–1 µm) and `--domain-width` (the physical box width the slab spans, PML excluded; default 2.0 µm in the gyptis author, 3.0 µm in the local author). They reach the gyptis mesh author as `PRISMO_GYPTIS_CONTACT_OFFSET` / `PRISMO_GYPTIS_WIDTH` (container environment, or exported before the in-process bundle loads), read once at import like the mesh size; the contacts must stay inside the box. Widening the contact spacing takes the contact out of the mode tail and frees the optimizer to place intermediate doping between rib and contact.
 
 ## Mode index (targeted guided mode)
 

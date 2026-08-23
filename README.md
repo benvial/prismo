@@ -181,16 +181,18 @@ writes `convergence.pdf`, `doping_field.pdf`, `mode_field.pdf`,
 `depletion_field.pdf`, `gradient_validation.pdf`, `loss_convergence.pdf`,
 `tradeoff.pdf`, `doping_evolution.{gif,mp4}` and `checkpoint.json` (best design
 + full history, resumable by `prismo animate`). There is no stub path: without
-the containers `make run` raises instead of inventing a gradient; unit tests
-inject explicit doubles through the `components=` seam.
+the containers `make run` needs both solvers importable (gyptis/FEniCS and
+`julia`, as on Binder) and raises otherwise instead of inventing a gradient;
+unit tests inject explicit doubles through the `components=` seam.
 
 **In the browser.** The Binder badge above opens
 [`notebooks/prismo.ipynb`](notebooks/prismo.ipynb) in a JupyterLab with both
 solvers installed in-process (conda gyptis/FEniCS + Julia 1.10 with the same
 pinned ChargeTransport.jl environment as the container, from `binder/`). No
-Docker there, so it is the `make run` path: same physics, adjoint and optimizer,
-on the locally authored rib mesh. Binder gives ~1 CPU and 2 GB, about a minute
-per evaluation, so the notebook defaults to a short run; a terminal in the same
+Docker there, so it is the `make run` path: the same gyptis-authored mesh,
+physics, adjoint and optimizer, with the solvers called in-process instead of
+over HTTP. Binder gives ~1 CPU and 2 GB: a minute of JIT warm-up, then a few
+seconds per evaluation (a 200-iteration run is ~15 min); a terminal in the same
 session takes any `prismo ...` / `make run` command.
 
 Developer loop: `PRISMO_DEV_MOUNTS=1 make run-containers` bind-mounts the host

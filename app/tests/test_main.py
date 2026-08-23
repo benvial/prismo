@@ -132,7 +132,7 @@ def test_run_gradient_validation_passes_for_real_gradient(
         output_dir=str(tmp_path),
         tolerance=1e-2,
         n_directions=2,
-        use_containers=False,
+        live_solvers=False,
         components=stub_components(),
     )
     assert result.passed is True
@@ -230,7 +230,7 @@ def test_container_run_seeds_signed_junction_for_optimization(
         mesh_path=str(tmp_path / "mesh.msh"),
         output_dir=str(tmp_path),
         no_jit=True,
-        use_containers=True,
+        live_solvers=True,
         components=_container_components([[0.5, 0.0], [1.5, 0.0]]),
     )
 
@@ -327,7 +327,7 @@ def test_container_run_figures_probe_the_optimized_pipeline(
         mesh_path=str(tmp_path / "mesh.msh"),
         output_dir=str(tmp_path),
         no_jit=True,
-        use_containers=True,
+        live_solvers=True,
         components=components,
     )
 
@@ -419,7 +419,7 @@ def test_container_run_survives_a_failing_mode_query(
         mesh_path=str(tmp_path / "mesh.msh"),
         output_dir=str(tmp_path),
         no_jit=True,
-        use_containers=True,
+        live_solvers=True,
         components=components,
     )
 
@@ -467,7 +467,7 @@ def test_container_run_rejects_near_zero_objective(
             mesh_path=str(tmp_path / "mesh.msh"),
             output_dir=str(tmp_path),
             no_jit=True,
-            use_containers=True,
+            live_solvers=True,
             components=_container_components([[0.5, 0.0]]),
         )
 
@@ -563,7 +563,7 @@ def test_container_run_reports_warm_and_cold_objective(
         mesh_path=str(tmp_path / "mesh.msh"),
         output_dir=str(tmp_path),
         no_jit=True,
-        use_containers=True,
+        live_solvers=True,
         components=components,
     )
 
@@ -627,7 +627,7 @@ def test_container_run_without_reset_seam_skips_cold_reevaluation(
         mesh_path=str(tmp_path / "mesh.msh"),
         output_dir=str(tmp_path),
         no_jit=True,
-        use_containers=True,
+        live_solvers=True,
         components=_container_components([[0.5, 0.0], [1.5, 0.0]]),
     )
 
@@ -680,7 +680,7 @@ def test_run_clears_stale_live_doping_frames(
         mesh_path=str(tmp_path / "mesh.msh"),
         output_dir=str(tmp_path),
         no_jit=True,
-        use_containers=True,
+        live_solvers=True,
         components=_container_components([[0.5, 0.0], [1.5, 0.0]]),
     )
 
@@ -719,7 +719,7 @@ def test_gradient_validation_cold_resets_before_every_evaluation(
         tolerance=1e-2,
         n_directions=2,
         step_sizes=step_sizes,
-        use_containers=False,
+        live_solvers=False,
         components=components,
         cold=True,
     )
@@ -753,7 +753,7 @@ def test_gradient_validation_cold_requires_a_reset_seam(
             output_dir=str(tmp_path),
             tolerance=1e-2,
             n_directions=1,
-            use_containers=False,
+            live_solvers=False,
             components=stub_components(),
             cold=True,
         )
@@ -787,7 +787,7 @@ def test_gradient_validation_default_is_warm(
         tolerance=1e-2,
         n_directions=1,
         step_sizes=np.asarray([1e-2]),
-        use_containers=False,
+        live_solvers=False,
         components=components,
     )
     assert resets == []
@@ -814,7 +814,7 @@ def test_local_pipeline_inputs_keep_the_seeded_junction_under_the_default_filter
     inputs = main_module.build_pipeline_inputs(
         r_min=0.05,
         mesh_path=str(tmp_path / "waveguide.msh"),
-        use_containers=False,
+        live_solvers=False,
         components=None,
     )
 
@@ -854,14 +854,14 @@ def test_mesh_size_refines_the_locally_authored_mesh(tmp_path: Path) -> None:
     coarse = main_module.build_pipeline_inputs(
         r_min=0.05,
         mesh_path=str(tmp_path / "coarse.msh"),
-        use_containers=False,
+        live_solvers=False,
         components=None,
         mesh_size=0.04,
     )
     fine = main_module.build_pipeline_inputs(
         r_min=0.05,
         mesh_path=str(tmp_path / "fine.msh"),
-        use_containers=False,
+        live_solvers=False,
         components=None,
         mesh_size=0.02,
     )
@@ -899,7 +899,7 @@ def test_design_variables_live_on_the_silicon_nodes_only(tmp_path: Path) -> None
     inputs = main_module.build_pipeline_inputs(
         r_min=0.05,
         mesh_path=str(tmp_path / "waveguide.msh"),
-        use_containers=False,
+        live_solvers=False,
         components=None,
     )
     geometry = RibWaveguideGeometry()
@@ -924,7 +924,7 @@ def test_design_variables_live_on_the_silicon_nodes_only(tmp_path: Path) -> None
     )
 
 
-def test_container_overlay_geometry_follows_the_gyptis_frame() -> None:
+def test_gyptis_overlay_geometry_follows_the_gyptis_frame() -> None:
     """Container figures draw the overlay in the gyptis mesh's own frame.
 
     The gyptis author centres its layer stack on y = 0 with a 0.35 um
@@ -933,7 +933,7 @@ def test_container_overlay_geometry_follows_the_gyptis_frame() -> None:
     the rib outline off the device. The overlay must instead be
     derived from the design-cell vertices and node coordinates.
     """
-    from prismo.main import PipelineInputs, _container_overlay_geometry
+    from prismo.main import PipelineInputs, _gyptis_overlay_geometry
     from prismo.waveguide_mesh import RibWaveguideGeometry
 
     # gyptis-like frame: 500 nm x 220 nm rib sitting on the slab top at
@@ -959,7 +959,7 @@ def test_container_overlay_geometry_follows_the_gyptis_frame() -> None:
         design_vertices=vertices,
     )
 
-    overlay = _container_overlay_geometry(inputs)
+    overlay = _gyptis_overlay_geometry(inputs)
     assert overlay.rib_left == pytest.approx(-0.25)
     assert overlay.rib_right == pytest.approx(0.25)
     assert overlay.slab_top == pytest.approx(-0.06)
@@ -982,7 +982,7 @@ def test_container_overlay_geometry_follows_the_gyptis_frame() -> None:
         design_transfer=None,
         design_vertices=None,
     )
-    assert _container_overlay_geometry(inputs_no_vertices) is inputs.geometry
+    assert _gyptis_overlay_geometry(inputs_no_vertices) is inputs.geometry
 
 
 def _probe_mesh_stubs(
@@ -1030,7 +1030,7 @@ def test_objective_probe_loads_the_checkpoint_design(
         direction="gradient",
         spacing=1e-4,
         n_points=5,
-        use_containers=False,
+        live_solvers=False,
         components=components,
         cold=False,
     )
@@ -1078,7 +1078,7 @@ def test_objective_probe_checkpoint_size_mismatch_raises(
             direction="gradient",
             spacing=1e-4,
             n_points=5,
-            use_containers=False,
+            live_solvers=False,
             components=stub_components(),
             cold=False,
         )
@@ -1100,7 +1100,7 @@ def test_objective_probe_cold_resets_before_every_evaluation(
         direction="random",
         spacing=1e-4,
         n_points=7,
-        use_containers=False,
+        live_solvers=False,
         components=stub_components(
             reset_chargetransport=lambda: resets.append("reset")
         ),
@@ -1126,7 +1126,7 @@ def test_objective_probe_cold_requires_a_reset_seam(
             direction="gradient",
             spacing=1e-4,
             n_points=3,
-            use_containers=False,
+            live_solvers=False,
             components=stub_components(),
             cold=True,
         )
@@ -1149,7 +1149,7 @@ def test_objective_probe_zero_gradient_points_at_random_direction(
             direction="gradient",
             spacing=1e-4,
             n_points=3,
-            use_containers=False,
+            live_solvers=False,
             components=stub_components(),
             cold=False,
         )
@@ -1218,7 +1218,7 @@ def test_container_run_survives_a_failing_cold_resolve(
         mesh_path=str(tmp_path / "mesh.msh"),
         output_dir=str(tmp_path),
         no_jit=True,
-        use_containers=True,
+        live_solvers=True,
         components=components,
     )
 
@@ -1271,7 +1271,7 @@ def test_run_seed_option_selects_the_initial_design(
         mesh_path=str(tmp_path / "mesh.msh"),
         output_dir=str(tmp_path),
         no_jit=True,
-        use_containers=True,
+        live_solvers=True,
         components=_container_components([[0.0, 0.25], [0.1, 0.25]]),
         seed="u",
     )
@@ -1338,7 +1338,7 @@ def test_run_binds_loss_weight_and_mode_overlap_to_the_optimizer(
         mesh_path=str(tmp_path / "mesh.msh"),
         output_dir=str(tmp_path),
         no_jit=True,
-        use_containers=True,
+        live_solvers=True,
         components=components,
         loss_weight=1e-6,
     )
@@ -1383,7 +1383,7 @@ def test_run_without_a_gyptis_backend_needs_no_overlap_unless_weighted(
         mesh_path=str(tmp_path / "mesh.msh"),
         output_dir=str(tmp_path),
         no_jit=True,
-        use_containers=True,
+        live_solvers=True,
         components=_container_components([[0.5, 0.0], [1.5, 0.0]]),  # gyptis=None
     )
 
@@ -1514,7 +1514,7 @@ def test_gradient_validation_uses_the_requested_seed(
         output_dir=str(tmp_path),
         tolerance=1e-2,
         n_directions=1,
-        use_containers=False,
+        live_solvers=False,
         components=None,
         seed="vertical",
     )
@@ -1597,7 +1597,7 @@ def test_run_hands_per_iteration_doping_frames_to_the_outputs(
         mesh_path=str(tmp_path / "mesh.msh"),
         output_dir=str(tmp_path),
         no_jit=True,
-        use_containers=True,
+        live_solvers=True,
         components=_container_components([[0.5, 0.0], [1.5, 0.0]]),
     )
 
@@ -1777,7 +1777,7 @@ def test_run_hands_the_swept_carriers_to_the_outputs(
         mesh_path=str(tmp_path / "mesh.msh"),
         output_dir=str(tmp_path),
         no_jit=True,
-        use_containers=True,
+        live_solvers=True,
         components=components,
     )
     # Identity-carrier doubles: n = p = doping at both biases, so nothing is swept.

@@ -7,6 +7,7 @@ paper-ready plots.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -87,6 +88,42 @@ def _check_geometry_knobs(
         raise typer.BadParameter("--domain-width must be positive [µm]")
 
 
+def _in_process_components(
+    mode_index: int = 0,
+    mesh_size: float | None = None,
+    contact_offset: float | None = None,
+    domain_width: float | None = None,
+) -> Any:
+    """The in-process solver bundle, with the gyptis author sized from the CLI.
+
+    The gyptis tesseract_api reads its geometry knobs from the environment when
+    it loads, so export them before the bundle is built. A CLI invocation is a
+    fresh process, which is what makes this work; a caller that has already
+    loaded the bundle keeps the author it loaded with.
+    """
+    from prismo.pipeline import (
+        build_default_components,
+        default_components,
+        gyptis_author_env,
+    )
+
+    os.environ.update(gyptis_author_env(mesh_size, contact_offset, domain_width))
+    # The shared bundle targets the fundamental; a higher-order target needs
+    # its own (the mode is bound at build time).
+    if mode_index:
+        return build_default_components(mode_index=mode_index)
+    return default_components()
+
+
+def _live_solvers(components: Any | None) -> bool:
+    """Whether ``components`` carries a live gyptis (containers or in-process).
+
+    Live solvers author the shared mesh and size the design transfer; doubles
+    without ``write_mesh`` get the local rib mesh instead.
+    """
+    return components is not None and components.write_mesh is not None
+
+
 @app.command()
 def run(
     r_min: float = typer.Option(_DEFAULT_R_MIN, help="Density filter radius [µm]"),
@@ -148,7 +185,6 @@ def run(
     _check_geometry_knobs(seed, contact_offset, domain_width)
     from prismo.pipeline import (
         PipelineComponents,
-        build_default_components,
         init_tesseract_containers,
         teardown_containers,
     )
@@ -163,10 +199,10 @@ def run(
             contact_offset=contact_offset,
             domain_width=domain_width,
         )
-    elif mode_index:
-        # The shared in-process bundle targets the fundamental; a higher-order
-        # target needs its own bundle (the mode is bound at build time).
-        components = build_default_components(mode_index=mode_index)
+    else:
+        components = _in_process_components(
+            mode_index, mesh_size, contact_offset, domain_width
+        )
 
     try:
         _run_pipeline(
@@ -177,7 +213,7 @@ def run(
             mesh_size=mesh_size,
             output_dir=output_dir,
             no_jit=no_jit,
-            use_containers=use_containers,
+            live_solvers=use_containers or _live_solvers(components),
             components=components,
             move_limit=move_limit,
             mode_index=mode_index,
@@ -268,6 +304,10 @@ def validate_gradient(
             contact_offset=contact_offset,
             domain_width=domain_width,
         )
+    else:
+        components = _in_process_components(
+            contact_offset=contact_offset, domain_width=domain_width
+        )
 
     try:
         result = _run_gradient_validation(
@@ -277,7 +317,7 @@ def validate_gradient(
             tolerance=tolerance,
             n_directions=n_directions,
             step_sizes=step_sizes,
-            use_containers=use_containers,
+            live_solvers=use_containers or _live_solvers(components),
             components=components,
             cold=cold,
             loss_weight=loss_weight,
@@ -409,7 +449,7 @@ def _local_geometry(
 def build_pipeline_inputs(
     r_min: float,
     mesh_path: str,
-    use_containers: bool,
+    live_solvers: bool,
     components: Any | None,
     mesh_size: float | None = None,
     seed: str = "lateral",
@@ -422,16 +462,19 @@ def build_pipeline_inputs(
     check) and ``scripts/benchmark_multiphysics_optimization.py`` all
     start here so they solve on exactly the same mesh, filter, transfer, and
     seed -- the benchmark used to assemble its own and drifted out of contract
-    with this one. Container runs author the mesh via gyptis
-    ``write_mesh`` and require live components; the in-process path builds the
-    rib mesh locally. Lengths are micrometres throughout, ``r_min`` included.
+    with this one. With live solvers (``live_solvers``: the containers, or the
+    tesseract apis loaded in-process) gyptis authors the shared mesh via
+    ``write_mesh`` and the design transfer is built from it; without them
+    (solver doubles in tests) the rib mesh is built locally and the design
+    field maps onto it directly. Lengths are micrometres throughout, ``r_min``
+    included.
 
-    ``mesh_size`` refines the silicon: on the container path the caller has
-    already passed it to :func:`init_tesseract_containers`, which is where the
-    mesh author lives, so here it only sizes the local rib mesh. ``None`` keeps
-    each author's default; likewise ``contact_offset`` / ``domain_width``, which
-    on the container path were already passed to the gyptis author and here
-    size the local mesh and the figure overlay. ``seed`` picks
+    ``mesh_size`` refines the silicon: on the live path the caller has already
+    handed it to the gyptis author (container environment or the in-process
+    ``PRISMO_GYPTIS_*`` knobs), so here it only sizes the local rib mesh.
+    ``None`` keeps each author's default; likewise ``contact_offset`` /
+    ``domain_width``, which on the live path were already passed to the gyptis
+    author and here size the local mesh and the figure overlay. ``seed`` picks
     the initial junction topology (``pipeline.SEED_KINDS``).
     """
     import jax.numpy as jnp
@@ -454,9 +497,9 @@ def build_pipeline_inputs(
         contact_offset=contact_offset,
         domain_width=domain_width,
     )
-    if use_containers:
+    if live_solvers:
         if components is None or components.write_mesh is None:
-            raise RuntimeError("Container pipeline requires gyptis mesh authoring")
+            raise RuntimeError("Live pipeline requires gyptis mesh authoring")
         design_vertices = components.write_mesh(mesh_path_obj)
         actual_mesh = mesh_path_obj
     else:
@@ -523,17 +566,15 @@ def build_pipeline_inputs(
     typer.echo(f"      Seed: {seed} junction")
 
     design_transfer = None
-    if use_containers:
+    if live_solvers:
         # Carry the full nodal permittivity field onto the gyptis design cells
         # instead of the identity fallback, so a fixed-mean topology change moves
         # neff through the real eigenmode solve. The transfer is
         # assembled from live sources keyed to the shared mesh's nodes.
         if components is None:
-            raise RuntimeError("Container pipeline requires live components")
+            raise RuntimeError("Live pipeline requires live components")
         if design_vertices is None:
-            raise RuntimeError(
-                "Container pipeline requires gyptis design-cell vertices"
-            )
+            raise RuntimeError("Live pipeline requires gyptis design-cell vertices")
         design_transfer = build_design_transfer(
             components, coords, design_cell_vertices=design_vertices
         )
@@ -560,8 +601,8 @@ def build_pipeline_inputs(
     )
 
 
-def _container_overlay_geometry(inputs: PipelineInputs) -> Any:
-    """The figure overlay frame for a container run, from the gyptis mesh itself.
+def _gyptis_overlay_geometry(inputs: PipelineInputs) -> Any:
+    """The figure overlay frame for a live run, from the gyptis mesh itself.
 
     ``RibWaveguideGeometry`` describes the local mesh author's frame: y from 0
     at the substrate bottom, 0.5 µm substrate. The gyptis author centres its
@@ -859,7 +900,7 @@ def _run_pipeline(
     mesh_path: str,
     output_dir: str,
     no_jit: bool,
-    use_containers: bool,
+    live_solvers: bool,
     mesh_size: float | None = None,
     components: Any | None = None,
     move_limit: float = _DEFAULT_MOVE_LIMIT,
@@ -890,7 +931,7 @@ def _run_pipeline(
     inputs = build_pipeline_inputs(
         r_min,
         mesh_path,
-        use_containers,
+        live_solvers,
         components,
         mesh_size=mesh_size,
         seed=seed,
@@ -908,12 +949,10 @@ def _run_pipeline(
         f"      Loss weight: {loss_weight:g}"
         + (" (Δneff alone is optimized)" if loss_weight == 0.0 else " [neff per dB/cm]")
     )
-    # Container figures draw the gyptis frame, not the local author's
-    #: the two meshes differ in vertical origin and substrate
-    # thickness, and the overlay must describe the mesh the nodes came from.
-    geometry = (
-        _container_overlay_geometry(inputs) if use_containers else inputs.geometry
-    )
+    # Live-solver figures draw the gyptis frame, not the local author's:
+    # the two meshes differ in vertical origin and substrate thickness, and
+    # the overlay must describe the mesh the nodes came from.
+    geometry = _gyptis_overlay_geometry(inputs) if live_solvers else inputs.geometry
     coords = inputs.coords
     mesh_ref = inputs.mesh_ref
     H_dense = inputs.H_dense
@@ -924,10 +963,10 @@ def _run_pipeline(
 
     typer.echo("[2/3] Running NLopt MMA optimization...")
     try:
-        optimization_max_iter = max(max_iter, 5) if use_containers else max_iter
+        optimization_max_iter = max(max_iter, 5) if live_solvers else max_iter
         optimization_ftol_rel = ftol_rel
         on_iteration = None
-        if use_containers:
+        if live_solvers:
             H_np = np.asarray(H_dense)
             H_sum_np = np.asarray(H_sum)
 
@@ -1035,7 +1074,7 @@ def _run_pipeline(
                 f"{loss_figure_of_merit_v_db(headline, float(warm_loss)):+.4g} V·dB"
             )
 
-    if use_containers:
+    if live_solvers:
         # This audits that the containers produced a *live* signal, not that the
         # optimizer liked it. The magnitude is what carries that: a dead or
         # stubbed pipeline reads |Delta_neff| ~ 0 with no gradient. The sign is
@@ -1052,7 +1091,7 @@ def _run_pipeline(
         ]
         if invalid:
             raise RuntimeError(
-                "Container pipeline produced invalid optimization signal at "
+                "Live pipeline produced invalid optimization signal at "
                 f"{len(invalid)} iteration(s)"
             )
 
@@ -1076,12 +1115,12 @@ def _run_pipeline(
         geometry=geometry,
         pipeline_fn=bound_pipeline,
         ftol_rel=optimization_ftol_rel,
-        gradient_validation_directions=1 if use_containers else 3,
-        gradient_validation_steps=(np.logspace(-4, -2, 3) if use_containers else None),
+        gradient_validation_directions=1 if live_solvers else 3,
+        gradient_validation_steps=(np.logspace(-4, -2, 3) if live_solvers else None),
         # Explicit on both paths: the figure's finite differences probe the
         # bound pipeline, which takes a design-node vector, while ``rho_opt``
         # above has already been scattered to full node order for plotting.
-        gradient_validation_rho=rho_initial if use_containers else rho_opt,
+        gradient_validation_rho=rho_initial if live_solvers else rho_opt,
         mode_field=mode_field,
         output_dir=output_dir,
         # The silicon triangulation: the doping figure paints the device's own
@@ -1106,7 +1145,7 @@ def _run_gradient_validation(
     output_dir: str,
     tolerance: float,
     n_directions: int,
-    use_containers: bool,
+    live_solvers: bool,
     components: Any | None = None,
     step_sizes: np.ndarray | None = None,
     cold: bool = False,
@@ -1135,7 +1174,7 @@ def _run_gradient_validation(
     inputs = build_pipeline_inputs(
         r_min,
         mesh_path,
-        use_containers,
+        live_solvers,
         components,
         seed=seed,
         contact_offset=contact_offset,
@@ -1262,6 +1301,10 @@ def probe_objective(
             contact_offset=contact_offset,
             domain_width=domain_width,
         )
+    else:
+        components = _in_process_components(
+            contact_offset=contact_offset, domain_width=domain_width
+        )
     try:
         _run_objective_probe(
             r_min=r_min,
@@ -1271,7 +1314,7 @@ def probe_objective(
             direction=direction,
             spacing=spacing,
             n_points=n_points,
-            use_containers=use_containers,
+            live_solvers=use_containers or _live_solvers(components),
             components=components,
             cold=cold,
             loss_weight=loss_weight,
@@ -1307,7 +1350,7 @@ def _run_objective_probe(
     direction: str,
     spacing: float,
     n_points: int,
-    use_containers: bool,
+    live_solvers: bool,
     components: Any | None = None,
     cold: bool = False,
     loss_weight: float = 0.0,
@@ -1334,7 +1377,7 @@ def _run_objective_probe(
     inputs = build_pipeline_inputs(
         r_min,
         mesh_path,
-        use_containers,
+        live_solvers,
         components,
         seed=seed,
         contact_offset=contact_offset,

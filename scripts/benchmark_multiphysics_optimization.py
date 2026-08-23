@@ -211,7 +211,9 @@ def _prepare_full_pipeline(args: argparse.Namespace, components: Any) -> Any:
     inputs = build_pipeline_inputs(
         r_min=args.r_min,
         mesh_path=str(args.mesh_path),
-        use_containers=args.mode == "containers",
+        # Live solvers (containers, or the tesseract apis importable in-process)
+        # author the shared mesh; without them the local rib mesh is used.
+        live_solvers=args.mode == "containers" or components.write_mesh is not None,
         components=components,
     )
     if inputs.n_nodes == 0:

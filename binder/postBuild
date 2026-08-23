@@ -6,6 +6,9 @@ set -euxo pipefail
 # Host app + shared schemas on top of the conda solvers. The JAX/NLopt stack is
 # already in the conda env, so pip only adds tesseract-core, typer and friends.
 python -m pip install --no-cache-dir -e components/shared_code -e app
+# The tesseract_api modules import tesseract_core.runtime, which the plain
+# tesseract-core wheel does not pull in (the images install it themselves).
+python -m pip install --no-cache-dir "tesseract-core[runtime]==1.11.0"
 
 # Warm the FEniCS/FFC JIT cache (same workload the gyptis image runs at build
 # time) so the first eigensolve in a session does not pay form compilation.

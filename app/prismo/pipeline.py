@@ -260,6 +260,28 @@ def _close_all(
         close()
 
 
+def gyptis_author_env(
+    mesh_size: float | None = None,
+    contact_offset: float | None = None,
+    domain_width: float | None = None,
+) -> dict[str, str]:
+    """Environment knobs the gyptis mesh author reads, for the values given.
+
+    The gyptis tesseract_api sizes the shared mesh from ``PRISMO_GYPTIS_MESH_SIZE``
+    / ``PRISMO_GYPTIS_CONTACT_OFFSET`` / ``PRISMO_GYPTIS_WIDTH`` when it loads. The
+    container path passes them to the image; the in-process path exports them
+    before the module is first imported. ``None`` keeps the author's default.
+    """
+    env: dict[str, str] = {}
+    if mesh_size is not None:
+        env["PRISMO_GYPTIS_MESH_SIZE"] = repr(float(mesh_size))
+    if contact_offset is not None:
+        env["PRISMO_GYPTIS_CONTACT_OFFSET"] = repr(float(contact_offset))
+    if domain_width is not None:
+        env["PRISMO_GYPTIS_WIDTH"] = repr(float(domain_width))
+    return env
+
+
 def init_tesseract_containers(
     mesh_dir: str | Path | None = None,
     mesh_size: float | None = None,
@@ -359,12 +381,7 @@ def init_tesseract_containers(
         _close_all(closers)
         raise RuntimeError("Failed to start ChargeTransport container") from exc
 
-    if mesh_size is not None:
-        gyptis_env["PRISMO_GYPTIS_MESH_SIZE"] = repr(float(mesh_size))
-    if contact_offset is not None:
-        gyptis_env["PRISMO_GYPTIS_CONTACT_OFFSET"] = repr(float(contact_offset))
-    if domain_width is not None:
-        gyptis_env["PRISMO_GYPTIS_WIDTH"] = repr(float(domain_width))
+    gyptis_env.update(gyptis_author_env(mesh_size, contact_offset, domain_width))
     try:
         gyptis_tesseract = Tesseract.from_image(
             "prismo_gyptis:latest",
@@ -1120,11 +1137,20 @@ def build_default_components(mode_index: int = 0) -> PipelineComponents:
     )
 
 
-_DEFAULT_COMPONENTS: PipelineComponents = build_default_components()
+_DEFAULT_COMPONENTS: PipelineComponents | None = None
 
 
 def default_components() -> PipelineComponents:
-    """The shared in-process components ``pipeline()`` uses without a bundle."""
+    """The shared in-process components ``pipeline()`` uses without a bundle.
+
+    Built on first use, not at import: the gyptis tesseract_api reads its
+    geometry knobs (``PRISMO_GYPTIS_*``, see :func:`gyptis_author_env`) when it
+    loads, so the CLI can set them for an in-process run before the bundle
+    exists.
+    """
+    global _DEFAULT_COMPONENTS
+    if _DEFAULT_COMPONENTS is None:
+        _DEFAULT_COMPONENTS = build_default_components()
     return _DEFAULT_COMPONENTS
 
 
@@ -1391,7 +1417,7 @@ def carrier_fields(
     the mode). Not differentiated; the same two solves the pipeline runs.
     """
     if components is None:
-        components = _DEFAULT_COMPONENTS
+        components = default_components()
     if H is not None:
         if H_sum is None:
             H_sum = jnp.sum(H, axis=1)
@@ -1430,7 +1456,7 @@ def design_epsilon_from_theta(
     if background_epsilon is None:
         background_epsilon = DEFAULT_BACKGROUND_EPSILON
     if components is None:
-        components = _DEFAULT_COMPONENTS
+        components = default_components()
     epsilon_bg, epsilon_pert, _n0, _p0 = _pre_eigensolve(
         theta,
         H,
@@ -1473,7 +1499,7 @@ def pipeline_with_terms(
     if background_epsilon is None:
         background_epsilon = DEFAULT_BACKGROUND_EPSILON
     if components is None:
-        components = _DEFAULT_COMPONENTS
+        components = default_components()
 
     epsilon_bg, epsilon_pert, n0_cm3, p0_cm3 = _pre_eigensolve(
         theta,
