@@ -294,8 +294,13 @@ class TestPipelineStub:
         with pytest.raises(Exception, match="backend"):
             pipeline(rho)
 
-    def test_default_components_have_no_physics_free_fallback(self, rho):
+    def test_default_components_have_no_physics_free_fallback(self, rho, monkeypatch):
         """``build_default_components`` builds, but a call without a live solver raises."""
+        import prismo.pipeline as pl
+
+        # Hermetic: pretend neither component's tesseract_api is importable, so
+        # the outcome does not depend on a Julia or gyptis install on the host.
+        monkeypatch.setattr(pl, "_load_tesseract_api", lambda name: None)
         components = build_default_components()
         with pytest.raises(Exception, match="backend"):
             pipeline(rho, components=components)
