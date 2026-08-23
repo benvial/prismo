@@ -209,14 +209,16 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-
-
+# Run outputs (figures, checkpoints, meshes); docs/figures/ holds the committed snapshots
 outputs/
+run_*
+# Local agent scaffolding, design notes and working tickets (not part of the release)
 AGENTS.md
 CLAUDE.md
 RULES.md
 CONTEXT.md
+docs/adr
 docs/agents
 docs/research
 .scratch
-run_*
+.kilo

@@ -32,7 +32,7 @@ _MIN_CONTAINER_OBJECTIVE = 1e-12
 # kept as a literal so ``--help`` never eagerly imports jax/nlopt).
 _DEFAULT_MOVE_LIMIT = 0.05
 # Density-filter radius [µm]: 3-4 elements of the 0.04 µm container mesh, so
-# the result is smooth enough to be an implant mask (ticket 25). The previous
+# the result is smooth enough to be an implant mask. The previous
 # 0.05 µm reached one neighbour and left checkerboard-like slab values.
 _DEFAULT_R_MIN = 0.10
 # Junction seeds (``--seed``); mirrors ``pipeline.SEED_KINDS`` as literals so
@@ -130,7 +130,7 @@ def run(
         min=0.0,
         help="Weight w of the modal free-carrier loss in the objective "
         "Δneff - w·alpha [neff per dB/cm]; 0 optimizes Δneff alone and only "
-        "reports the loss (ticket 25). ~4e-6 trades 1e-4 of Δneff against "
+        "reports the loss. ~4e-6 trades 1e-4 of Δneff against "
         "25 dB/cm",
     ),
     seed: str = _seed_option(),
@@ -233,18 +233,18 @@ def validate_gradient(
         "--loss-weight",
         min=0.0,
         help="Validate the loss-penalized objective Δneff - w·alpha instead of "
-        "Δneff alone (ticket 25)",
+        "Δneff alone",
     ),
     seed: str = _seed_option(),
     contact_offset: float = _contact_offset_option(),
     domain_width: float = _domain_width_option(),
 ) -> None:
-    """Validate the composed ∂(Δneff)/∂θ gradient against central FD (ticket 06).
+    """Validate the composed ∂(Δneff)/∂θ gradient against central FD.
 
     The hackathon's "gradients do real work" proof: checks the adjoint against
     central finite differences on sampled θ directions at the seeded junction and
     writes ``gradient_validation.pdf``. Run with ``--use-containers`` to exercise
-    the real ChargeTransport + gyptis boundary (CT included, audit #7); exits
+    the real ChargeTransport + gyptis boundary (CT included); exits
     non-zero if the worst relative error exceeds the tolerance.
     """
     from prismo.pipeline import (
@@ -372,7 +372,7 @@ def _local_geometry(
     reads from ``PRISMO_GYPTIS_MESH_SIZE``; the junction and bulk sizes follow
     it at the class defaults' own ratios (half the core at the junction, 2.5x it
     in the bulk), so one knob refines the whole local mesh proportionally.
-    ``contact_offset`` and ``domain_width`` (ticket 25) mirror the gyptis
+    ``contact_offset`` and ``domain_width`` mirror the gyptis
     ``PRISMO_GYPTIS_CONTACT_OFFSET`` / ``PRISMO_GYPTIS_WIDTH`` knobs; ``None``
     keeps the class defaults.
     """
@@ -395,7 +395,9 @@ def _local_geometry(
         kwargs["box_width"] = domain_width
     geometry = geometry_cls(**kwargs)
     # Same rule as the gyptis author: both contact footprints inside the box.
-    contact_outer = geometry.rib_right + geometry.contact_offset + geometry.contact_width
+    contact_outer = (
+        geometry.rib_right + geometry.contact_offset + geometry.contact_width
+    )
     if contact_outer >= geometry.box_width / 2.0:
         raise typer.BadParameter(
             f"--contact-offset {geometry.contact_offset} µm puts the contact edge at "
@@ -416,20 +418,20 @@ def build_pipeline_inputs(
 ) -> PipelineInputs:
     """Author the shared mesh and assemble the fixed pipeline inputs.
 
-    ``prismo run`` (optimization), ``prismo validate-gradient`` (the ticket 06
-    deliverable) and ``scripts/benchmark_multiphysics_optimization.py`` all
+    ``prismo run`` (optimization), ``prismo validate-gradient`` (the gradient
+    check) and ``scripts/benchmark_multiphysics_optimization.py`` all
     start here so they solve on exactly the same mesh, filter, transfer, and
     seed -- the benchmark used to assemble its own and drifted out of contract
-    with this one (ticket 15). Container runs author the mesh via gyptis
+    with this one. Container runs author the mesh via gyptis
     ``write_mesh`` and require live components; the in-process path builds the
     rib mesh locally. Lengths are micrometres throughout, ``r_min`` included.
 
     ``mesh_size`` refines the silicon: on the container path the caller has
     already passed it to :func:`init_tesseract_containers`, which is where the
     mesh author lives, so here it only sizes the local rib mesh. ``None`` keeps
-    each author's default; likewise ``contact_offset`` / ``domain_width``
-    (ticket 25), which on the container path were already passed to the gyptis
-    author and here size the local mesh and the figure overlay. ``seed`` picks
+    each author's default; likewise ``contact_offset`` / ``domain_width``, which
+    on the container path were already passed to the gyptis author and here
+    size the local mesh and the figure overlay. ``seed`` picks
     the initial junction topology (``pipeline.SEED_KINDS``).
     """
     import jax.numpy as jnp
@@ -470,7 +472,7 @@ def build_pipeline_inputs(
             "      WARNING: empty mesh (gmsh not available?). Using synthetic 8x8 grid."
         )
         n_side = 8
-        # Micrometres, like every real mesh this app reads (ticket 15): a 20 nm
+        # Micrometres, like every real mesh this app reads: a 20 nm
         # node pitch is 0.02 here, so the µm-scaled ``--r-min`` still means the
         # same physical radius on the fallback grid.
         xs, ys = np.meshgrid(
@@ -516,7 +518,7 @@ def build_pipeline_inputs(
     # Seed a signed P/N junction in every run path (sign(theta) is a free
     # design variable, so the optimizer can move or dissolve it). Seeded on the
     # design nodes, so the junction splits the silicon at its own median x
-    # rather than the whole domain's; ``seed`` picks the topology (ticket 25).
+    # rather than the whole domain's; ``seed`` picks the topology.
     theta_init = seed_design_field(design_coords, seed)
     typer.echo(f"      Seed: {seed} junction")
 
@@ -524,7 +526,7 @@ def build_pipeline_inputs(
     if use_containers:
         # Carry the full nodal permittivity field onto the gyptis design cells
         # instead of the identity fallback, so a fixed-mean topology change moves
-        # neff through the real eigenmode solve (ticket 08). The transfer is
+        # neff through the real eigenmode solve. The transfer is
         # assembled from live sources keyed to the shared mesh's nodes.
         if components is None:
             raise RuntimeError("Container pipeline requires live components")
@@ -564,9 +566,9 @@ def _container_overlay_geometry(inputs: PipelineInputs) -> Any:
     ``RibWaveguideGeometry`` describes the local mesh author's frame: y from 0
     at the substrate bottom, 0.5 µm substrate. The gyptis author centres its
     layer stack on y = 0 with a 0.35 µm substrate, so drawing the local frame
-    over container figures put the rib outline and shading off the device
-    (ticket 16). Derive the rib rectangle from the design-cell vertices (the
-    rib-interior triangles of the shared mesh), the domain half-width from the
+    over container figures put the rib outline and shading off the device.
+    Derive the rib rectangle from the design-cell vertices (the rib-interior
+    triangles of the shared mesh), the domain half-width from the
     node coordinates, and the slab/contact dimensions from the values both mesh
     authors share. Falls back to the local geometry when the vertices are
     unavailable.
@@ -598,7 +600,7 @@ def _optimized_mode_field(
     components: Any | None,
     mode_index: int = 0,
 ) -> ModeField | None:
-    """The tracked optical mode ``|E|`` at the optimized design (ticket 07).
+    """The tracked optical mode ``|E|`` at the optimized design.
 
     Re-runs the pipeline's own pre-eigensolve stages at ``rho_opt`` -- filter,
     doping, both ChargeTransport solves, Soref-Bennett, mesh transfer -- so the
@@ -678,7 +680,7 @@ def _clear_live_frames(output_dir: str | Path) -> int:
 
     The live frames are written one per optimizer iteration; a shorter run
     after a longer one would otherwise leave stale frames that read as part of
-    its own trajectory (ticket 21). Returns the number of frames removed.
+    its own trajectory. Returns the number of frames removed.
     """
     out = Path(output_dir)
     if not out.is_dir():
@@ -695,7 +697,7 @@ def _clear_live_frames(output_dir: str | Path) -> int:
 def _mode_overlap_weights(
     inputs: PipelineInputs, components: Any | None, loss_weight: float
 ) -> np.ndarray | None:
-    """The frozen mode-overlap weights the loss term needs (ticket 25).
+    """The frozen mode-overlap weights the loss term needs.
 
     One background eigensolve + adjoint through the bound gyptis component.
     Always attempted so every run reports its modal loss; a backend that cannot
@@ -778,7 +780,7 @@ def _best_history_entry(history: list[dict[str, Any]]) -> dict[str, Any]:
     """The accepted design's record: the best *objective* (Δneff when unweighted).
 
     The optimizer only accepts improving steps, so the last entry may be a
-    rejected trial; histories predating ticket 25 carry no ``objective`` key
+    rejected trial; older histories carry no ``objective`` key
     and fall back to Δneff.
     """
     return max(history, key=lambda e: e.get("objective", e["delta_n_eff"]))
@@ -805,12 +807,12 @@ def _cold_reevaluation(
     """Re-solve the reported design cold and compare with the optimizer's value.
 
     The headline Δneff must be a property of the design, not of the solve
-    history that produced it (ticket 20): the ChargeTransport worker's warm
+    history that produced it: the ChargeTransport worker's warm
     state is dropped, the best design evaluated once more, and both numbers
     reported. Returns ``None`` (with a note) when no reset seam is bound, and
     ``None`` with a warning when the cold solve itself fails: a design that
     only solves from a warm start is a finding worth the headline figures, not
-    a crash after a finished optimization (ticket 23). ``bound_terms`` is the
+    a crash after a finished optimization. ``bound_terms`` is the
     ``pipeline_with_terms`` partial: the comparison is on Δneff itself, not on
     a loss-penalized objective.
     """
@@ -899,7 +901,7 @@ def _run_pipeline(
         "      Target mode: "
         + ("fundamental (index 0)" if mode_index == 0 else f"guided index {mode_index}")
     )
-    # Loss-aware objective (ticket 25): Δneff - w·alpha with alpha the first-order modal
+    # Loss-aware objective: Δneff - w·alpha with alpha the first-order modal
     # free-carrier loss of the unbiased device; w = 0 reports the loss only.
     mode_overlap = _mode_overlap_weights(inputs, components, loss_weight)
     typer.echo(
@@ -907,7 +909,7 @@ def _run_pipeline(
         + (" (Δneff alone is optimized)" if loss_weight == 0.0 else " [neff per dB/cm]")
     )
     # Container figures draw the gyptis frame, not the local author's
-    # (ticket 16): the two meshes differ in vertical origin and substrate
+    #: the two meshes differ in vertical origin and substrate
     # thickness, and the overlay must describe the mesh the nodes came from.
     geometry = (
         _container_overlay_geometry(inputs) if use_containers else inputs.geometry
@@ -974,7 +976,7 @@ def _run_pipeline(
     # transfer included -- for the cold re-evaluation and the figure's finite
     # differences. Omitting them made the figure probe an unfiltered pipeline
     # with ChargeTransport on its 1D fallback device, i.e. a different function
-    # than the one that was optimized (ticket 15).
+    # than the one that was optimized.
     bound_kwargs = dict(
         H=H_dense,
         H_sum=H_sum,
@@ -993,7 +995,7 @@ def _run_pipeline(
     # figure, not every figure of a finished multi-minute optimization. It runs
     # before the cold re-evaluation so it sees the worker still warm at the
     # reported design: a design that solves only warm would otherwise lose its
-    # mode figure to the reset (ticket 23).
+    # mode figure to the reset.
     try:
         mode_field = _optimized_mode_field(inputs, rho_opt, components, mode_index)
     except Exception as exc:
@@ -1015,18 +1017,16 @@ def _run_pipeline(
         best = _best_history_entry(history)
         warm_delta_neff = float(best["delta_n_eff"])
         if loss_weight > 0.0:
-            typer.echo(
-                f"      Best objective (warm) = {float(best['objective']):+.6e}"
-            )
+            typer.echo(f"      Best objective (warm) = {float(best['objective']):+.6e}")
         typer.echo(f"      Best Delta_n_eff (warm) = {warm_delta_neff:+.6e}")
         cold = _cold_reevaluation(bound_terms, rho_opt, warm_delta_neff, components)
         headline = cold.cold_delta_neff if cold is not None else warm_delta_neff
         # VπLπ headline (V·cm): the field-standard modulation efficiency,
         # reported from Δneff at the fixed -5 V bias (smaller |VπLπ| better),
-        # computed from the cold value when available (ticket 20).
+        # computed from the cold value when available.
         typer.echo(f"      VpiLpi = {vpi_lpi_v_cm(headline):+.4e} V·cm")
         # Modal free-carrier loss of the reported design and the VπLπ·alpha figure
-        # of merit the literature compares on (ticket 25).
+        # of merit the literature compares on.
         warm_loss = best.get("modal_loss_db_cm")
         if warm_loss is not None:
             typer.echo(f"      Modal loss (0 V, warm) = {float(warm_loss):.4g} dB/cm")
@@ -1063,12 +1063,14 @@ def _run_pipeline(
     # which is what oxide means anyway.
     plot_initial = design_nodes.scatter_numpy(rho_initial)
     plot_opt = design_nodes.scatter_numpy(rho_opt)
-    doping_frames, animated_history = _doping_frames(history, H_dense, H_sum, design_nodes)
+    doping_frames, animated_history = _doping_frames(
+        history, H_dense, H_sum, design_nodes
+    )
     plot_paths = generate_outputs(
         rho_initial=plot_initial,
         rho_opt=plot_opt,
         history=history,
-        # Node coordinates are micrometres on both paths (ticket 15), which is
+        # Node coordinates are micrometres on both paths, which is
         # what the figures plot in -- no conversion at this seam.
         mesh_coords=coords,
         geometry=geometry,
@@ -1118,10 +1120,10 @@ def _run_gradient_validation(
     Unlike the optimization run, this binds the *full* pipeline -- filter,
     ``mesh_ref`` (so ChargeTransport solves on the shared 2D grid, not its 1D
     fallback), and design transfer -- into the function the finite-difference
-    sweep probes, so the CT adjoint is the thing being proven (audit #7).
-    ``cold`` resets the ChargeTransport worker before every evaluation
-    (ticket 20). ``loss_weight > 0`` validates the loss-penalized objective
-    (ticket 25), i.e. the loss term's adjoint through the 0 V carriers too.
+    sweep probes, so the CT adjoint is the thing being proven.
+    ``cold`` resets the ChargeTransport worker before every evaluation.
+    ``loss_weight > 0`` validates the loss-penalized objective, i.e. the loss
+    term's adjoint through the 0 V carriers too.
     """
     from prismo.outputs import validate_gradient as validate_gradient_fn
     from prismo.pipeline import pipeline as pipeline_fn
@@ -1149,8 +1151,10 @@ def _run_gradient_validation(
                 "--cold requires a ChargeTransport backend with a reset seam"
             )
         before_evaluation = partial(_reset_chargetransport, components)
-        typer.echo("      Cold start: resetting the ChargeTransport worker before "
-                   "every evaluation")
+        typer.echo(
+            "      Cold start: resetting the ChargeTransport worker before "
+            "every evaluation"
+        )
     bound_pipeline = partial(
         pipeline_fn,
         H=inputs.H_dense,
@@ -1230,13 +1234,13 @@ def probe_objective(
         0.0,
         "--loss-weight",
         min=0.0,
-        help="Scan the loss-penalized objective Δneff - w·alpha (ticket 25)",
+        help="Scan the loss-penalized objective Δneff - w·alpha",
     ),
     seed: str = _seed_option(),
     contact_offset: float = _contact_offset_option(),
     domain_width: float = _domain_width_option(),
 ) -> None:
-    """Scan Δneff along one direction at fine spacing (ticket 23).
+    """Scan Δneff along one direction at fine spacing.
 
     Separates a kink in θ → Δneff from an evaluation noise floor: samples
     ``f(θ₀ + t·d)`` on a uniform grid, fits a quadratic, and reports the fit
@@ -1311,7 +1315,7 @@ def _run_objective_probe(
     contact_offset: float | None = None,
     domain_width: float | None = None,
 ) -> ObjectiveLineScan:
-    """Line-scan the bound pipeline around a design (ticket 23)."""
+    """Line-scan the bound pipeline around a design."""
     import jax.numpy as jnp
 
     from prismo.outputs import feasible_offsets, probe_direction, scan_objective_line
@@ -1352,8 +1356,10 @@ def _run_objective_probe(
                 "--cold requires a ChargeTransport backend with a reset seam"
             )
         before_evaluation = partial(_reset_chargetransport, components)
-        typer.echo("      Cold start: resetting the ChargeTransport worker before "
-                   "every evaluation")
+        typer.echo(
+            "      Cold start: resetting the ChargeTransport worker before "
+            "every evaluation"
+        )
 
     bound_pipeline = partial(
         pipeline_fn,
@@ -1431,7 +1437,9 @@ def animate(
     ),
     fps: int = typer.Option(_DEFAULT_ANIMATION_FPS, min=1, help="Frames per second"),
     fmt: str = typer.Option(
-        "gif,mp4", "--format", help="Comma-separated encoders: gif (Pillow), mp4 (ffmpeg)"
+        "gif,mp4",
+        "--format",
+        help="Comma-separated encoders: gif (Pillow), mp4 (ffmpeg)",
     ),
     contact_offset: float = typer.Option(
         0.2, "--contact-offset", help="Contact gap the run used, for the overlay [µm]"

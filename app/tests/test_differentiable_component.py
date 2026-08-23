@@ -4,7 +4,6 @@ Exercises the adapter through its own interface -- forward value, vjp and
 gradient, JIT -- and the hard-error routing when no backend is bound, without
 reaching into pipeline module internals.
 
-Ref: pipeline-deepening ticket 01; rethink ticket 04 (delete fake fallbacks).
 """
 
 import numpy as np
@@ -140,7 +139,7 @@ class TestTupleOutputComponent:
             return jnp.sum(a) + jnp.sum(b)
 
         grad = jax.grad(loss)(x)
-        expected = 2.0 * np.asarray([1.0, 2.0, 3.0]) + 3.0 * np.asarray(
-            [1.0, 2.0, 3.0]
-        ) ** 2
+        expected = (
+            2.0 * np.asarray([1.0, 2.0, 3.0]) + 3.0 * np.asarray([1.0, 2.0, 3.0]) ** 2
+        )
         np.testing.assert_allclose(grad, expected)

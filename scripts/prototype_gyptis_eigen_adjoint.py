@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prototype: gyptis field-epsilon eigen-adjoint gradient path (tickets 02/03/06).
+"""Prototype: gyptis field-epsilon eigen-adjoint gradient path.
 
 Validates the end-to-end field-valued Hellmann-Feynman gradient through a 2D
 waveguide eigenmode solve in gyptis, where the silicon core carries a
@@ -65,7 +65,7 @@ def _field_gradient(design: np.ndarray) -> np.ndarray:
 def main() -> None:
     """Run the gyptis field-epsilon eigen-adjoint prototype validation."""
     print("=" * 72)
-    print("gyptis field-epsilon eigen-adjoint prototype (tickets 02/03/06)")
+    print("gyptis field-epsilon eigen-adjoint prototype")
     print("=" * 72)
 
     if not GYPTIS_AVAILABLE:
@@ -77,18 +77,24 @@ def main() -> None:
         )
         sys.exit(0)
 
-    print(f"\ngyptis {gyptis.__version__}  dolfin {dolfin.__version__}  "
-          f"numpy {np.__version__}\n")
+    print(
+        f"\ngyptis {gyptis.__version__}  dolfin {dolfin.__version__}  "
+        f"numpy {np.__version__}\n"
+    )
 
     # --- 1. Embedded design region on the silicon core ---
     centroids = _api.design_cell_centroids()
     n_design = centroids.shape[0]
     core_bg = _api.DEFAULT_CORE_EPSILON
     print(f"design cells:            {n_design}")
-    print(f"design x-range:          "
-          f"[{centroids[:, 0].min():.3f}, {centroids[:, 0].max():.3f}]")
-    print(f"design y-range:          "
-          f"[{centroids[:, 1].min():.3f}, {centroids[:, 1].max():.3f}]")
+    print(
+        f"design x-range:          "
+        f"[{centroids[:, 0].min():.3f}, {centroids[:, 0].max():.3f}]"
+    )
+    print(
+        f"design y-range:          "
+        f"[{centroids[:, 1].min():.3f}, {centroids[:, 1].max():.3f}]"
+    )
 
     rng = np.random.default_rng(0)
     pattern = rng.uniform(-1.0, 1.0, n_design)
@@ -106,16 +112,20 @@ def main() -> None:
     print(f"\nneff (structured):       {neff_sq_struct**0.5:.6f}")
     print(f"neff (uniform, same mean): {neff_sq_unif**0.5:.6f}")
     print(f"|dneff_sq|:              {abs(neff_sq_struct - neff_sq_unif):.3e}")
-    print(f"guided window:           ({n_clad:.3f}, {n_core:.3f})  "
-          f"structured guided? {n_clad < neff_sq_struct**0.5 < n_core}")
+    print(
+        f"guided window:           ({n_clad:.3f}, {n_core:.3f})  "
+        f"structured guided? {n_clad < neff_sq_struct**0.5 < n_core}"
+    )
     print(f"forward solve time:      {t_forward:.2f}s")
 
     # --- 3. Single-pass field adjoint ---
     t0 = time.perf_counter()
     grad = _field_gradient(structured)
     t_adjoint = time.perf_counter() - t0
-    print(f"\nfield gradient: shape={grad.shape} "
-          f"std={grad.std():.3e} mean={grad.mean():.3e}")
+    print(
+        f"\nfield gradient: shape={grad.shape} "
+        f"std={grad.std():.3e} mean={grad.mean():.3e}"
+    )
     print(f"adjoint time (shared solve + single pass): {t_adjoint:.2f}s")
 
     # --- 4. Central finite-difference validation on sampled cells ---
@@ -142,8 +152,10 @@ def main() -> None:
     print("  FD would require 2 * n_design eigen solves per gradient")
     print(f"  = {2 * n_design} solves  (~{2 * n_design * t_forward:.0f}s)")
     print(f"  field adjoint:           {t_adjoint:.2f}s")
-    print(f"  speedup:                 "
-          f"{(2 * n_design * t_forward) / max(t_adjoint, 1e-6):.0f}x")
+    print(
+        f"  speedup:                 "
+        f"{(2 * n_design * t_forward) / max(t_adjoint, 1e-6):.0f}x"
+    )
     print("\nDone.")
 
 

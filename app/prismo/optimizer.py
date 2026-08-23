@@ -1,12 +1,11 @@
 """Move-limited MMA optimization loop for the PRISMO pipeline.
 
 Wraps the JAX-differentiable pipeline in NLopt's MMA, one fresh MMA subproblem
-per outer step inside a move-limit box (ticket 19).
+per outer step inside a move-limit box.
 Design variables: the signed design field theta in [-1, 1], one entry per
 design node (the silicon nodes of the shared mesh; see ``pipeline.DesignNodes``).
 Objective: maximize signed delta_n_eff, optionally minus a weighted modal
-free-carrier loss (ticket 25).
-Ref: tickets 15, 19, 25.
+free-carrier loss.
 """
 
 from __future__ import annotations
@@ -39,7 +38,7 @@ _HistoryEntry = dict[str, Any]
 # rather than amplifying noise.
 _OBJECTIVE_SCALE_FLOOR = 1e-30
 
-# Per-iteration move limit on theta (ticket 19). Every outer step runs MMA
+# Per-iteration move limit on theta. Every outer step runs MMA
 # inside the box ``x ± move_limit`` intersected with ``[-1, 1]``, so no design
 # variable moves more than this in one iteration whatever MMA's asymptotes
 # would do. With NLopt's unconstrained MMA the trust region grew by 1.2x per
@@ -137,7 +136,7 @@ def optimize_doping(
             accepted full-move-limit step improves the objective by less than
             this fraction.
         move_limit: Per-iteration move limit on theta: no design variable
-            moves more than this in one iteration (ticket 19).
+            moves more than this in one iteration.
         max_move_halvings: Consecutive halvings of the move limit (after failed
             or non-improving steps) before the iterate is declared stalled.
         checkpoint_path: Where to write ``{"rho_opt", "history", ...}`` after
@@ -159,7 +158,7 @@ def optimize_doping(
         components: Live pipeline components to compose. Defaults to the
             in-process components (see ``pipeline``).
         loss_weight: Weight of the modal free-carrier loss in the objective
-            ``delta_neff - loss_weight * loss_db_cm`` (ticket 25). ``0`` keeps
+            ``delta_neff - loss_weight * loss_db_cm``. ``0`` keeps
             the pure Δneff objective; the loss is still recorded when
             ``mode_overlap`` is given.
         mode_overlap: ``(n_design_cells,)`` mode-overlap weights from
@@ -355,7 +354,7 @@ def optimize_doping(
                 stop_reason = "cancelled"
                 break
 
-            # Fresh MMA subproblem inside the move-limit box (ticket 19). The
+            # Fresh MMA subproblem inside the move-limit box. The
             # objective is scaled so the steepest variable sees an O(10)
             # gradient over the box; see ``_MMA_GRADIENT_SCALE_TARGET``.
             g_max = float(np.max(np.abs(g_x))) if g_x.size else 0.0
@@ -441,7 +440,7 @@ def _save_checkpoint(
 ) -> None:
     """Save optimization progress (best design + history) to ``path``.
 
-    Written after every evaluation (ticket 19), so a killed run still yields a
+    Written after every evaluation, so a killed run still yields a
     convergence figure and a design to plot; each history record carries its
     evaluated ``design``, so ``prismo animate`` can replay the run from the
     checkpoint alone.

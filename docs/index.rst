@@ -10,12 +10,15 @@
 
 .. rst-class:: lead
 
-    Topology optimization of a reverse-biased PN-junction phase shifter,
-    composed as differentiable Tesseracts.
+    Free-form doping design of a silicon PN-junction phase shifter:
+    ChargeTransport.jl (Julia, discrete adjoint) and gyptis/FEniCS
+    (eigen-adjoint) composed as Tesseracts into one ``jax.grad``.
 
 .. container:: buttons
 
-    :doc:`Docs <install>`
+    :doc:`Install <install>`
+    :doc:`The problem <problem>`
+    :doc:`Results <results>`
     `GitHub <https://github.com/benvial/prismo>`_
 
 .. grid:: 1 1 2 3
@@ -60,6 +63,19 @@
     :hidden:
 
     install
+    usage
+
+.. toctree::
+    :caption: Guide
+    :hidden:
+
+    problem
+    physics
+    adjoint
+    design
+    architecture
+    results
+    glossary
 
 .. toctree::
     :caption: API

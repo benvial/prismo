@@ -21,11 +21,9 @@ def _grid_coords(n=N, spacing=0.02):
 
     A 0.02 µm pitch under the module's 0.05 µm default radius is the same
     geometry the old 20 nm / 50 nm pair described, now in the unit the real
-    meshes are authored in (ticket 15).
+    meshes are authored in.
     """
-    xs, ys = np.meshgrid(
-        np.arange(n) * spacing, np.arange(n) * spacing, indexing="xy"
-    )
+    xs, ys = np.meshgrid(np.arange(n) * spacing, np.arange(n) * spacing, indexing="xy")
     return np.stack([xs.ravel(), ys.ravel()], axis=1)
 
 
@@ -158,9 +156,7 @@ class TestDensityFilterWithMesh:
             with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
                 mesh_path = f.name
             try:
-                build_rib_waveguide_mesh_via_gmsh(
-                    mesh_path, RibWaveguideGeometry()
-                )
+                build_rib_waveguide_mesh_via_gmsh(mesh_path, RibWaveguideGeometry())
                 coords = read_mesh_node_coordinates(mesh_path)
                 assert coords.shape[0] > 0
                 assert coords.shape[1] == 2

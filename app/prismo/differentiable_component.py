@@ -18,7 +18,6 @@ There is no physics-free stub: a component with no live backend raises rather
 than fabricating a value or gradient. Tests compose explicit JAX-native
 doubles through the pipeline's ``components=`` seam instead.
 
-Ref: pipeline-deepening ticket 01; rethink ticket 04 (delete fake fallbacks).
 """
 
 from __future__ import annotations

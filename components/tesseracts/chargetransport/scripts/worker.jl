@@ -22,7 +22,7 @@ mutable struct WorkerState
     forward_solutions::Dict{Float64, Any}
     warm_bias_solutions::Dict{Float64, Any}
     # Silicon doping each warm biased solution was converged on, so a failed
-    # direct warm start can continue by doping homotopy at fixed bias (ticket 18).
+    # direct warm start can continue by doping homotopy at fixed bias.
     warm_bias_dopings::Dict{Float64, Vector{Float64}}
 end
 
@@ -44,7 +44,7 @@ WorkerState() = WorkerState(
     Dict{Float64, Vector{Float64}}(),
 )
 
-# Drop every warm solution (ticket 18 ``reset``). The mesh, system and material
+# Drop every warm solution. The mesh, system and material
 # data stay: they are a deterministic function of the request, only the Newton
 # starting points carry solve history. The next request on any profile then
 # pays the full cold continuation -- equilibrium from near-intrinsic doping and

@@ -5,8 +5,7 @@ tests pin the two boundaries the script crosses into the rest of the project:
 the container-mode pipeline setup (which must build the shared mesh and the
 mesh-transfer operator exactly as ``prismo run --use-containers`` does) and the
 single-component gyptis benchmark (which must speak the component's current
-``design_epsilon`` input schema). Both were broken against the code they call
-until ticket 15.
+``design_epsilon`` input schema). Both were once broken against the code they call.
 """
 
 from __future__ import annotations
@@ -69,9 +68,7 @@ class TestFullPipelinePreparation:
         pytest.importorskip("jax")
         import prismo.pipeline as pipeline_module
 
-        vertices = np.array(
-            [[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]], dtype=float
-        )
+        vertices = np.array([[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]], dtype=float)
         mesh_file = tmp_path / "waveguide.msh"
 
         def write_mesh(path: str | Path) -> np.ndarray:
@@ -83,9 +80,7 @@ class TestFullPipelinePreparation:
         coords = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
         import prismo.waveguide_mesh as mesh_module
 
-        monkeypatch.setattr(
-            mesh_module, "read_mesh_node_coordinates", lambda _: coords
-        )
+        monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
 
         seen: dict[str, object] = {}
 
@@ -95,9 +90,7 @@ class TestFullPipelinePreparation:
 
         monkeypatch.setattr(pipeline_module, "build_design_transfer", fake_transfer)
 
-        inputs = script._prepare_full_pipeline(
-            _args(mesh_path=mesh_file), components
-        )
+        inputs = script._prepare_full_pipeline(_args(mesh_path=mesh_file), components)
 
         assert inputs.n_nodes == coords.shape[0]
         np.testing.assert_allclose(np.asarray(seen["vertices"]), vertices)
@@ -108,9 +101,7 @@ class TestFullPipelinePreparation:
         assert inputs.mesh_ref is not None
         assert inputs.mesh_ref.n_nodes == coords.shape[0]
 
-    def test_container_mode_requires_a_mesh_authoring_backend(
-        self, script, tmp_path
-    ):
+    def test_container_mode_requires_a_mesh_authoring_backend(self, script, tmp_path):
         components = types.SimpleNamespace(write_mesh=None)
         with pytest.raises(RuntimeError, match="mesh authoring"):
             script._prepare_full_pipeline(

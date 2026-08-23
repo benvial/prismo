@@ -1,7 +1,4 @@
-"""Tests for paper-ready output plotting.
-
-Ref: ticket 16.
-"""
+"""Tests for paper-ready output plotting."""
 
 import tempfile
 from pathlib import Path
@@ -29,7 +26,7 @@ N_NODES = 16
 
 
 def _stub_pipeline(theta):
-    """The pipeline driven by physics-free component doubles (ticket 04).
+    """The pipeline driven by physics-free component doubles.
 
     The implicit no-backend stubs were deleted, so plotting tests that drive the
     real ``pipeline`` supply explicit doubles through the ``components=`` seam.
@@ -41,7 +38,7 @@ def _make_history() -> list[dict]:
     return [
         {
             "iteration": i + 1,
-            "delta_n_eff": 0.001 * (1.0 - 0.5 ** i),
+            "delta_n_eff": 0.001 * (1.0 - 0.5**i),
             "delta_rho": 0.01 / (i + 1),
             "grad_norm": 0.001 / (i + 1),
             "wall_time": i * 0.5,
@@ -101,7 +98,6 @@ class TestConvergencePlot:
         with tempfile.TemporaryDirectory() as tmp:
             assert plot_convergence(history, output_dir=tmp).exists()
 
-
     def test_loss_series_reads_only_evaluated_losses(self):
         from prismo.outputs import history_loss_series
 
@@ -115,7 +111,7 @@ class TestConvergencePlot:
 
 
 def _make_loss_history() -> list[dict]:
-    """A history whose loss falls while Δneff rises (ticket 25)."""
+    """A history whose loss falls while Δneff rises."""
     history = _make_history()
     for i, entry in enumerate(history):
         entry["modal_loss_db_cm"] = 300.0 - 10.0 * i
@@ -211,7 +207,9 @@ class TestDopingAnimation:
         from prismo.outputs import animate_doping_evolution
 
         with tempfile.TemporaryDirectory() as tmp:
-            assert animate_doping_evolution([], [], _make_coords(), output_dir=tmp) == []
+            assert (
+                animate_doping_evolution([], [], _make_coords(), output_dir=tmp) == []
+            )
 
 
 class TestDopingFieldPlot:
@@ -229,7 +227,9 @@ class TestDopingFieldPlot:
         doping = np.linspace(-1e18, 1e18, N_NODES)
         with tempfile.TemporaryDirectory() as tmp:
             first = plot_live_doping_field(doping, coords, iteration=1, output_dir=tmp)
-            second = plot_live_doping_field(doping * 0.5, coords, iteration=2, output_dir=tmp)
+            second = plot_live_doping_field(
+                doping * 0.5, coords, iteration=2, output_dir=tmp
+            )
             assert first == second
             assert first.name == "doping_field_live.png"
             assert first.exists()
@@ -262,7 +262,11 @@ class TestDopingFieldPlot:
         geometry = RibWaveguideGeometry()
         with tempfile.TemporaryDirectory() as tmp:
             path = plot_doping_field(
-                rho_initial, rho_opt, coords, geometry=geometry, output_dir=tmp,
+                rho_initial,
+                rho_opt,
+                coords,
+                geometry=geometry,
+                output_dir=tmp,
             )
             assert Path(path).exists()
 
@@ -465,16 +469,19 @@ class TestModeFieldPlot:
 
 class TestGenerateOutputs:
     def test_emits_the_headline_figures(self):
-        """The four headline figures, and no retired panel (ticket 07)."""
+        """The four headline figures, and no retired panel."""
         import jax.numpy as jnp
 
         coords = _make_coords()
         mode = ModeField(
-            abs_e=np.linspace(0.0, 1.0, N_NODES), coords_um=coords * 1e6,
+            abs_e=np.linspace(0.0, 1.0, N_NODES),
+            coords_um=coords * 1e6,
         )
         with tempfile.TemporaryDirectory() as tmp:
             paths = generate_outputs(
-                np.full(N_NODES, 0.25), RNG.random(N_NODES), _make_history(),
+                np.full(N_NODES, 0.25),
+                RNG.random(N_NODES),
+                _make_history(),
                 coords,
                 pipeline_fn=_stub_pipeline,
                 gradient_validation_rho=jnp.full(N_NODES, 0.25),
@@ -492,8 +499,11 @@ class TestGenerateOutputs:
         coords = _make_coords()
         with tempfile.TemporaryDirectory() as tmp:
             paths = generate_outputs(
-                np.full(N_NODES, 0.25), RNG.random(N_NODES), _make_history(),
-                coords, output_dir=tmp,
+                np.full(N_NODES, 0.25),
+                RNG.random(N_NODES),
+                _make_history(),
+                coords,
+                output_dir=tmp,
             )
             assert {path.name for path in paths} == {
                 "convergence.pdf",
@@ -507,8 +517,11 @@ class TestGenerateOutputs:
         designs = [RNG.uniform(-1, 1, N_NODES) for _ in range(3)]
         with tempfile.TemporaryDirectory() as tmp:
             paths = generate_outputs(
-                np.full(N_NODES, 0.25), RNG.random(N_NODES), history,
-                coords, output_dir=tmp,
+                np.full(N_NODES, 0.25),
+                RNG.random(N_NODES),
+                history,
+                coords,
+                output_dir=tmp,
                 design_history=designs,
                 animation_formats=("gif",),
             )
@@ -524,8 +537,11 @@ class TestGenerateOutputs:
         coords = _make_coords()
         with tempfile.TemporaryDirectory() as tmp:
             paths = generate_outputs(
-                np.full(N_NODES, 0.25), RNG.random(N_NODES), _make_history(),
-                coords, output_dir=tmp,
+                np.full(N_NODES, 0.25),
+                RNG.random(N_NODES),
+                _make_history(),
+                coords,
+                output_dir=tmp,
                 swept_carriers=-RNG.uniform(0.0, 1e17, N_NODES),
             )
             assert "depletion_field.pdf" in {path.name for path in paths}
@@ -538,13 +554,16 @@ class TestGenerateOutputs:
         d1 = d1 / jnp.linalg.norm(d1)
         with tempfile.TemporaryDirectory() as tmp:
             path = plot_gradient_validation(
-                _stub_pipeline, rho, directions=[d1], output_dir=tmp,
+                _stub_pipeline,
+                rho,
+                directions=[d1],
+                output_dir=tmp,
             )
             assert Path(path).exists()
 
 
 class TestColdReevaluation:
-    """Warm/cold Δneff comparison and its convergence-figure annotation (ticket 20)."""
+    """Warm/cold Δneff comparison and its convergence-figure annotation."""
 
     def test_discrepancy_and_verdict(self):
         from prismo.outputs import ColdReevaluation
@@ -562,15 +581,22 @@ class TestColdReevaluation:
         from prismo.outputs import ColdReevaluation, plot_convergence
 
         history = [
-            {"iteration": i, "delta_n_eff": 1e-4 * i, "delta_rho": 0.0,
-             "grad_norm": 1.0, "wall_time": float(i)}
+            {
+                "iteration": i,
+                "delta_n_eff": 1e-4 * i,
+                "delta_rho": 0.0,
+                "grad_norm": 1.0,
+                "wall_time": float(i),
+            }
             for i in range(1, 4)
         ]
         for cold in (
             ColdReevaluation(warm_delta_neff=3e-4, cold_delta_neff=3e-4),
             ColdReevaluation(warm_delta_neff=3e-4, cold_delta_neff=6.5e-5),
         ):
-            path = plot_convergence(history, output_dir=tmp_path, cold_reevaluation=cold)
+            path = plot_convergence(
+                history, output_dir=tmp_path, cold_reevaluation=cold
+            )
             assert path.exists()
 
 
@@ -701,7 +727,9 @@ class TestObjectiveLineScan:
         # +t*d_0 <= 1 - 0.999 -> t <= 1e-3*sqrt(3) ~ 1.73e-3; -t side is free.
         assert kept.min() == offsets.min()
         assert kept.max() == pytest.approx(1e-3)
-        assert np.all(np.abs(np.asarray(rho)[None, :] + kept[:, None] * np.asarray(d)) <= 1.0)
+        assert np.all(
+            np.abs(np.asarray(rho)[None, :] + kept[:, None] * np.asarray(d)) <= 1.0
+        )
 
     def test_probe_direction_returns_the_gradient_it_used(self):
         import jax.numpy as jnp

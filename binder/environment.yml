@@ -1,0 +1,23 @@
+# Conda environment for the Binder image (repo2docker). One environment holds
+# both solvers in-process: gyptis + legacy FEniCS from conda-forge for the
+# optical eigensolve, and the host app's JAX/NLopt stack. Julia and the
+# ChargeTransport.jl packages come from binder/Project.toml. The app itself is
+# pip-installed in binder/postBuild.
+name: prismo
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - gyptis
+  # Unconstrained, the solver pairs fenics with a 2022 jax; the app needs >=0.4.30.
+  - jax>=0.4.30
+  - nlopt
+  - python-gmsh
+  - numpy>=1.26
+  - scipy>=1.11
+  - matplotlib>=3.8
+  - pillow>=10
+  - pip
+  # Notebook helpers: render the PDF figures to PNG, encode the doping mp4.
+  - poppler
+  - ffmpeg

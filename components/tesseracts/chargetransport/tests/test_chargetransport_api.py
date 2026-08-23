@@ -118,7 +118,7 @@ def test_output_schema_electrons_and_holes_are_differentiable() -> None:
 
 @pytest.mark.skipif(
     not _julia_available(),
-    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+    reason="requires a Julia backend; no physics-free stub",
 )
 def test_apply_returns_output_schema() -> None:
     outputs = apply(make_inputs())
@@ -127,7 +127,7 @@ def test_apply_returns_output_schema() -> None:
 
 @pytest.mark.skipif(
     not _julia_available(),
-    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+    reason="requires a Julia backend; no physics-free stub",
 )
 def test_apply_returns_fields_per_node_with_same_shape_as_doping() -> None:
     inputs = make_inputs()
@@ -138,7 +138,7 @@ def test_apply_returns_fields_per_node_with_same_shape_as_doping() -> None:
 
 @pytest.mark.skipif(
     not _julia_available(),
-    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+    reason="requires a Julia backend; no physics-free stub",
 )
 def test_apply_returns_finite_values() -> None:
     doping = np.array([1e22, -5e21, 0.0, 5e21, -1e22])
@@ -149,7 +149,7 @@ def test_apply_returns_finite_values() -> None:
 
 @pytest.mark.skipif(
     not _julia_available(),
-    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+    reason="requires a Julia backend; no physics-free stub",
 )
 def test_apply_deterministic() -> None:
     doping = np.array([1e22, -5e21, 2e21, -2e21, 1e20])
@@ -161,7 +161,7 @@ def test_apply_deterministic() -> None:
 
 @pytest.mark.skipif(
     not _julia_available(),
-    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+    reason="requires a Julia backend; no physics-free stub",
 )
 def test_apply_output_ordering_matches_input() -> None:
     doping = np.arange(N_NODES, dtype=float) * 1e21
@@ -177,7 +177,7 @@ def test_apply_output_ordering_matches_input() -> None:
 
 @pytest.mark.skipif(
     not _julia_available(),
-    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+    reason="requires a Julia backend; no physics-free stub",
 )
 def test_vjp_returns_cotangent_for_requested_input() -> None:
     inputs = make_inputs()
@@ -192,7 +192,7 @@ def test_vjp_returns_cotangent_for_requested_input() -> None:
 
 @pytest.mark.skipif(
     not _julia_available(),
-    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+    reason="requires a Julia backend; no physics-free stub",
 )
 def test_vjp_returns_finite_values() -> None:
     inputs = make_inputs()
@@ -214,7 +214,7 @@ def test_vjp_empty_when_input_not_requested() -> None:
 
 @pytest.mark.skipif(
     not _julia_available(),
-    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+    reason="requires a Julia backend; no physics-free stub",
 )
 def test_vjp_linear_in_cotangent() -> None:
     inputs = make_inputs()
@@ -229,18 +229,14 @@ def test_vjp_linear_in_cotangent() -> None:
     np.testing.assert_allclose(ratio, 3.0, rtol=1e-10)
 
 
-@pytest.mark.skipif(
-    _julia_available(), reason="exercises the no-Julia error path (ticket 04)"
-)
+@pytest.mark.skipif(_julia_available(), reason="exercises the no-Julia error path")
 def test_apply_without_backend_raises() -> None:
     """No physics-free identity fallback: a solve without Julia is a hard error."""
     with pytest.raises(RuntimeError, match="Julia drift-diffusion backend"):
         apply(make_inputs())
 
 
-@pytest.mark.skipif(
-    _julia_available(), reason="exercises the no-Julia error path (ticket 04)"
-)
+@pytest.mark.skipif(_julia_available(), reason="exercises the no-Julia error path")
 def test_vjp_without_backend_raises() -> None:
     """No physics-free identity VJP: an adjoint without Julia is a hard error."""
     with pytest.raises(RuntimeError, match="Julia adjoint backend"):
@@ -254,7 +250,7 @@ def test_vjp_without_backend_raises() -> None:
 
 @pytest.mark.skipif(
     not _julia_available(),
-    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+    reason="requires a Julia backend; no physics-free stub",
 )
 def test_vjp_handles_scalar_cotangents() -> None:
     inputs = make_inputs()
@@ -276,7 +272,7 @@ def test_vjp_handles_scalar_cotangents() -> None:
 
 @pytest.mark.skipif(
     not _julia_available(),
-    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+    reason="requires a Julia backend; no physics-free stub",
 )
 def test_vjp_matches_finite_difference() -> None:
     doping = np.array([1e22, -5e21, 2e21, -2e21, 1e20], dtype=float)
@@ -309,7 +305,7 @@ def test_vjp_matches_finite_difference() -> None:
 
 @pytest.mark.skipif(
     not _julia_available(),
-    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+    reason="requires a Julia backend; no physics-free stub",
 )
 def test_vjp_rejects_inputs_without_matching_forward() -> None:
     _api._session_registry.clear()
@@ -365,7 +361,7 @@ def test_vjp_reuses_matching_persistent_worker_state(
 
 @pytest.mark.skipif(
     not _julia_available(),
-    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+    reason="requires a Julia backend; no physics-free stub",
 )
 def test_shutdown_invalidates_retained_forward_state() -> None:
     """Worker teardown prevents VJPs from using another run's state."""
@@ -405,7 +401,7 @@ def test_shutdown_invalidates_retained_forward_state() -> None:
 )
 @pytest.mark.skipif(
     not _julia_available(),
-    reason="requires a Julia backend; no physics-free stub (ticket 04)",
+    reason="requires a Julia backend; no physics-free stub",
 )
 def test_vjp_rejects_changed_forward_inputs(
     forward_inputs: InputSchema,
@@ -498,14 +494,14 @@ def test_vjp_propagates_julia_timeout(
 
 
 # ---------------------------------------------------------------------------
-# Worker survives hard designs (ticket 18)
+# Worker survives hard designs
 # ---------------------------------------------------------------------------
 
 
 class _FailsOnceThenSucceedsWorker:
     """One worker whose first solve runs out of its Julia-side budget.
 
-    Mirrors the worker after ticket 18: a solve that exceeds the wall-clock
+    Mirrors the worker: a solve that exceeds the wall-clock
     budget comes back as ``ok: false`` with a descriptive error -- the process
     is *not* killed -- and the next request on the same worker is served.
     """
@@ -658,7 +654,7 @@ def _shared_mesh_lateral_junction() -> tuple[Path, np.ndarray]:
 
     Both files are regenerated from ``prismo.waveguide_mesh``, so the fixture
     carries the shared-mesh contract this component reads under: micrometre
-    coordinates and the ``slab`` / ``rib_silicon`` silicon groups (ticket 15).
+    coordinates and the ``slab`` / ``rib_silicon`` silicon groups.
     """
     mesh = _FIXTURES / "waveguide.msh"
     doping = np.load(_FIXTURES / "lateral_junction_doping.npy")
@@ -672,7 +668,7 @@ def test_reverse_bias_converges_on_shared_mesh() -> None:
     On the 1D fallback (no mesh_ref) the same gmsh-order field is a 16-junction
     line the reverse-bias solve cannot converge on. Given the shared mesh, the
     junction is spatially coherent and the solve converges with correct P/N
-    physics. Ref: .scratch/chargetransport-mesh-node-ordering/issues/03.
+    physics.
     """
     mesh, doping = _shared_mesh_lateral_junction()
     mesh_ref = _make_mesh_ref(str(mesh), n_nodes=len(doping))
@@ -704,7 +700,6 @@ def test_reverse_bias_adjoint_is_nonsingular_on_shared_mesh() -> None:
     continuation, but the adjoint's direct linear solve raises
     SingularException -- the failure that crashed `make run-containers`. The
     mesh is now generated conforming, so the adjoint returns finite gradients.
-    Ref: .scratch/chargetransport-mesh-node-ordering/issues/03.
     """
     mesh, doping = _shared_mesh_lateral_junction()
     mesh_ref = _make_mesh_ref(str(mesh), n_nodes=len(doping))
@@ -822,8 +817,8 @@ def test_failed_warm_start_falls_back_to_convergence_or_explicit_error() -> None
     reverse bias on a full-magnitude PN profile is exactly the case
     ``solve_at_bias_with_warm_start``/``solve_equilibrium_with_warm_start``
     catch (``VoronoiFVM.ConvergenceError``/``AssemblyError``) and retry
-    through the adaptive continuation path (see ct_common.jl comments on
-    ticket 17: "A single Newton step from equilibrium fails to converge at
+    through the adaptive continuation path (see ct_common.jl comments:
+    "A single Newton step from equilibrium fails to converge at
     large reverse bias"). Performance work must not turn that recoverable
     solve into a silent failure: either it still converges to finite carrier
     fields, or it raises the same explicit ``RuntimeError`` any other failed
@@ -952,9 +947,7 @@ def test_vjp_matches_gmsh_pn_directional_difference(bias_voltage: float) -> None
         Path(mesh_path).unlink(missing_ok=True)
 
 
-@pytest.mark.skipif(
-    _julia_available(), reason="exercises the no-Julia error path (ticket 04)"
-)
+@pytest.mark.skipif(_julia_available(), reason="exercises the no-Julia error path")
 def test_apply_mesh_ref_without_backend_raises() -> None:
     """Without Julia, apply must raise -- no identity pass-through of the doping."""
     with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:

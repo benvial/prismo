@@ -1,0 +1,18 @@
+#!/bin/bash
+# repo2docker runs this once at image build time, as the notebook user, from
+# the repository root.
+set -euxo pipefail
+
+# Host app + shared schemas on top of the conda solvers. The JAX/NLopt stack is
+# already in the conda env, so pip only adds tesseract-core, typer and friends.
+python -m pip install --no-cache-dir -e components/shared_code -e app
+
+# Warm the FEniCS/FFC JIT cache (same workload the gyptis image runs at build
+# time) so the first eigensolve in a session does not pay form compilation.
+python components/tesseracts/gyptis/warmup.py
+
+# Make sure every Julia package the worker loads is precompiled into the
+# image; Pkg.instantiate already did most of this, this is the backstop.
+julia --startup-file=no -e 'using ChargeTransport, VoronoiFVM, ExtendableGrids, NPZ, JSON, Gmsh; println("Julia packages precompiled.")'
+
+mkdir -p outputs

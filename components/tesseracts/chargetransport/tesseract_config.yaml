@@ -1,7 +1,6 @@
 # Tesseract configuration file
 # ChargeTransport.jl semiconductor drift-diffusion solver (Julia)
 # Worker pattern: Python tesseract_api.py owns one Julia worker with NPY I/O
-# Ref: tickets 02 (container + I/O), 06 (container build)
 
 name: "prismo_chargetransport"
 version: "0.1.0"

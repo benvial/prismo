@@ -1,25 +1,31 @@
-.PHONY: help new build julia-base images test gen-tests data run run-containers validate-gradient validate-gradient-containers probe-objective probe-objective-containers animate benchmark clean
+.PHONY: help install new build julia-base images test gen-tests run run-containers validate-gradient validate-gradient-containers probe-objective probe-objective-containers animate figures benchmark docs clean
 
 PYTHON ?= python
 
 help:
-	@echo "Available targets:"
-	@echo "  new NAME [RECIPE=jax|pytorch] - Create a new Tesseract component (make new mytess RECIPE=jax)"
-	@echo "  build [NAME]                  - Build all components or a single tesseract (make build mytess)"
-	@echo "  julia-base NAME               - (Re)build the Julia base image for a component (only needed when its julia_env/*.toml change)"
-	@echo "  images                        - Show when each component image was built vs. when its sources last changed (STALE = rebuild)"
-	@echo "  test [NAME]                   - Test all components + app, a single component, or app only"
-	@echo "  gen-tests NAME FILE=case.json - Capture a test case by running an input payload (make gen-tests mytess FILE=in.json)"
-	@echo "  data                          - Pull example data"
-	@echo "  run                           - Run app end-to-end"
-	@echo "  run-containers                - Run app with both Docker containers"
-	@echo "  validate-gradient             - Validate the composed gradient (adjoint vs finite differences)"
-	@echo "  validate-gradient-containers  - Validate the gradient across the real CT + gyptis boundary"
-	@echo "  probe-objective               - Line-scan the objective along one direction (smoothness probe)"
-	@echo "  probe-objective-containers    - Same, across the real CT + gyptis boundary"
-	@echo "  animate                       - Replay outputs/checkpoint.json as a doping-field animation (no solver)"
+	@echo "Setup"
+	@echo "  install                       - pip install the host app + shared schemas into the active Python env"
+	@echo "  julia-base chargetransport    - Build the Julia base image (once; redo only when julia_env/*.toml change)"
+	@echo "  build [NAME]                  - tesseract build all components, or one (make build gyptis)"
+	@echo "  images                        - Show whether each component image is older than its sources (STALE = rebuild)"
+	@echo "Run (containers = the real solvers)"
+	@echo "  run-containers                - The optimization; figures + checkpoint.json in outputs/ (RUN_ARGS=\"--loss-weight 1e-5\")"
+	@echo "  validate-gradient-containers  - Composed adjoint vs central finite differences"
+	@echo "  probe-objective-containers    - Line-scan the objective along one direction (smoothness probe)"
+	@echo "  animate                       - Rebuild doping_evolution.{gif,mp4} from outputs/checkpoint.json (no solver)"
+	@echo "  figures                       - Snapshot outputs/*.pdf (+ gif) as PNGs into docs/figures/ for the README"
+	@echo "  run | validate-gradient | probe-objective  - Same, but in-process (needs both solvers importable; otherwise raises)"
+	@echo "Develop"
+	@echo "  test [NAME|app]               - Component regression cases + app unit tests, one component, or app only"
+	@echo "  new NAME [RECIPE=jax|pytorch] - Scaffold a new Tesseract component"
+	@echo "  gen-tests NAME FILE=case.json - Capture a component test case from an input payload"
 	@echo "  benchmark                     - Record cold/warm multiphysics callback timings"
+	@echo "  docs                          - Build the Sphinx docs into docs/_build/html"
 	@echo "  clean                         - Remove build artifacts, caches, and temp files"
+
+install:
+	@echo "Installing prismo_shared and the host app (editable)..."
+	@$(PYTHON) -m pip install -e components/shared_code -e "app[dev]"
 
 new:
 	@set -e; \
@@ -92,7 +98,7 @@ build:
 		fi; \
 	fi
 
-# Image staleness check (ticket 21): an image is STALE when a commit touching
+# Image staleness check: an image is STALE when a commit touching
 # its component directory (or components/shared_code) is newer than the image.
 images:
 	@for dir in components/tesseracts/*/; do \
@@ -140,10 +146,10 @@ test:
 			fi; \
 		done; \
 		echo "Testing app..."; \
-		python -m pytest app; \
+		$(PYTHON) -m pytest app; \
 	elif [ "$(filter-out $@,$(MAKECMDGOALS))" = "app" ]; then \
 		echo "Testing app only..."; \
-		python -m pytest app; \
+		$(PYTHON) -m pytest app; \
 	else \
 		echo "Testing tesseract: $(filter-out $@,$(MAKECMDGOALS))"; \
 		TESS_DIR="components/tesseracts/$(filter-out $@,$(MAKECMDGOALS))"; \
@@ -189,10 +195,6 @@ gen-tests:
 		python scripts/gen_test_case.py > "$$OUT_PATH"; \
 	echo "Wrote $$OUT_PATH (review it, then 'make test $$TESS_SLUG')"
 
-data:
-	@echo "Pulling data..."
-	@bash data/get_data.sh
-
 run:
 	@echo "Running app..."
 	@PYTHONPATH=app:components/shared_code:$${PYTHONPATH} $(PYTHON) -m prismo.main run $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
@@ -220,6 +222,24 @@ probe-objective-containers:
 animate:
 	@echo "Animating the doping field from the checkpoint..."
 	@PYTHONPATH=app:components/shared_code:$${PYTHONPATH} $(PYTHON) -m prismo.main animate $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
+
+# README figures: rasterize the PDFs of the last run and shrink the animation
+# (GitHub renders PNG/GIF inline; the pre-commit size cap is 3 MB).
+figures:
+	@mkdir -p docs/figures
+	@for f in outputs/*.pdf; do \
+		[ -f "$$f" ] || continue; \
+		pdftoppm -png -r 150 -singlefile "$$f" "docs/figures/$$(basename $${f%.pdf})"; \
+	done
+	@if [ -f outputs/doping_evolution.mp4 ]; then \
+		ffmpeg -v error -y -i outputs/doping_evolution.mp4 \
+			-vf "fps=8,scale=720:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3" \
+			docs/figures/doping_evolution.gif; \
+	fi
+	@ls -la docs/figures
+
+docs:
+	@$(MAKE) -C docs html
 
 benchmark:
 	@echo "Benchmarking multiphysics optimization callbacks..."

@@ -1,2 +1,4 @@
-# Dependencies to execute app
-tesseract-core==1.11.0
+# Host-side dependencies to run the pipeline (the solvers live in the Tesseract images).
+# Install with: pip install -r app/requirements.txt   (or: make install)
+-e ./components/shared_code
+-e ./app

@@ -1,11 +1,10 @@
 """Paper-ready visualization outputs for the PRISMO pipeline.
 
-Ref: rethink ticket 07 — the headline figure set. ``generate_outputs`` emits
-four: the MMA convergence curve carrying both the optimized signed Δneff and
-the reported VπLπ, the adjoint-vs-finite-difference gradient validation
-(ticket 06), the initial-vs-optimized signed θ field, and the optical mode |E|
-on the rib cross-section. Panels that serve none of those were dropped. A
-loss-aware run (ticket 25) adds the loss history, the Δneff-vs-loss trade-off
+The headline figure set. ``generate_outputs`` emits four: the MMA convergence
+curve carrying both the optimized signed Δneff and the reported VπLπ, the
+adjoint-vs-finite-difference gradient validation, the initial-vs-optimized
+signed θ field, and the optical mode ``|E|`` on the rib cross-section. Panels that serve none of those were dropped. A
+loss-aware run adds the loss history, the Δneff-vs-loss trade-off
 plane, and an animation of the doping field over the optimizer's evaluations.
 """
 
@@ -15,6 +14,7 @@ import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -25,17 +25,19 @@ from matplotlib import tri as mtri
 from matplotlib.colors import SymLogNorm
 
 matplotlib.use("Agg")
-plt.rcParams.update({
-    "font.size": 12,
-    "axes.titlesize": 14,
-    "axes.labelsize": 12,
-    "xtick.labelsize": 10,
-    "ytick.labelsize": 10,
-    "legend.fontsize": 10,
-    "figure.dpi": 150,
-    "savefig.bbox": "tight",
-    "savefig.pad_inches": 0.1,
-})
+plt.rcParams.update(
+    {
+        "font.size": 12,
+        "axes.titlesize": 14,
+        "axes.labelsize": 12,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "legend.fontsize": 10,
+        "figure.dpi": 150,
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.1,
+    }
+)
 
 _OUTPUT_DIR = Path("outputs")
 
@@ -87,14 +89,20 @@ def _pcolormesh_field(
     """
     if triangles is not None and len(triangles):
         return ax.tripcolor(
-            mtri.Triangulation(x, y, triangles), values, shading="gouraud", **kwargs,
+            mtri.Triangulation(x, y, triangles),
+            values,
+            shading="gouraud",
+            **kwargs,
         )
 
     x_values = np.unique(x)
     y_values = np.unique(y)
     if x_values.size * y_values.size != values.size:
         return ax.tripcolor(
-            mtri.Triangulation(x, y), values, shading="gouraud", **kwargs,
+            mtri.Triangulation(x, y),
+            values,
+            shading="gouraud",
+            **kwargs,
         )
 
     order = np.lexsort((x, y))
@@ -103,7 +111,7 @@ def _pcolormesh_field(
 
 
 # Relative warm/cold discrepancy above which the reported optimum is flagged
-# (ticket 20). The ChargeTransport Newton solves converge to 1e-10 and the
+# . The ChargeTransport Newton solves converge to 1e-10 and the
 # eigensolve is deterministic, so a warm and a cold solve of the same design
 # agree to ~1e-8 relative when the steady state is unique; anything above this
 # means the warm value depended on the solve history, not on the design.
@@ -112,7 +120,7 @@ COLD_REEVALUATION_RTOL = 1e-4
 
 @dataclass(frozen=True)
 class ColdReevaluation:
-    """Warm-vs-cold Δneff of the reported design (ticket 20).
+    """Warm-vs-cold Δneff of the reported design.
 
     ``warm_delta_neff`` is the value the optimizer saw (solved from the
     neighbouring designs' Newton starting points); ``cold_delta_neff`` is the
@@ -142,7 +150,7 @@ def history_loss_series(history: list[dict]) -> tuple[list[int], list[float]]:
     """``(iterations, modal_loss_db_cm)`` for the entries that evaluated a loss.
 
     The optimizer records ``modal_loss_db_cm`` as ``None`` when no mode-overlap
-    weights were bound (ticket 25); a history with no finite loss yields two
+    weights were bound; a history with no finite loss yields two
     empty lists and the convergence figure draws no loss panel.
     """
     iters: list[int] = []
@@ -169,13 +177,28 @@ def _history_fom_series(history: list[dict]) -> list[tuple[int, float]]:
     return [(i, v) for i, v in fom if np.isfinite(v)]
 
 
+def _legend_below(ax: Any, handles: list[Any], labels: list[str]) -> None:
+    """Legend in a row under the x-axis, clear of both y-axes' curves."""
+    if not labels:
+        return
+    ax.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.16),
+        ncol=min(len(labels), 3),
+        frameon=False,
+        handlelength=2.0,
+    )
+
+
 def plot_loss_convergence(
     history: list[dict],
     output_dir: str | Path | None = None,
 ) -> Path | None:
     """Modal loss [dB/cm] and the VπLπ·alpha figure of merit [V·dB] vs iteration.
 
-    The companion of :func:`plot_convergence` for the loss axis of ticket 25:
+    The companion of :func:`plot_convergence` for the loss axis:
     the free-carrier loss of the unbiased device at every evaluation, and the
     literature's efficiency-loss figure of merit on a twin axis. Returns
     ``None`` (writes nothing) when the history carries no evaluated loss.
@@ -186,7 +209,11 @@ def plot_loss_convergence(
     out = _ensure_output_dir(output_dir)
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot(
-        iters, losses, "o-", markersize=3, color="#d7191c",
+        iters,
+        losses,
+        "o-",
+        markersize=3,
+        color="#d7191c",
         label=r"modal loss $\alpha$ (0 V)",
     )
     ax.set_ylabel(r"$\alpha$ [dB/cm]", color="#d7191c")
@@ -196,8 +223,12 @@ def plot_loss_convergence(
     if finite:
         ax_fom = ax.twinx()
         ax_fom.plot(
-            [i for i, _ in finite], [v for _, v in finite],
-            "s--", markersize=3, color="#7b3294", alpha=0.8,
+            [i for i, _ in finite],
+            [v for _, v in finite],
+            "s--",
+            markersize=3,
+            color="#7b3294",
+            alpha=0.8,
             label=r"$V_\pi L_\pi \cdot \alpha$ (reported)",
         )
         magnitudes = [abs(v) for _, v in finite if v != 0.0]
@@ -207,7 +238,7 @@ def plot_loss_convergence(
         ax_fom.tick_params(axis="y", labelcolor="#7b3294")
         extra_handles, extra_labels = ax_fom.get_legend_handles_labels()
         handles, labels = handles + extra_handles, labels + extra_labels
-    ax.legend(handles, labels, loc="best")
+    _legend_below(ax, handles, labels)
     ax.set_xlabel("Iteration")
     ax.set_title("Modal loss and figure of merit")
     ax.grid(True, alpha=0.3)
@@ -227,14 +258,16 @@ def iso_fom_delta_neff(loss_db_cm: np.ndarray, fom_v_db: float) -> np.ndarray:
     """Δneff along the curve ``VπLπ·alpha = fom``: ``|V|·λ·alpha / (2·fom)``."""
     from prismo.pipeline import _WAVELENGTH_CM, REVERSE_BIAS_V
 
-    return abs(REVERSE_BIAS_V) * _WAVELENGTH_CM * np.asarray(loss_db_cm) / (2.0 * fom_v_db)
+    return (
+        abs(REVERSE_BIAS_V) * _WAVELENGTH_CM * np.asarray(loss_db_cm) / (2.0 * fom_v_db)
+    )
 
 
 def plot_tradeoff(
     history: list[dict],
     output_dir: str | Path | None = None,
 ) -> Path | None:
-    """The optimizer's path in the (modal loss, Δneff) plane (ticket 25).
+    """The optimizer's path in the (modal loss, Δneff) plane.
 
     Every evaluated design is a point, coloured by iteration and joined in
     order, against iso-``VπLπ·alpha`` hyperbolae: a design moving up-left
@@ -264,15 +297,38 @@ def plot_tradeoff(
         ax.plot(loss_grid, curve, color="0.6", linestyle=":", linewidth=1)
         last = int(np.flatnonzero(inside)[-1])
         ax.annotate(
-            f"{fom:g} V·dB", xy=(loss_grid[last], curve[last]), xytext=(-2, -2),
-            textcoords="offset points", ha="right", va="top", fontsize=8, color="0.4",
+            f"{fom:g} V·dB",
+            xy=(loss_grid[last], curve[last]),
+            xytext=(-2, -2),
+            textcoords="offset points",
+            ha="right",
+            va="top",
+            fontsize=8,
+            color="0.4",
         )
     ax.plot(loss, dneff, "-", color="0.3", linewidth=1, alpha=0.6, zorder=2)
     sc = ax.scatter(loss, dneff, c=iters, cmap="viridis", s=22, zorder=3)
-    ax.plot([loss[0]], [dneff[0]], marker="o", markersize=9, markerfacecolor="none",
-            markeredgecolor="#1a9641", linestyle="none", label="seed", zorder=4)
-    ax.plot([loss[-1]], [dneff[-1]], marker="*", markersize=13, color="#d7191c",
-            linestyle="none", label="last evaluation", zorder=4)
+    ax.plot(
+        [loss[0]],
+        [dneff[0]],
+        marker="o",
+        markersize=9,
+        markerfacecolor="none",
+        markeredgecolor="#1a9641",
+        linestyle="none",
+        label="seed",
+        zorder=4,
+    )
+    ax.plot(
+        [loss[-1]],
+        [dneff[-1]],
+        marker="*",
+        markersize=13,
+        color="#d7191c",
+        linestyle="none",
+        label="last evaluation",
+        zorder=4,
+    )
     fig.colorbar(sc, ax=ax, label="Iteration")
     ax.set_xlim(0.0, loss_max)
     if y_top > y_bottom:
@@ -297,7 +353,7 @@ def plot_convergence(
 ) -> Path:
     """Convergence plot: signed delta_n_eff and reported VpiLpi vs iteration.
 
-    The loss axis of a loss-aware run (ticket 25) is its own figure,
+    The loss axis of a loss-aware run is its own figure,
     :func:`plot_loss_convergence`.
 
     Args:
@@ -306,7 +362,7 @@ def plot_convergence(
         ftol_rel: MMA relative tolerance for the marker annotation.
         cold_reevaluation: Warm/cold Δneff of the reported design; drawn as a
             marker at the last iteration, with a warning annotation when the
-            discrepancy exceeds its tolerance (ticket 20).
+            discrepancy exceeds its tolerance.
 
     Returns:
         Path to the saved figure.
@@ -317,8 +373,13 @@ def plot_convergence(
 
     if not history:
         ax.text(
-            0.5, 0.5, "No data", ha="center", va="center",
-            transform=ax.transAxes, fontsize=14,
+            0.5,
+            0.5,
+            "No data",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=14,
         )
     else:
         from prismo.pipeline import vpi_lpi_v_cm
@@ -327,18 +388,29 @@ def plot_convergence(
         values = [h["delta_n_eff"] for h in history]
 
         ax.plot(
-            iters, values, "o-", markersize=3, color="#2c7bb6",
+            iters,
+            values,
+            "o-",
+            markersize=3,
+            color="#2c7bb6",
             label=r"$\Delta n_{\mathrm{eff}}$ (optimized)",
         )
         ax.axhline(
-            y=values[-1], color="#d7191c", linestyle="--", alpha=0.6,
+            y=values[-1],
+            color="#d7191c",
+            linestyle="--",
+            alpha=0.6,
             label="final value",
         )
 
         if cold_reevaluation is not None:
             ax.plot(
-                [iters[-1]], [cold_reevaluation.cold_delta_neff],
-                marker="*", markersize=11, linestyle="none", color="#7b3294",
+                [iters[-1]],
+                [cold_reevaluation.cold_delta_neff],
+                marker="*",
+                markersize=11,
+                linestyle="none",
+                color="#7b3294",
                 label=r"$\Delta n_{\mathrm{eff}}$ (cold re-evaluation)",
                 zorder=5,
             )
@@ -347,8 +419,12 @@ def plot_convergence(
                     "WARNING: warm/cold mismatch "
                     f"{cold_reevaluation.rel_discrepancy:.1e} "
                     f"> {cold_reevaluation.tolerance:.0e}",
-                    xy=(0.02, 0.97), xycoords="axes fraction",
-                    ha="left", va="top", fontsize=8, color="#d7191c",
+                    xy=(0.02, 0.97),
+                    xycoords="axes fraction",
+                    ha="left",
+                    va="top",
+                    fontsize=8,
+                    color="#d7191c",
                     bbox={"boxstyle": "round", "fc": "white", "ec": "#d7191c"},
                 )
 
@@ -361,12 +437,15 @@ def plot_convergence(
                     break
             if idx is not None:
                 ax.axvline(
-                    x=iters[idx], color="#fdae61", linestyle=":", alpha=0.8,
+                    x=iters[idx],
+                    color="#fdae61",
+                    linestyle=":",
+                    alpha=0.8,
                     label=f"ftol_rel={ftol_rel:.0e}",
                 )
 
         # VpiLpi is the field-standard headline but is *reported*, not optimized
-        # (ticket 03). It goes as 1/delta_n_eff, so an early iteration near zero
+        # . It goes as 1/delta_n_eff, so an early iteration near zero
         # is orders of magnitude above the converged value and on a linear axis
         # would flatten the whole curve; an iteration exactly at zero is infinite
         # and cannot be drawn at all. So it rides a twin *symlog* axis -- signed,
@@ -378,8 +457,12 @@ def plot_convergence(
             magnitudes = [abs(v) for _, v in finite if v != 0.0]
             ax_vpi = ax.twinx()
             ax_vpi.plot(
-                [i for i, _ in finite], [v for _, v in finite],
-                "s--", markersize=3, color="#1a9641", alpha=0.8,
+                [i for i, _ in finite],
+                [v for _, v in finite],
+                "s--",
+                markersize=3,
+                color="#1a9641",
+                alpha=0.8,
                 label=r"$V_\pi L_\pi$ (reported)",
             )
             if magnitudes and vpi_axis_is_symlog(magnitudes):
@@ -394,7 +477,9 @@ def plot_convergence(
     if ax_vpi is not None:
         extra_handles, extra_labels = ax_vpi.get_legend_handles_labels()
         handles, labels = handles + extra_handles, labels + extra_labels
-    ax.legend(handles, labels, loc="best")
+    # Below the axes: ``loc="best"`` only dodges the primary axis' artists and
+    # lands on the twin-axis curve.
+    _legend_below(ax, handles, labels)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
 
@@ -418,7 +503,7 @@ def plot_doping_field(
         rho_initial: Initial design vector ``(n_nodes,)``.
         rho_opt: Optimized design vector ``(n_nodes,)``.
         mesh_coords: Node coordinates ``(n_nodes, 2)`` in micrometres -- the
-            unit both mesh authors emit (ticket 15), and the unit the axes are
+            unit both mesh authors emit, and the unit the axes are
             labelled in, so no conversion happens here.
         geometry: ``RibWaveguideGeometry`` for overlay (optional).
         output_dir: Directory to write ``doping_field.pdf``.
@@ -524,7 +609,11 @@ def plot_live_doping_field(
 
 
 def _zoom_to_silicon(
-    ax: plt.Axes, x: np.ndarray, y: np.ndarray, triangles: np.ndarray | None, pad: float = 0.15
+    ax: plt.Axes,
+    x: np.ndarray,
+    y: np.ndarray,
+    triangles: np.ndarray | None,
+    pad: float = 0.15,
 ) -> None:
     """Crop the vertical axis to the painted silicon (plus ``pad`` µm).
 
@@ -561,7 +650,7 @@ def animate_doping_evolution(
     run (symlog, like the live frames), titled with the iteration, its Δneff
     and -- when evaluated -- its modal loss; a trial the optimizer rejected
     (objective below the running best) is labelled as such, so the move-limit
-    halvings of ticket 19 read as what they are rather than as progress.
+    halvings read as what they are rather than as progress.
 
     Args:
         doping_frames: Full-node net doping ``(n_nodes,)`` [cm^-3] per
@@ -607,7 +696,9 @@ def animate_doping_evolution(
         best_so_far = max(best_so_far, value)
 
     fig, ax = plt.subplots(figsize=(8.0, 3.6), layout="constrained")
-    mesh = _pcolormesh_field(ax, x, y, frames[0], triangles=triangles, cmap="RdBu_r", norm=norm)
+    mesh = _pcolormesh_field(
+        ax, x, y, frames[0], triangles=triangles, cmap="RdBu_r", norm=norm
+    )
     fig.colorbar(mesh, ax=ax, label=r"Net doping [cm$^{-3}$]", shrink=0.9)
     ax.set_facecolor("0.92")
     ax.set_xlabel("x [µm]")
@@ -635,7 +726,9 @@ def animate_doping_evolution(
     def _draw(k: int) -> tuple:
         nonlocal mesh
         mesh.remove()
-        mesh = _pcolormesh_field(ax, x, y, frames[k], triangles=triangles, cmap="RdBu_r", norm=norm)
+        mesh = _pcolormesh_field(
+            ax, x, y, frames[k], triangles=triangles, cmap="RdBu_r", norm=norm
+        )
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
         title.set_text(_caption(k))
@@ -670,7 +763,7 @@ class OverlayGeometry:
     only describe the mesh the *local* author builds (y from 0 at the
     substrate bottom, 0.5 µm substrate). The gyptis author centres its layer
     stack on y = 0 with a 0.35 µm substrate, so drawing the local frame on
-    container figures put the rib outline off the device entirely (ticket 16).
+    container figures put the rib outline off the device entirely.
     The container path builds one of these from the gyptis mesh itself instead.
 
     ``substrate_top`` is the y of the substrate/slab interface -- the value the
@@ -696,7 +789,7 @@ class OverlayGeometry:
 def _overlay_geometry(ax: plt.Axes, geometry: object) -> None:
     """Draw waveguide geometry overlay on an axis.
 
-    The geometry's dimensions are already micrometres (ticket 15), the same
+    The geometry's dimensions are already micrometres, the same
     unit as the node coordinates and the axes, so nothing is rescaled here.
     """
     # Geometry is duck-typed to keep plotting independent from mesh module.
@@ -722,16 +815,32 @@ def _overlay_geometry(ax: plt.Axes, geometry: object) -> None:
 
     for cs, ce in [(ct_l_start, ct_l_end), (ct_r_start, ct_r_end)]:
         ax.fill_between(
-            [cs, ce], sub_top, slab_top, color="gray", alpha=0.3, edgecolor="none",
+            [cs, ce],
+            sub_top,
+            slab_top,
+            color="gray",
+            alpha=0.3,
+            edgecolor="none",
         )
 
-    ax.fill_between([-hw, rib_l], slab_top, rib_top, color="gray", alpha=0.1, edgecolor="none")
-    ax.fill_between([rib_r, hw], slab_top, rib_top, color="gray", alpha=0.1, edgecolor="none")
+    ax.fill_between(
+        [-hw, rib_l], slab_top, rib_top, color="gray", alpha=0.1, edgecolor="none"
+    )
+    ax.fill_between(
+        [rib_r, hw], slab_top, rib_top, color="gray", alpha=0.1, edgecolor="none"
+    )
 
-    props = dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7, edgecolor="gray")
+    props = dict(
+        boxstyle="round,pad=0.3", facecolor="white", alpha=0.7, edgecolor="gray"
+    )
     ax.text(
-        0.05, 0.95, "Si core", transform=ax.transAxes, fontsize=9,
-        verticalalignment="top", bbox=props,
+        0.05,
+        0.95,
+        "Si core",
+        transform=ax.transAxes,
+        fontsize=9,
+        verticalalignment="top",
+        bbox=props,
     )
 
 
@@ -777,7 +886,7 @@ def plot_mode_field(
 
     The eigensolver's mode is what turns the doping design into a phase shift,
     so the headline set shows it directly: whichever mode the solve tracked, on
-    the same cross-section as the doping figure (ticket 07).
+    the same cross-section as the doping figure.
 
     Args:
         mode: The tracked mode's normalized ``|E|`` and vertex coordinates.
@@ -810,8 +919,12 @@ def plot_mode_field(
     if mode.rib_bounds is not None:
         x0, x1, y0, y1 = mode.rib_bounds
         ax.plot(
-            [x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0],
-            "w--", linewidth=0.8, alpha=0.8, label="Si rib",
+            [x0, x1, x1, x0, x0],
+            [y0, y0, y1, y1, y0],
+            "w--",
+            linewidth=0.8,
+            alpha=0.8,
+            label="Si rib",
         )
         ax.legend(loc="upper right", framealpha=0.6)
 
@@ -856,19 +969,32 @@ def plot_depletion_field(
     out = _ensure_output_dir(output_dir)
     swept = np.asarray(swept_carriers, dtype=float)
     x, y = mesh_coords[:, 0], mesh_coords[:, 1]
-    limit = max(float(np.max(np.abs(swept))) if swept.size else 0.0, _DOPING_SYMLOG_LINTHRESH)
+    limit = max(
+        float(np.max(np.abs(swept))) if swept.size else 0.0, _DOPING_SYMLOG_LINTHRESH
+    )
 
     fig, ax = plt.subplots(figsize=(8.0, 3.6), layout="constrained")
     mesh = _pcolormesh_field(
-        ax, x, y, swept, triangles=triangles, cmap="PuOr",
-        norm=SymLogNorm(linthresh=_DOPING_SYMLOG_LINTHRESH, vmin=-limit, vmax=limit, base=10),
+        ax,
+        x,
+        y,
+        swept,
+        triangles=triangles,
+        cmap="PuOr",
+        norm=SymLogNorm(
+            linthresh=_DOPING_SYMLOG_LINTHRESH, vmin=-limit, vmax=limit, base=10
+        ),
     )
     ax.set_facecolor("0.92")
     if mode_field is not None:
         mx, my = mode_field.coords_um[:, 0], mode_field.coords_um[:, 1]
         contours = ax.tricontour(
-            mtri.Triangulation(mx, my), mode_field.abs_e,
-            levels=[0.2, 0.4, 0.6, 0.8], colors="k", linewidths=0.8, alpha=0.8,
+            mtri.Triangulation(mx, my),
+            mode_field.abs_e,
+            levels=[0.2, 0.4, 0.6, 0.8],
+            colors="k",
+            linewidths=0.8,
+            alpha=0.8,
         )
         ax.clabel(contours, fmt="%.1f", fontsize=7)
     if geometry is not None:
@@ -879,7 +1005,9 @@ def plot_depletion_field(
     ax.set_ylabel("y [µm]")
     ax.set_aspect("equal")
     fig.colorbar(
-        mesh, ax=ax, shrink=0.9,
+        mesh,
+        ax=ax,
+        shrink=0.9,
         label=r"$(n+p)(V_{bias}) - (n+p)(0\,\mathrm{V})$ [cm$^{-3}$]",
     )
 
@@ -889,10 +1017,10 @@ def plot_depletion_field(
     return path
 
 
-# Default acceptance bar for the composed cross-boundary gradient (ticket 06).
+# Default acceptance bar for the composed cross-boundary gradient.
 # Central differences of a smooth pipeline are O(h^2), but the *composed* adjoint
 # is limited by the least-exact link in the chain: the CT discrete adjoint reads
-# carrier density back through an internal 1e-8 finite difference (audit #7) and
+# carrier density back through an internal 1e-8 finite difference and
 # the gyptis eigen-adjoint carries its solver tolerance. 1% relative agreement at
 # the best step is the "gradients do real work" bar -- tight enough to catch a
 # sign error, a missing adjoint term, or a unit mismatch across the boundary,
@@ -902,7 +1030,7 @@ GRADIENT_VALIDATION_TOLERANCE = 1e-2
 
 @dataclass(frozen=True)
 class GradientValidationResult:
-    """Outcome of an adjoint-vs-finite-difference gradient check (ticket 06).
+    """Outcome of an adjoint-vs-finite-difference gradient check.
 
     ``best_rel_errors[i]`` is the smallest relative error over the feasible
     finite-difference steps for direction ``i`` -- the point where central FD is
@@ -992,7 +1120,7 @@ def _gradient_validation_curves(
     least one feasible step. The adjoint's directional derivative is
     ``grad · direction``; the finite-difference estimate is the central
     difference at each step. ``before_evaluation`` runs before every pipeline
-    evaluation (the adjoint one included) -- the cold-start hook of ticket 20,
+    evaluation (the adjoint one included) -- the cold-start hook,
     which resets the ChargeTransport worker so no FD sample inherits the
     previous sample's Newton starting point.
     """
@@ -1039,7 +1167,7 @@ def _render_gradient_validation(
 ) -> Path:
     fig, ax = plt.subplots(figsize=(6, 4))
     for i, feasible_steps, errors in curves:
-        label = f"direction {i+1}" if n_directions > 1 else "FD"
+        label = f"direction {i + 1}" if n_directions > 1 else "FD"
         ax.loglog(feasible_steps, errors, "o-", markersize=3, label=label)
 
     # Central differences of a smooth pipeline converge at second order (see
@@ -1122,9 +1250,7 @@ def plot_gradient_validation(
     out, curves, step_sizes, n_directions = _gradient_validation_setup(
         pipeline_fn, rho, directions, n_directions, step_sizes, output_dir
     )
-    return _render_gradient_validation(
-        curves, step_sizes, n_directions, tolerance, out
-    )
+    return _render_gradient_validation(curves, step_sizes, n_directions, tolerance, out)
 
 
 def validate_gradient(
@@ -1139,10 +1265,10 @@ def validate_gradient(
 ) -> GradientValidationResult:
     """Check the adjoint against central FD and gate on a stated tolerance.
 
-    The proof behind ticket 06's headline: the composed ``rho -> Delta n_eff``
+    The proof behind the headline: the composed ``rho -> Delta n_eff``
     gradient is exercised through whatever ``pipeline_fn`` closes over -- pass a
     ``pipeline`` bound to the live ChargeTransport and gyptis components to prove
-    the cross-boundary adjoint (CT included, audit #7), not a stub. The figure is
+    the cross-boundary adjoint (CT included), not a stub. The figure is
     always written; ``passed`` records whether the worst per-direction best error
     stayed at or below ``tolerance`` (it does not raise, so a failing check still
     produces the diagnostic figure).
@@ -1156,8 +1282,8 @@ def validate_gradient(
             from ``1e-6`` to ``1e-1``.
         tolerance: Acceptance bar on the worst per-direction best relative error.
         output_dir: Directory to write ``gradient_validation.pdf``.
-        before_evaluation: Hook run before every pipeline evaluation (ticket
-            20's cold-start option: reset the ChargeTransport worker so the FD
+        before_evaluation: Hook run before every pipeline evaluation (the
+            cold-start option: reset the ChargeTransport worker so the FD
             reference is not polluted by warm-start path dependence).
 
     Returns:
@@ -1176,9 +1302,7 @@ def validate_gradient(
 
     best_rel_errors = [min(errors) for _, _, errors in curves]
     worst_rel_error = max(best_rel_errors)
-    path = _render_gradient_validation(
-        curves, step_sizes, n_directions, tolerance, out
-    )
+    path = _render_gradient_validation(curves, step_sizes, n_directions, tolerance, out)
     return GradientValidationResult(
         n_directions=len(curves),
         best_rel_errors=best_rel_errors,
@@ -1190,7 +1314,7 @@ def validate_gradient(
 
 
 # ---------------------------------------------------------------------------
-# Objective line scan (ticket 23)
+# Objective line scan
 # ---------------------------------------------------------------------------
 
 
@@ -1198,8 +1322,8 @@ def validate_gradient(
 class ObjectiveLineScan:
     """``f(rho + t*d)`` sampled along one direction at uniform spacing.
 
-    The smoothness probe behind ticket 23: the optimizer's trials around the
-    ticket-22 optimum sat ~2e-3 relative below the iterate regardless of how
+    The smoothness probe: the optimizer's trials around an earlier
+    optimum sat ~2e-3 relative below the iterate regardless of how
     small the box became, and this scan separates a genuine kink (the residual
     of a quadratic fit is structured and shrinks with the spacing) from an
     evaluation noise floor (the residual is white and does not). All relative
@@ -1326,7 +1450,7 @@ def scan_objective_line(
     before_evaluation: Callable[[], None] | None = None,
     gradient: jax.Array | None = None,
 ) -> ObjectiveLineScan:
-    """Sample ``pipeline_fn`` along ``direction`` and fit a quadratic (ticket 23).
+    """Sample ``pipeline_fn`` along ``direction`` and fit a quadratic.
 
     Args:
         pipeline_fn: Callable ``(rho) -> scalar`` differentiable by JAX.
@@ -1337,7 +1461,7 @@ def scan_objective_line(
         output_dir: When given, write ``objective_line_scan.pdf`` and
             ``objective_line_scan.json`` there.
         before_evaluation: Hook run before the gradient and before every
-            sample (ticket 20's cold-start reset).
+            sample.
         gradient: The adjoint gradient at ``rho`` if the caller already has it
             (e.g. from :func:`probe_direction`); computed here when ``None``.
 
@@ -1429,7 +1553,7 @@ def generate_outputs(
     animation_formats: Sequence[str] = ("gif", "mp4"),
     swept_carriers: np.ndarray | None = None,
 ) -> list[Path]:
-    """Generate the headline output figures (ticket 07).
+    """Generate the headline output figures.
 
     Args:
         rho_initial: Initial design vector.
@@ -1451,7 +1575,7 @@ def generate_outputs(
             Skipped if ``None`` (no gyptis backend bound).
         output_dir: Output directory (default: ``outputs/``).
         cold_reevaluation: Warm/cold Δneff of the reported design, annotated
-            on the convergence figure (ticket 20). ``None`` draws nothing.
+            on the convergence figure. ``None`` draws nothing.
         design_history: Full-node net doping [cm^-3] per evaluated design, in
             history order; animated into ``doping_evolution.{gif,mp4}`` (see
             :func:`animate_doping_evolution`). ``None`` skips the animation.
@@ -1476,7 +1600,7 @@ def generate_outputs(
         cold_reevaluation=cold_reevaluation,
     )
     paths.append(conv)
-    # Loss-aware run (ticket 25): the loss history and the trade-off plane.
+    # Loss-aware run: the loss history and the trade-off plane.
     for loss_figure in (plot_loss_convergence, plot_tradeoff):
         loss_path = loss_figure(history, output_dir=out)
         if loss_path is not None:

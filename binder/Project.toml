@@ -1,0 +1,16 @@
+# Julia environment for the Binder image. Same pinned packages as the
+# chargetransport component (julia_env/Project.toml + Manifest.toml); the
+# app test suite checks the two stay in sync. The only addition is the
+# compat entry below: repo2docker reads it to pick the Julia version, and a
+# bare "1.10" would mean ^1.10 (latest 1.x), where ChargeTransport.jl +
+# VoronoiFVM.jl segfault.
+[deps]
+ChargeTransport = "25c3eafe-d88c-11e9-3031-f396758f002a"
+ExtendableGrids = "cfc395e8-590f-11e8-1f13-43a2532b2fa8"
+Gmsh = "705231aa-382f-11e9-3f0c-b7cb4346fdeb"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+NPZ = "15e1cf62-19b3-5cfa-8e77-841668bca605"
+VoronoiFVM = "82b139dc-5afc-11e9-35da-9b9bdfd336f3"
+
+[compat]
+julia = "~1.10"

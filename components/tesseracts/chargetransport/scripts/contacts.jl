@@ -8,9 +8,8 @@
 # ExtendableGrids discards the physical group tags too: it assigns bregion
 # indices consecutively in `gmsh.model.getPhysicalGroups(1)` order.  Keep this
 # helper in lockstep with that enumeration; a Gmsh tag is not a bregion index
-# when, as in the unified mesh spike, tags have gaps.
+# when, as in the shared mesh, tags have gaps.
 #
-# Ref: ticket 07 (mesh contact mapping layer).
 
 using Gmsh
 

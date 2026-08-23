@@ -29,5 +29,7 @@ def stub_components(**overrides) -> PipelineComponents:
     def gyptis(design_epsilon, core_epsilon=None):
         return jnp.mean(design_epsilon)
 
-    base = PipelineComponents(chargetransport=ct, gyptis=gyptis, gyptis_background=gyptis)
+    base = PipelineComponents(
+        chargetransport=ct, gyptis=gyptis, gyptis_background=gyptis
+    )
     return replace(base, **overrides)

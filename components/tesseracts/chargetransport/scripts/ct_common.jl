@@ -3,7 +3,7 @@
 # Included by worker.jl and warmup.jl. Keeping the system
 # construction and the biased solve in one place means the PackageCompiler
 # warmup exercises exactly the same method specializations the runtime
-# scripts use (ticket 17).
+# scripts use.
 
 using ChargeTransport
 using ExtendableGrids
@@ -41,13 +41,13 @@ const PRISMO_DOPING_TO_CT = -1.0e6
 # coefficients expect.
 const CT_DENSITY_TO_CM3 = 1.0e-6
 
-# Shockley-Read-Hall parameters (ticket 17): mid-gap traps, 100 ns lifetime for
+# Shockley-Read-Hall parameters: mid-gap traps, 100 ns lifetime for
 # both carriers, trap density of order n_i. Applied per region in
 # ``build_ct_system``, which also records why SRH is on.
 const CT_SRH_LIFETIME_S = 1.0e-7
 const CT_SRH_TRAP_DENSITY_M3 = 1.0e16
 
-# Wall-clock budget for one worker request (ticket 18). The continuation loops
+# Wall-clock budget for one worker request. The continuation loops
 # below (doping magnitude, bias ramp, doping homotopy) are each bounded in
 # retries, but a hard design can still chain hundreds of Newton solves, and the
 # Python side used to kill the whole Julia process on its own 25 s timeout --
@@ -189,7 +189,7 @@ function silicon_grid(full, silicon_ids, anode_breg, cathode_breg)
         xy = full[Coordinates][:, parent_nodes]
         for (bregion, xmin, xmax, y) in contact_segments
             # Containment, not overlap: the shared mesh cuts the silicon bands at
-            # the contact footprints (ticket 14), so a contact face coincides with
+            # the contact footprints, so a contact face coincides with
             # a contact segment exactly. Accepting any face that merely *touches*
             # one would also swallow the neighbouring shoulder face, silently
             # widening the contact to whatever the coarse slab meshing produced.
@@ -217,7 +217,7 @@ Neumann problem whose quasi-Fermi levels are fixed only up to a free constant,
 so it never responds to the applied bias and Newton settles on whichever member
 of that family it drifts into. That is exactly how a non-conformal slab/rib
 interface in the shared mesh left the design region floating, with the composed
-objective reading a bias-independent gauge instead of depletion (ticket 14).
+objective reading a bias-independent gauge instead of depletion.
 Nothing downstream can detect it, so the invariant is asserted here.
 """
 function check_contacted_device(grid, cells, bfaceregions, anode_breg, cathode_breg)
@@ -307,7 +307,7 @@ function build_ct_system(doping, mesh_path)
     #
     # Not for the seeded junction: there the reverse-bias carrier profile is set
     # by the electrostatics and the contacts, and SRH was measured to leave the
-    # whole 0 -> -5 V ramp unchanged to five digits (ticket 14). It is on because
+    # whole 0 -> -5 V ramp unchanged to five digits. It is on because
     # the free-form designs the optimizer proposes after ~10 MMA iterations
     # (rail-level doping, a dozen junction sign-flips, floating p-pockets inside
     # the rib) make the generation-free drift-diffusion steady state NON-UNIQUE:
@@ -318,7 +318,7 @@ function build_ct_system(doping, mesh_path)
     # quasi-Fermi level in depleted and floating regions, which removes the
     # spurious branch: the failing design then solves on the first default ramp
     # and a warm start that used to land on the wrong branch fails Newton and
-    # falls through to the ramp instead (ticket 17, diagnosis 2026-08-22).
+    # falls through to the ramp instead.
     data.bulkRecombination = set_bulk_recombination(
         iphin = 1, iphip = 2,
         bulk_recomb_Auger = false,
@@ -461,7 +461,7 @@ end
 # Instead we solve the FULL nonlinear problem (λ1 = 1) directly, but
 # ramp the doping profile from a near-intrinsic magnitude, warm-starting each
 # solve from the previous one. Every Newton solve then starts inside its basin
-# of attraction (ticket 17). The step is adaptive: a decade at a time is only
+# of attraction. The step is adaptive: a decade at a time is only
 # the nominal schedule, and it is halved wherever Newton cannot cross.
 
 # Smallest magnitude-continuation step, in decades of doping. The ramp is in
@@ -539,7 +539,7 @@ end
 function make_solver_control()
     # ChargeTransport.SolverControl, not VoronoiFVM's — the two packages
     # export distinct types under the same name; the ChargeTransport solve
-    # wrappers expect theirs (matches the forward path from ticket 03).
+    # wrappers expect theirs (matches the forward path).
     control = ChargeTransport.SolverControl()
     control.abstol = 1e-10
     control.reltol = 1e-10
@@ -555,7 +555,7 @@ end
 # Solve at an applied bias, starting from the equilibrium solution u0.
 #
 # A single Newton step from equilibrium fails to converge at large reverse
-# bias (VoronoiFVM.ConvergenceError at -5 V, ticket 17). Ramp the cathode
+# bias (VoronoiFVM.ConvergenceError at -5 V). Ramp the cathode
 # contact voltage, warm-starting each solve from the previous one. Newton's
 # iteration count grows with the voltage step, so adapt: halve the step on
 # ConvergenceError and regrow cautiously on success.
@@ -565,11 +565,11 @@ end
 # between 0 and -0.4 V. A 0.5 V start with a 1e-3 floor gives up there
 # (AssemblyError from Boltzmann overflow at every bias past -0.5 V); starting
 # at 0.1 V and allowing the step down to 1e-6 crosses it and reaches -5 V
-# (ticket 06). Halving rather than quartering keeps the recovered step close
+#. Halving rather than quartering keeps the recovered step close
 # to the largest one that still converges, so the retry count stays bounded.
 const CT_BIAS_STEP_INITIAL = 0.1
 const CT_BIAS_STEP_MIN = 1e-6
-const CT_BIAS_MAX_FAILURES = 400  # hard bound on retries: never hang (ticket 17)
+const CT_BIAS_MAX_FAILURES = 400  # hard bound on retries: never hang
 
 function solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregions)
     if abs(bias_voltage) == 0.0 || cathode_breg > n_bregions
@@ -606,7 +606,7 @@ function solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregion
     return sol
 end
 
-# Doping homotopy at fixed bias (ticket 18): continue from the last converged
+# Doping homotopy at fixed bias: continue from the last converged
 # biased state at ``warm_doping`` to the requested ``doping`` along
 # ``d(t) = warm_doping + t (doping - warm_doping)``, warm-starting each step.
 # This is the natural continuation for an optimizer that moves the design a
@@ -656,7 +656,7 @@ function solve_at_bias_by_doping_homotopy(
     return sol
 end
 
-# Biased solve with the fallback chain of ticket 18:
+# Biased solve with the fallback chain:
 #
 #   1. direct Newton from the nearby biased warm solution (``warm_start``);
 #   2. doping homotopy at fixed bias from that solution (needs ``warm_doping``,

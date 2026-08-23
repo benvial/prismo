@@ -1,7 +1,4 @@
-"""Tests for the NLopt MMA optimization loop.
-
-Ref: ticket 15.
-"""
+"""Tests for the NLopt MMA optimization loop."""
 
 import json
 from itertools import pairwise
@@ -24,7 +21,7 @@ N_NODES = 16
 
 
 def _with_terms(objective_fn):
-    """Wrap a scalar objective mock into the ``(objective, terms)`` seam (ticket 25).
+    """Wrap a scalar objective mock into the ``(objective, terms)`` seam.
 
     The mock's value doubles as Δneff.
     """
@@ -326,8 +323,7 @@ class TestOptimizeDopingThreadsMeshRef:
     """The optimizer must forward the shared mesh to ChargeTransport.
 
     Without it CT never receives the real geometry and solves on its 1D
-    fallback -- the crash the whole feature exists to fix. Ref:
-    .scratch/chargetransport-mesh-node-ordering/issues/02.
+    fallback -- the crash the whole feature exists to fix.
     """
 
     def test_mesh_ref_reaches_chargetransport_component(self):
@@ -389,7 +385,7 @@ class TestOptimizeDopingSurvivesSolverFailure:
     ChargeTransport's Newton solve diverges on some designs MMA proposes. NLopt
     cannot be told to reject a trial point, and feeding MMA a fabricated penalty
     poisons its asymptote update, so the optimizer abandons that MMA instance,
-    halves the move limit and re-proposes from the same iterate (ticket 19). It
+    halves the move limit and re-proposes from the same iterate. It
     stops only after a bounded number of halvings, keeping the best feasible
     design.
     """
@@ -410,7 +406,10 @@ class TestOptimizeDopingSurvivesSolverFailure:
                 raise RuntimeError("Julia forward solve failed: ConvergenceError()")
             return -jnp.sum((rho - target_j) ** 2)
 
-        with mock.patch("prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(mock_pipeline)):
+        with mock.patch(
+            "prismo.optimizer.pipeline_with_terms",
+            side_effect=_with_terms(mock_pipeline),
+        ):
             rho_opt, history = optimize_doping(
                 initial_rho=np.full(self.N_NODES, 0.25, dtype=float),
                 max_iter=60,
@@ -444,7 +443,10 @@ class TestOptimizeDopingSurvivesSolverFailure:
             return jnp.asarray(1.0, dtype=jnp.float64) - jnp.sum(rho**2) * 0.0
 
         seed = np.full(self.N_NODES, 0.25, dtype=float)
-        with mock.patch("prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(mock_pipeline)):
+        with mock.patch(
+            "prismo.optimizer.pipeline_with_terms",
+            side_effect=_with_terms(mock_pipeline),
+        ):
             rho_opt, history = optimize_doping(
                 initial_rho=seed,
                 max_iter=100,
@@ -463,7 +465,10 @@ class TestOptimizeDopingSurvivesSolverFailure:
             raise RuntimeError("Julia forward solve failed: ConvergenceError()")
 
         with (
-            mock.patch("prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(mock_pipeline)),
+            mock.patch(
+                "prismo.optimizer.pipeline_with_terms",
+                side_effect=_with_terms(mock_pipeline),
+            ),
             pytest.raises(RuntimeError, match="ConvergenceError"),
         ):
             optimize_doping(
@@ -482,7 +487,10 @@ class TestOptimizeDopingSurvivesSolverFailure:
             # is the degenerate loop observed against the real containers.
             return jnp.asarray(1.0, dtype=jnp.float64)
 
-        with mock.patch("prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(mock_pipeline)):
+        with mock.patch(
+            "prismo.optimizer.pipeline_with_terms",
+            side_effect=_with_terms(mock_pipeline),
+        ):
             rho_opt, _ = optimize_doping(
                 initial_rho=np.full(self.N_NODES, 0.25, dtype=float),
                 max_iter=500,
@@ -514,7 +522,8 @@ class TestMoveLimit:
         move_limit = 0.07
 
         with mock.patch(
-            "prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(self._quadratic(target))
+            "prismo.optimizer.pipeline_with_terms",
+            side_effect=_with_terms(self._quadratic(target)),
         ):
             rho_opt, history = optimize_doping(
                 initial_rho=np.zeros(self.N_NODES),
@@ -550,7 +559,8 @@ class TestMoveLimit:
     def test_bounds_still_hold_at_the_rails(self):
         target = np.full(self.N_NODES, 3.0)
         with mock.patch(
-            "prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(self._quadratic(target))
+            "prismo.optimizer.pipeline_with_terms",
+            side_effect=_with_terms(self._quadratic(target)),
         ):
             rho_opt, _ = optimize_doping(
                 initial_rho=np.full(self.N_NODES, 0.9),
@@ -581,7 +591,10 @@ class TestCheckpoint:
                 len(json.loads(path.read_text())["history"]) if path.exists() else 0
             )
 
-        with mock.patch("prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(mock_pipeline)):
+        with mock.patch(
+            "prismo.optimizer.pipeline_with_terms",
+            side_effect=_with_terms(mock_pipeline),
+        ):
             rho_opt, history = optimize_doping(
                 initial_rho=np.full(self.N_NODES, 0.25, dtype=float),
                 max_iter=6,
@@ -696,7 +709,8 @@ class TestDesignHistoryCheckpoint:
             return -jnp.sum((rho - target) ** 2)
 
         with mock.patch(
-            "prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(mock_pipeline)
+            "prismo.optimizer.pipeline_with_terms",
+            side_effect=_with_terms(mock_pipeline),
         ):
             _, history = optimize_doping(
                 initial_rho=np.full(self.N, 0.25),
@@ -721,7 +735,8 @@ class TestDesignHistoryCheckpoint:
             return -jnp.sum((rho - target) ** 2)
 
         with mock.patch(
-            "prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(mock_pipeline)
+            "prismo.optimizer.pipeline_with_terms",
+            side_effect=_with_terms(mock_pipeline),
         ):
             _, history = optimize_doping(
                 initial_rho=np.full(self.N, 0.25),

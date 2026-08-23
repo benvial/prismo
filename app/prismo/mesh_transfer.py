@@ -1,6 +1,6 @@
-"""Carrier-field -> gyptis-design-cell mesh-transfer operator (ticket 05).
+"""Carrier-field -> gyptis-design-cell mesh-transfer operator.
 
-Both solvers now share one gmsh geometry (ticket 05), so the transfer is an
+Both solvers now share one gmsh geometry, so the transfer is an
 *exact local restriction* rather than a cross-mesh interpolation: every gyptis
 design cell is a triangle of the shared mesh whose three vertices are shared-mesh
 nodes. The design-cell value is the mean of its three vertex nodal values -- the

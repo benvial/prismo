@@ -90,7 +90,7 @@ def test_cli_run_help() -> None:
 
 
 def test_cli_validate_gradient_help() -> None:
-    """The ticket 06 deliverable is exposed as its own subcommand."""
+    """The gradient check is exposed as its own subcommand."""
     main_module = import_module("prismo.main")
     result = runner.invoke(main_module.app, ["validate-gradient", "--help"])
     assert result.exit_code == 0, result.output
@@ -158,10 +158,13 @@ def test_cli_run_without_backend_errors(tmp_path: Path) -> None:
         main_module.app,
         [
             "run",
-            "--max-iter", "3",
+            "--max-iter",
+            "3",
             "--no-jit",
-            "--mesh-path", str(tmp_path / "waveguide.msh"),
-            "--output-dir", str(tmp_path),
+            "--mesh-path",
+            str(tmp_path / "waveguide.msh"),
+            "--output-dir",
+            str(tmp_path),
         ],
     )
     assert result.exit_code != 0
@@ -235,7 +238,7 @@ def test_container_run_seeds_signed_junction_for_optimization(
     # right nodes p-type so -5 V widens, rather than forward-biases, junction.
     np.testing.assert_allclose(captured["initial_rho"], [0.3, 0.3, -0.3])
     # The move limit and the per-evaluation checkpoint reach the optimizer
-    # (ticket 19); the checkpoint lives next to the figures.
+    # ; the checkpoint lives next to the figures.
     assert captured["move_limit"] == pytest.approx(0.05)
     assert Path(captured["checkpoint_path"]) == tmp_path / "checkpoint.json"
     assert callable(captured["on_iteration"])
@@ -261,7 +264,7 @@ def test_container_run_figures_probe_the_optimized_pipeline(
 
     The finite differences behind ``gradient_validation.pdf`` must run the same
     pipeline the optimizer drove -- filter, ``mesh_ref`` and transfer bound --
-    not an unfiltered one on ChargeTransport's 1D fallback device (ticket 15).
+    not an unfiltered one on ChargeTransport's 1D fallback device.
     """
     import jax.numpy as jnp
     import prismo.main as main_module
@@ -313,7 +316,7 @@ def test_container_run_figures_probe_the_optimized_pipeline(
     monkeypatch.setattr(
         outputs_module,
         "generate_outputs",
-        lambda **kwargs: (output_captured.update(kwargs) or []),
+        lambda **kwargs: output_captured.update(kwargs) or [],
     )
     _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
 
@@ -405,7 +408,7 @@ def test_container_run_survives_a_failing_mode_query(
     monkeypatch.setattr(
         outputs_module,
         "generate_outputs",
-        lambda **kwargs: (output_captured.update(kwargs) or []),
+        lambda **kwargs: output_captured.update(kwargs) or [],
     )
     _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
 
@@ -496,8 +499,7 @@ def test_container_run_reports_warm_and_cold_objective(
 
     The ChargeTransport worker is reset before the best design is evaluated
     once more, warm and cold Δneff are both printed, and a discrepancy beyond
-    the tolerance is surfaced as a warning and handed to the convergence figure
-    (ticket 20).
+    the tolerance is surfaced as a warning and handed to the convergence figure.
     """
     import prismo.main as main_module
     import prismo.optimizer as optimizer_module
@@ -511,13 +513,28 @@ def test_container_run_reports_warm_and_cold_objective(
     # The optimizer "saw" 1e-3; the doubles re-solve to something else, so the
     # warm/cold discrepancy is far above the tolerance.
     history = [
-        {"iteration": 1, "delta_n_eff": 5e-4, "delta_rho": 0.0, "grad_norm": 1e-4,
-         "wall_time": 0.1},
-        {"iteration": 2, "delta_n_eff": 1e-3, "delta_rho": 1e-3, "grad_norm": 1e-4,
-         "wall_time": 0.2},
+        {
+            "iteration": 1,
+            "delta_n_eff": 5e-4,
+            "delta_rho": 0.0,
+            "grad_norm": 1e-4,
+            "wall_time": 0.1,
+        },
+        {
+            "iteration": 2,
+            "delta_n_eff": 1e-3,
+            "delta_rho": 1e-3,
+            "grad_norm": 1e-4,
+            "wall_time": 0.2,
+        },
         # A rejected trial after the best: the reported warm value is the max.
-        {"iteration": 3, "delta_n_eff": 8e-4, "delta_rho": 1e-3, "grad_norm": 1e-4,
-         "wall_time": 0.3},
+        {
+            "iteration": 3,
+            "delta_n_eff": 8e-4,
+            "delta_rho": 1e-3,
+            "grad_norm": 1e-4,
+            "wall_time": 0.3,
+        },
     ]
     base = _container_components([[0.5, 0.0], [1.5, 0.0]])
     components = _solve_components_with_reset(base, calls)
@@ -535,7 +552,7 @@ def test_container_run_reports_warm_and_cold_objective(
     monkeypatch.setattr(
         outputs_module,
         "generate_outputs",
-        lambda **kwargs: (output_captured.update(kwargs) or []),
+        lambda **kwargs: output_captured.update(kwargs) or [],
     )
     _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
 
@@ -579,8 +596,13 @@ def test_container_run_without_reset_seam_skips_cold_reevaluation(
     coords = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
     output_captured: dict[str, object] = {}
     history = [
-        {"iteration": 1, "delta_n_eff": 1e-3, "delta_rho": 0.0, "grad_norm": 1e-4,
-         "wall_time": 0.1},
+        {
+            "iteration": 1,
+            "delta_n_eff": 1e-3,
+            "delta_rho": 0.0,
+            "grad_norm": 1e-4,
+            "wall_time": 0.1,
+        },
     ]
     monkeypatch.setattr(
         mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
@@ -594,7 +616,7 @@ def test_container_run_without_reset_seam_skips_cold_reevaluation(
     monkeypatch.setattr(
         outputs_module,
         "generate_outputs",
-        lambda **kwargs: (output_captured.update(kwargs) or []),
+        lambda **kwargs: output_captured.update(kwargs) or [],
     )
     _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
 
@@ -617,7 +639,7 @@ def test_run_clears_stale_live_doping_frames(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A run starts with no ``doping_field_<n>.png`` from a previous run (ticket 21)."""
+    """A run starts with no ``doping_field_<n>.png`` from a previous run."""
     import prismo.main as main_module
     import prismo.optimizer as optimizer_module
     import prismo.outputs as outputs_module
@@ -631,8 +653,13 @@ def test_run_clears_stale_live_doping_frames(
 
     coords = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
     history = [
-        {"iteration": 1, "delta_n_eff": 1e-3, "delta_rho": 0.0, "grad_norm": 1e-4,
-         "wall_time": 0.1},
+        {
+            "iteration": 1,
+            "delta_n_eff": 1e-3,
+            "delta_rho": 0.0,
+            "grad_norm": 1e-4,
+            "wall_time": 0.1,
+        },
     ]
     monkeypatch.setattr(
         mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
@@ -670,9 +697,7 @@ def test_gradient_validation_cold_resets_before_every_evaluation(
     from _doubles import stub_components
 
     resets: list[str] = []
-    components = stub_components(
-        reset_chargetransport=lambda: resets.append("reset")
-    )
+    components = stub_components(reset_chargetransport=lambda: resets.append("reset"))
     coords = np.asarray(
         [[0.0, 0.0], [1e-6, 0.0], [2e-6, 0.0], [3e-6, 0.0]], dtype=float
     )
@@ -742,9 +767,7 @@ def test_gradient_validation_default_is_warm(
     from _doubles import stub_components
 
     resets: list[str] = []
-    components = stub_components(
-        reset_chargetransport=lambda: resets.append("reset")
-    )
+    components = stub_components(reset_chargetransport=lambda: resets.append("reset"))
     coords = np.asarray(
         [[0.0, 0.0], [1e-6, 0.0], [2e-6, 0.0], [3e-6, 0.0]], dtype=float
     )
@@ -779,9 +802,9 @@ def test_local_pipeline_inputs_keep_the_seeded_junction_under_the_default_filter
     are running. That mesh used to be written in metres while ``--r-min``
     defaulted to ``0.05`` micrometres, so the filter radius was 0.05 m over a
     3 µm device: ``H`` became all-pairs and ``theta_tilde`` collapsed to the
-    global mean, erasing the seeded P/N junction the optimizer starts from
-    (ticket 15). Both are micrometres now, so the filtered field must still
-    change sign across the junction.
+    global mean, erasing the seeded P/N junction the optimizer starts from.
+    Both are micrometres now, so the filtered field must still change sign
+    across the junction.
     """
     pytest.importorskip("gmsh")
     import jax.numpy as jnp
@@ -907,7 +930,7 @@ def test_container_overlay_geometry_follows_the_gyptis_frame() -> None:
     The gyptis author centres its layer stack on y = 0 with a 0.35 um
     substrate; RibWaveguideGeometry describes the local author's frame (y from
     0, 0.5 um substrate), so drawing it over container node coordinates put
-    the rib outline off the device (ticket 16). The overlay must instead be
+    the rib outline off the device. The overlay must instead be
     derived from the design-cell vertices and node coordinates.
     """
     from prismo.main import PipelineInputs, _container_overlay_geometry
@@ -1141,7 +1164,7 @@ def test_container_run_survives_a_failing_cold_resolve(
 
     After the reset the ChargeTransport double raises (a cold ramp that does
     not converge); the run prints a warning, reports the warm value, and still
-    generates the figures (ticket 23).
+    generates the figures.
     """
     from dataclasses import replace
 
@@ -1154,8 +1177,13 @@ def test_container_run_survives_a_failing_cold_resolve(
     output_captured: dict[str, object] = {}
     calls: list[str] = []
     history = [
-        {"iteration": 1, "delta_n_eff": 1e-3, "delta_rho": 0.0, "grad_norm": 1e-4,
-         "wall_time": 0.1},
+        {
+            "iteration": 1,
+            "delta_n_eff": 1e-3,
+            "delta_rho": 0.0,
+            "grad_norm": 1e-4,
+            "wall_time": 0.1,
+        },
     ]
     base = _container_components([[0.5, 0.0], [1.5, 0.0]])
     components = _solve_components_with_reset(base, calls)
@@ -1179,7 +1207,7 @@ def test_container_run_survives_a_failing_cold_resolve(
     monkeypatch.setattr(
         outputs_module,
         "generate_outputs",
-        lambda **kwargs: (output_captured.update(kwargs) or []),
+        lambda **kwargs: output_captured.update(kwargs) or [],
     )
     _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
 
@@ -1231,7 +1259,7 @@ def test_run_seed_option_selects_the_initial_design(
     monkeypatch.setattr(
         optimizer_module,
         "optimize_doping",
-        lambda **kwargs: (captured.update(kwargs) or (kwargs["initial_rho"], [])),
+        lambda **kwargs: captured.update(kwargs) or (kwargs["initial_rho"], []),
     )
     monkeypatch.setattr(outputs_module, "generate_outputs", lambda **kwargs: [])
     _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
@@ -1250,7 +1278,9 @@ def test_run_seed_option_selects_the_initial_design(
 
     expected = np.asarray(seed_design_field(coords, "u"))
     np.testing.assert_array_equal(captured["initial_rho"], expected)
-    assert not np.array_equal(expected, np.asarray(seed_design_field(coords, "lateral")))
+    assert not np.array_equal(
+        expected, np.asarray(seed_design_field(coords, "lateral"))
+    )
 
 
 def test_run_binds_loss_weight_and_mode_overlap_to_the_optimizer(
@@ -1266,10 +1296,24 @@ def test_run_binds_loss_weight_and_mode_overlap_to_the_optimizer(
     captured: dict[str, object] = {}
     calls: list[str] = []
     history = [
-        {"iteration": 1, "objective": 4e-4, "delta_n_eff": 5e-4,
-         "modal_loss_db_cm": 100.0, "delta_rho": 0.0, "grad_norm": 1e-4, "wall_time": 0.1},
-        {"iteration": 2, "objective": 7e-4, "delta_n_eff": 1e-3,
-         "modal_loss_db_cm": 300.0, "delta_rho": 1e-3, "grad_norm": 1e-4, "wall_time": 0.2},
+        {
+            "iteration": 1,
+            "objective": 4e-4,
+            "delta_n_eff": 5e-4,
+            "modal_loss_db_cm": 100.0,
+            "delta_rho": 0.0,
+            "grad_norm": 1e-4,
+            "wall_time": 0.1,
+        },
+        {
+            "iteration": 2,
+            "objective": 7e-4,
+            "delta_n_eff": 1e-3,
+            "modal_loss_db_cm": 300.0,
+            "delta_rho": 1e-3,
+            "grad_norm": 1e-4,
+            "wall_time": 0.2,
+        },
     ]
     components = _solve_components_with_reset(
         _container_components([[0.5, 0.0], [1.5, 0.0]]), calls
@@ -1328,7 +1372,7 @@ def test_run_without_a_gyptis_backend_needs_no_overlap_unless_weighted(
     monkeypatch.setattr(
         optimizer_module,
         "optimize_doping",
-        lambda **kwargs: (captured.update(kwargs) or (kwargs["initial_rho"], [])),
+        lambda **kwargs: captured.update(kwargs) or (kwargs["initial_rho"], []),
     )
     monkeypatch.setattr(outputs_module, "generate_outputs", lambda **kwargs: [])
     _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
@@ -1361,7 +1405,9 @@ def test_cli_run_exposes_the_ticket_25_knobs() -> None:
     assert main_module._DEFAULT_R_MIN == pytest.approx(0.10)
 
 
-def test_container_run_forwards_the_geometry_knobs(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_container_run_forwards_the_geometry_knobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """``--contact-offset`` / ``--domain-width`` reach the container init."""
     import prismo.main as main_module
     import prismo.pipeline as pipeline_module
@@ -1409,8 +1455,14 @@ def test_bad_geometry_knobs_fail_before_any_container_starts(
         lambda **kwargs: started.append("init") or None,
     )
     for command in ("run", "validate-gradient", "probe-objective"):
-        for args in (["--contact-offset", "-0.1"], ["--seed", "diagonal"], ["--domain-width", "0"]):
-            result = runner.invoke(main_module.app, [command, "--use-containers", *args])
+        for args in (
+            ["--contact-offset", "-0.1"],
+            ["--seed", "diagonal"],
+            ["--domain-width", "0"],
+        ):
+            result = runner.invoke(
+                main_module.app, [command, "--use-containers", *args]
+            )
             assert result.exit_code != 0, (command, args)
             assert "must be" in result.output, (command, args, result.output)
     assert started == []
@@ -1448,8 +1500,11 @@ def test_gradient_validation_uses_the_requested_seed(
     def fake_validate(pipeline_fn, rho, **kwargs):
         captured["rho"] = np.asarray(rho)
         return types.SimpleNamespace(
-            passed=True, worst_rel_error=0.0, tolerance=1e-2,
-            best_rel_errors=[0.0], figure_path=tmp_path / "gv.pdf",
+            passed=True,
+            worst_rel_error=0.0,
+            tolerance=1e-2,
+            best_rel_errors=[0.0],
+            figure_path=tmp_path / "gv.pdf",
         )
 
     monkeypatch.setattr(outputs_module, "validate_gradient", fake_validate)
@@ -1463,7 +1518,9 @@ def test_gradient_validation_uses_the_requested_seed(
         components=None,
         seed="vertical",
     )
-    np.testing.assert_array_equal(captured["rho"], np.asarray(seed_design_field(coords, "vertical")))
+    np.testing.assert_array_equal(
+        captured["rho"], np.asarray(seed_design_field(coords, "vertical"))
+    )
 
 
 def test_local_geometry_rejects_contacts_outside_the_box() -> None:
@@ -1495,13 +1552,28 @@ def test_run_hands_per_iteration_doping_frames_to_the_outputs(
     output_captured: dict[str, object] = {}
     designs = [[0.3, 0.3, -0.3], [0.35, 0.25, -0.3], [0.4, 0.2, -0.3]]
     history = [
-        {"iteration": i + 1, "delta_n_eff": 1e-3 * (i + 1), "objective": 1e-3 * (i + 1),
-         "design": d, "delta_rho": 0.0, "grad_norm": 1e-4, "wall_time": 0.1}
+        {
+            "iteration": i + 1,
+            "delta_n_eff": 1e-3 * (i + 1),
+            "objective": 1e-3 * (i + 1),
+            "design": d,
+            "delta_rho": 0.0,
+            "grad_norm": 1e-4,
+            "wall_time": 0.1,
+        }
         for i, d in enumerate(designs)
     ]
     # One legacy record without a design: skipped, not fatal.
-    history.insert(1, {"iteration": 99, "delta_n_eff": 5e-4, "delta_rho": 0.0,
-                       "grad_norm": 1e-4, "wall_time": 0.1})
+    history.insert(
+        1,
+        {
+            "iteration": 99,
+            "delta_n_eff": 5e-4,
+            "delta_rho": 0.0,
+            "grad_norm": 1e-4,
+            "wall_time": 0.1,
+        },
+    )
     monkeypatch.setattr(
         mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
     )
@@ -1514,7 +1586,7 @@ def test_run_hands_per_iteration_doping_frames_to_the_outputs(
     monkeypatch.setattr(
         outputs_module,
         "generate_outputs",
-        lambda **kwargs: (output_captured.update(kwargs) or []),
+        lambda **kwargs: output_captured.update(kwargs) or [],
     )
     _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
 
@@ -1534,7 +1606,9 @@ def test_run_hands_per_iteration_doping_frames_to_the_outputs(
     assert [h["iteration"] for h in output_captured["animation_history"]] == [1, 2, 3]
     # r_min = 50e-9 µm on a 1 µm pitch: the filter is the identity, so the
     # frame is the doping map of the design itself.
-    np.testing.assert_allclose(frames[0], np.asarray(doping_from_theta(np.asarray(designs[0]))))
+    np.testing.assert_allclose(
+        frames[0], np.asarray(doping_from_theta(np.asarray(designs[0])))
+    )
 
 
 def test_animate_replays_a_checkpoint_without_any_solver(
@@ -1549,13 +1623,22 @@ def test_animate_replays_a_checkpoint_without_any_solver(
     n = coords.shape[0]
     rng = np.random.default_rng(1)
     history = [
-        {"iteration": i + 1, "delta_n_eff": 1e-4 * (i + 1), "objective": 1e-4 * (i + 1),
-         "modal_loss_db_cm": 10.0 + i, "design": rng.uniform(-1, 1, n).tolist(),
-         "delta_rho": 0.0, "grad_norm": 1e-4, "wall_time": 0.1}
+        {
+            "iteration": i + 1,
+            "delta_n_eff": 1e-4 * (i + 1),
+            "objective": 1e-4 * (i + 1),
+            "modal_loss_db_cm": 10.0 + i,
+            "design": rng.uniform(-1, 1, n).tolist(),
+            "delta_rho": 0.0,
+            "grad_norm": 1e-4,
+            "wall_time": 0.1,
+        }
         for i in range(3)
     ]
     checkpoint = tmp_path / "checkpoint.json"
-    checkpoint.write_text(json.dumps({"rho_opt": history[-1]["design"], "history": history}))
+    checkpoint.write_text(
+        json.dumps({"rho_opt": history[-1]["design"], "history": history})
+    )
     monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
     monkeypatch.setattr(
         mesh_module,
@@ -1585,10 +1668,14 @@ def test_animate_rejects_a_checkpoint_from_another_mesh(
 
     coords = _rib_coords()
     checkpoint = tmp_path / "checkpoint.json"
-    checkpoint.write_text(json.dumps({
-        "rho_opt": [0.0] * 5,
-        "history": [{"iteration": 1, "delta_n_eff": 0.0, "design": [0.0] * 5}],
-    }))
+    checkpoint.write_text(
+        json.dumps(
+            {
+                "rho_opt": [0.0] * 5,
+                "history": [{"iteration": 1, "delta_n_eff": 0.0, "design": [0.0] * 5}],
+            }
+        )
+    )
     monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
     monkeypatch.setattr(
         mesh_module,
@@ -1613,15 +1700,23 @@ def test_animate_reports_a_legacy_checkpoint(
     import prismo.main as main_module
 
     checkpoint = tmp_path / "checkpoint.json"
-    checkpoint.write_text(json.dumps({
-        "rho_opt": [0.0], "history": [{"iteration": 1, "delta_n_eff": 0.0}],
-    }))
-    assert main_module._run_animate(
-        checkpoint_path=str(checkpoint),
-        mesh_path=str(tmp_path / "mesh.msh"),
-        r_min=0.1,
-        output_dir=str(tmp_path),
-    ) == []
+    checkpoint.write_text(
+        json.dumps(
+            {
+                "rho_opt": [0.0],
+                "history": [{"iteration": 1, "delta_n_eff": 0.0}],
+            }
+        )
+    )
+    assert (
+        main_module._run_animate(
+            checkpoint_path=str(checkpoint),
+            mesh_path=str(tmp_path / "mesh.msh"),
+            r_min=0.1,
+            output_dir=str(tmp_path),
+        )
+        == []
+    )
     assert "no per-iteration designs" in capsys.readouterr().out
 
 
@@ -1645,9 +1740,17 @@ def test_run_hands_the_swept_carriers_to_the_outputs(
 
     coords = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
     output_captured: dict[str, object] = {}
-    history = [{"iteration": 1, "delta_n_eff": 1e-3, "objective": 1e-3,
-                "design": [0.3, 0.3, -0.3], "delta_rho": 0.0, "grad_norm": 1e-4,
-                "wall_time": 0.1}]
+    history = [
+        {
+            "iteration": 1,
+            "delta_n_eff": 1e-3,
+            "objective": 1e-3,
+            "design": [0.3, 0.3, -0.3],
+            "delta_rho": 0.0,
+            "grad_norm": 1e-4,
+            "wall_time": 0.1,
+        }
+    ]
     components = _solve_components_with_reset(
         _container_components([[0.5, 0.0], [1.5, 0.0]]), []
     )
@@ -1656,19 +1759,26 @@ def test_run_hands_the_swept_carriers_to_the_outputs(
     )
     monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
     monkeypatch.setattr(
-        optimizer_module, "optimize_doping",
+        optimizer_module,
+        "optimize_doping",
         lambda **kwargs: (np.asarray([0.3, 0.3, -0.3]), history),
     )
     monkeypatch.setattr(
-        outputs_module, "generate_outputs",
-        lambda **kwargs: (output_captured.update(kwargs) or []),
+        outputs_module,
+        "generate_outputs",
+        lambda **kwargs: output_captured.update(kwargs) or [],
     )
     _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
 
     main_module._run_pipeline(
-        r_min=50e-9, max_iter=1, ftol_rel=1e-5,
-        mesh_path=str(tmp_path / "mesh.msh"), output_dir=str(tmp_path),
-        no_jit=True, use_containers=True, components=components,
+        r_min=50e-9,
+        max_iter=1,
+        ftol_rel=1e-5,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        no_jit=True,
+        use_containers=True,
+        components=components,
     )
     # Identity-carrier doubles: n = p = doping at both biases, so nothing is swept.
     swept = output_captured["swept_carriers"]

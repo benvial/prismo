@@ -5,7 +5,6 @@ the shared Gmsh mesh description, the Soref-Bennett carrier-to-permittivity
 coupling arrays, and mesh-transfer metadata.
 """
 
-
 from pydantic import BaseModel, Field
 
 

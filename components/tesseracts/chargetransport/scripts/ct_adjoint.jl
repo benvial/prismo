@@ -159,8 +159,8 @@ and ``bψEQ`` is itself an output of the equilibrium solve. Doping therefore
 moves the biased state twice: through the local Poisson source
 (``explicit_doping_contraction``) and through the contact reference. At reverse
 bias the rib is depleted and the second path carries most of the gradient, so
-dropping it -- as this file did between 43d2efc and ticket 06 -- leaves the
-composed gradient wrong by more than half (ticket 06).
+dropping it -- as an earlier version of this file did -- leaves the
+composed gradient wrong by more than half.
 
 The chain is ``∂J/∂bψEQ[breg]`` (summed over the region's pinned ψ DOFs) times
 ``dbψEQ[breg]/dN``, which is nonzero only at the one boundary node

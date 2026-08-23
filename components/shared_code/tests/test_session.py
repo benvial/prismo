@@ -8,7 +8,6 @@ bounds how many coexist.
 """
 
 import numpy as np
-
 from prismo_shared.session import (
     SolveSession,
     SolveSessionRegistry,
@@ -141,7 +140,7 @@ def test_registry_survives_either_order_of_two_concurrent_forwards() -> None:
     gyptis' background and perturbed solves are independent ``pure_callback``s
     into one container, and XLA picks their order. Under one scope both
     survive, so the perturbed adjoint finds its session no matter which forward
-    XLA ran last (ticket 15).
+    XLA ran last.
     """
     for order in (("background", "perturbed"), ("perturbed", "background")):
         registry = SolveSessionRegistry(max_sessions=2)

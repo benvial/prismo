@@ -1,4 +1,4 @@
-"""Tests for the loss-aware objective and the junction seeds (ticket 25).
+"""Tests for the loss-aware objective and the junction seeds.
 
 The modal free-carrier loss is a first-order perturbation: the mode-overlap
 weights are the gyptis eigen-adjoint at the uniform background, frozen, and
@@ -99,7 +99,7 @@ class TestSeeds:
 
 class TestFreeCarrierAbsorption:
     def test_matches_soref_bennett_at_1e19(self):
-        """~85 cm^-1 for 1e19 electrons; ~60 cm^-1 for 1e19 holes (ticket 25)."""
+        """~85 cm^-1 for 1e19 electrons; ~60 cm^-1 for 1e19 holes."""
         alpha_e = free_carrier_absorption_cm(jnp.asarray([1e19]), jnp.asarray([0.0]))
         alpha_h = free_carrier_absorption_cm(jnp.asarray([0.0]), jnp.asarray([1e19]))
         assert float(alpha_e[0]) == pytest.approx(85.0)
@@ -153,7 +153,9 @@ class TestPipelineLossTerm:
         )
         assert isinstance(terms, PipelineTerms)
         assert float(objective) == pytest.approx(float(terms.delta_neff))
-        assert float(terms.delta_neff) == pytest.approx(float(pipeline(theta, components=components)))
+        assert float(terms.delta_neff) == pytest.approx(
+            float(pipeline(theta, components=components))
+        )
         # Loss at 0 V from the absolute carriers, weighted by the overlap, with the
         # mean-field stub's background neff = sqrt(background epsilon).
         alpha = 8.5e-18 * 1e18 + 6.0e-18 * 1e16

@@ -1,6 +1,6 @@
 #!/usr/bin/env julia
 
-# PackageCompiler precompile workload (ticket 17).
+# PackageCompiler precompile workload.
 #
 # Executed once during the base-image build via
 #   create_sysimage(...; precompile_execution_file = "warmup.jl")
@@ -13,7 +13,7 @@
 #   - build_ct_system on the 1D fallback grid AND on a Gmsh 2D mesh file
 #     (different grid types -> different method specializations)
 #   - equilibrium_solve! + solve_at_bias with a reverse-bias ramp
-#   - the warm-start chain of ticket 18 (direct warm Newton, doping homotopy
+#   - the warm-start chain (direct warm Newton, doping homotopy
 #     at fixed bias, solve budget bookkeeping)
 #   - get_density extraction and the contracted discrete-adjoint VJP
 #   - NPZ / JSON I/O
@@ -26,7 +26,7 @@ include(joinpath(@__DIR__, "ct_adjoint.jl"))
 # A three-cell strip with an Ohmic contact at each end of its bottom edge, one
 # free cell apart. Both contacts have to be distinct faces of the silicon
 # boundary that share no node: ``silicon_grid`` refuses a device where either is
-# missing (ticket 14), and a node belonging to both would carry two conflicting
+# missing, and a node belonging to both would carry two conflicting
 # Ohmic Dirichlet values once the bias is applied.
 const MINIMAL_DEVICE_MSH = """
 \$MeshFormat
@@ -70,7 +70,7 @@ function exercise(doping, mesh_path, bias_voltage)
     u0 = solve_equilibrium(ctsys, data, silicon_doping, control)
     sol = solve_at_bias(ctsys, control, u0, bias_voltage, cathode_breg, n_bregions)
 
-    # Warm-start chain (ticket 18): a nearby profile through the direct warm
+    # Warm-start chain: a nearby profile through the direct warm
     # Newton solve and the doping homotopy, so neither path JITs at runtime.
     nearby = silicon_doping .* 1.01
     u0_warm = solve_equilibrium_with_warm_start(ctsys, data, nearby, control, deepcopy(u0))

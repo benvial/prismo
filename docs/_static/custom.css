@@ -1,1 +1,12 @@
 /* Prismo custom CSS overrides for Shibuya theme */
+
+/* Mermaid diagrams: natural size, shrink only when wider than the column
+   (the extension's stylesheet forces width: 100%, which upscales small ones). */
+html pre.mermaid > svg {
+    width: auto !important;
+    max-width: 100% !important;
+    height: auto !important;
+}
+html pre.mermaid {
+    text-align: center;
+}

@@ -3,9 +3,7 @@
 Composes density filter -> doping mapping -> ChargeTransport.jl (0V, -5V)
 -> Soref-Bennett coupling -> gyptis -> delta_n_eff into a single
 JAX-differentiable function, optionally minus a weighted first-order modal
-free-carrier loss (ticket 25, ADR 0004).
-
-Ref: tickets 14 (pipeline composition), 15 (optimization loop), 25 (loss).
+free-carrier loss.
 """
 
 from __future__ import annotations
@@ -40,13 +38,12 @@ _COMPONENTS_DIR = Path(__file__).resolve().parents[2] / "components" / "tesserac
 # it) and counterdoping is not representable. theta=0 -> 0 (net-intrinsic); a
 # larger |theta| dopes harder, saturating at |N| ~ 1e19 cm^-3 at |theta|=1 -- the
 # largest reverse-bias-stable concentration on the shared ChargeTransport mesh,
-# within the B/P solid-solubility and Boltzmann-statistics window. Code = comment
-# = glossary (CONTEXT.md).
+# within the B/P solid-solubility and Boltzmann-statistics window.
 #
 # The reference is the *depletion-modulator* concentration, not a near-intrinsic
 # one: at |N| ~ 3e15 the -5 V depletion width (~1.6 um) swamps the 500 nm x 220 nm
 # rib, so the rib is fully depleted and the reverse-bias carrier field carries no
-# bulk-doping signal at all (ticket 06). Centring the span on 1e17 keeps the seeded
+# bulk-doping signal at all. Centring the span on 1e17 keeps the seeded
 # junction partially depleted -- the regime a real carrier-depletion modulator works
 # in -- while the |theta|=1 rail still lands at ~1e19.
 DOPING_REFERENCE_CM3 = 1e17
@@ -167,7 +164,7 @@ def seed_signed_junction(coords: np.ndarray) -> jax.Array:
     )
 
 
-# Junction seeds (ticket 25). The MMA optimum is local, so the run can start
+# Junction seeds. The MMA optimum is local, so the run can start
 # from more than the lateral junction: a vertical (P over N) and a U-shaped
 # (N wrapped under and beside a P core) topology, the 2D cross-sections of the
 # literature's higher-perimeter junctions. Every seed keeps n-type on the left
@@ -292,8 +289,8 @@ def init_tesseract_containers(
             fundamental, ``k`` the ``k``-th guided mode in descending neff (see
             :func:`build_gyptis_components`).
         contact_offset: Gap from the rib edge to the near contact edge [µm],
-            passed to the gyptis mesh author as ``PRISMO_GYPTIS_CONTACT_OFFSET``
-            (ticket 25). ``None`` keeps the component's default (0.2 µm).
+            passed to the gyptis mesh author as ``PRISMO_GYPTIS_CONTACT_OFFSET``.
+            ``None`` keeps the component's default (0.2 µm).
         domain_width: Physical box width [µm] (the slab spans it; the PML lies
             outside), passed as ``PRISMO_GYPTIS_WIDTH``. ``None`` keeps the
             default (2.0 µm).
@@ -331,10 +328,9 @@ def init_tesseract_containers(
         if name in os.environ
     }
 
-    # Dev loop (ticket 21): ``PRISMO_DEV_MOUNTS=1`` bind-mounts the host
+    # Dev loop: ``PRISMO_DEV_MOUNTS=1`` bind-mounts the host
     # ``tesseract_api.py`` and ``prismo_shared`` over both images so a Python
     # component edit costs a container restart, not a 4-5 GB image rebuild.
-    # See docs/agents/debugging.md.
     dev_mounts = dev_mounts_requested()
     gyptis_volumes: list[str] = []
     gyptis_env: dict[str, str] = {}
@@ -411,7 +407,7 @@ def teardown_containers(components: PipelineComponents) -> None:
     components.close()
 
 
-# -- Dev mounts (ticket 21) ------------------------------------------------------
+# -- Dev mounts ------------------------------------------------------
 
 # In-container paths the dev mounts shadow. ``tesseract_api.py`` sits at the
 # image's fixed API path; ``prismo_shared`` cannot be mounted over its
@@ -455,7 +451,7 @@ def _dev_mount_volumes(component: str) -> tuple[list[str], dict[str, str]]:
 def reset_chargetransport_worker(
     *, container: Any | None = None, local_api: Any | None = None
 ) -> None:
-    """Drop the ChargeTransport worker's warm solutions (ticket 20).
+    """Drop the ChargeTransport worker's warm solutions.
 
     The next solve is then a function of the doping alone -- the cold
     continuation from near-intrinsic equilibrium and the bias ramp -- rather
@@ -543,8 +539,8 @@ def read_gyptis_design_cell_vertices(
 
     Each gyptis design cell is a triangle of the shared unified mesh; its three
     vertices are shared-mesh nodes. The host matches these coordinates to node
-    indices to assemble the exact node->DG0-cell restriction operator (ticket
-    05). Exposed through the ``write_mesh`` operation.
+    indices to assemble the exact node->DG0-cell restriction operator.
+    Exposed through the ``write_mesh`` operation.
     """
     (raw,) = _gyptis_query(
         {"operation": "write_mesh"},
@@ -583,13 +579,13 @@ def read_gyptis_mode_field(
     Solves once at ``design_epsilon`` and returns ``(abs_e, coords)`` -- the
     peak-normalized magnitude per vertex and the matching ``(n_vertices, 2)``
     vertex coordinates in micrometres. This is the headline optical-mode figure's
-    data source (ticket 07); it is a read-only query, so it does not advance the
+    data source; it is a read-only query, so it does not advance the
     component's tracked mode branch.
 
     ``core_epsilon`` must be the same background the solve components were given:
     it is part of the geometry key the component tracks the mode branch by, so a
     mismatched value would both solve a different device and miss the tracked
-    branch, falling back to the mode selection ticket 13 replaced. Likewise
+    branch, falling back to the untracked mode selection. Likewise
     ``mode_index`` must match the solve components' target: it is part of the
     same branch key, so the figure shows the mode that was optimized.
     """
@@ -646,7 +642,7 @@ def build_design_transfer(
 ) -> jax.Array:
     """Assemble the dense mesh-transfer matrix for the container gyptis path.
 
-    Both solvers share one gmsh geometry (ticket 05), so the transfer is an exact
+    Both solvers share one gmsh geometry, so the transfer is an exact
     local restriction: each gyptis design cell is a triangle of the shared mesh
     whose three vertices are shared-mesh nodes. Reads the design-cell vertices
     from the gyptis backend (in ``design_epsilon`` order) and matches them to
@@ -999,7 +995,7 @@ def _build_design_epsilon(
     """Build the gyptis background and perturbed design-region permittivity fields.
 
     The nodal permittivity perturbation is carried onto the gyptis design cells
-    by the mesh-transfer operator (ticket 04), preserving its spatial structure
+    by the mesh-transfer operator, preserving its spatial structure
     rather than collapsing it to a per-domain scalar mean. The perturbed field is
     ``background + transferred(delta_eps)``; the background field is a *uniform*
     ``background`` of the same length, so the background solve stays
@@ -1042,10 +1038,10 @@ class PipelineComponents:
     ``design_cell_centroids`` is the static geometry query bound to the same
     gyptis backend as the solve components: a zero-arg reader returning the
     ``(n_design, 2)`` centroids in ``design_epsilon`` order, so the pipeline
-    setup can build the mesh-transfer operator (ticket 08) through the seam
+    setup can build the mesh-transfer operator through the seam
     without reaching for a raw container handle. ``mode_field`` is the matching
     read-only query for the tracked mode's ``|E|`` profile, used by the headline
-    mode figure (ticket 07). Both are ``None`` when no gyptis backend is bound.
+    mode figure. Both are ``None`` when no gyptis backend is bound.
     """
 
     chargetransport: Callable[..., Any]
@@ -1054,11 +1050,11 @@ class PipelineComponents:
     design_cell_centroids: Callable[[], np.ndarray] | None = None
     design_cell_vertices: Callable[[], np.ndarray] | None = None
     write_mesh: Callable[[str | Path], np.ndarray] | None = None
-    mode_field: (
-        Callable[[np.ndarray, float], tuple[np.ndarray, np.ndarray]] | None
-    ) = None
+    mode_field: Callable[[np.ndarray, float], tuple[np.ndarray, np.ndarray]] | None = (
+        None
+    )
     # Drops the ChargeTransport worker's warm solutions so the next solve is
-    # cold (ticket 20). ``None`` when no ChargeTransport backend is bound.
+    # cold. ``None`` when no ChargeTransport backend is bound.
     reset_chargetransport: Callable[[], None] | None = None
     closers: tuple[Callable[[], None], ...] = field(default=())
 
@@ -1136,7 +1132,7 @@ def default_components() -> PipelineComponents:
 _CM3_TO_M3 = 1e6
 
 # Fixed reverse-bias operating point and free-space wavelength for the objective
-# and the VπLπ modulation-efficiency headline (ticket 03). Δneff is evaluated
+# and the VπLπ modulation-efficiency headline. Δneff is evaluated
 # between 0 V and REVERSE_BIAS_V; λ matches the gyptis solver's 1.55 µm C-band
 # point (WAVELENGTH in the gyptis tesseract_api).
 REVERSE_BIAS_V = -5.0
@@ -1159,7 +1155,7 @@ def vpi_lpi_v_cm(delta_neff: float | jax.Array) -> float:
     return abs(REVERSE_BIAS_V) * _WAVELENGTH_CM / (2.0 * dneff)
 
 
-# -- Free-carrier loss (ticket 25) ------------------------------------------------
+# -- Free-carrier loss ------------------------------------------------
 
 # Power attenuation 1 cm^-1 (neper) = 10*log10(e) dB/cm.
 NEPER_TO_DB: float = 10.0 / float(np.log(10.0))
@@ -1180,9 +1176,9 @@ def free_carrier_absorption_cm(
     """
     if coeffs is None:
         coeffs = _DEFAULT_COEFFS
-    return coeffs.C_e * _signed_pow(electrons_cm3, coeffs.D_e) + coeffs.C_h * _signed_pow(
-        holes_cm3, coeffs.D_h
-    )
+    return coeffs.C_e * _signed_pow(
+        electrons_cm3, coeffs.D_e
+    ) + coeffs.C_h * _signed_pow(holes_cm3, coeffs.D_h)
 
 
 def modal_loss_db_cm(
@@ -1203,9 +1199,9 @@ def modal_loss_db_cm(
     those of the *unperturbed* (background) mode, frozen: the carrier-induced
     permittivity shift is ~1e-3 and does not reshape the mode.
     """
-    alpha_mode_cm = (
-        background_index / neff_background
-    ) * jnp.sum(mode_overlap * alpha_cells_cm)
+    alpha_mode_cm = (background_index / neff_background) * jnp.sum(
+        mode_overlap * alpha_cells_cm
+    )
     return NEPER_TO_DB * alpha_mode_cm
 
 
@@ -1255,7 +1251,7 @@ def _signed_pow(x: jax.Array, p: float) -> jax.Array:
     Soref-Bennett is calibrated for carrier injection (dn > 0); reverse
     bias depletes carriers (dn < 0), where a fractional ``x**p`` is
     undefined. The antisymmetric extension keeps depletion physically
-    correct: removing carriers raises the refractive index (ticket 17).
+    correct: removing carriers raises the refractive index.
     """
     return jnp.sign(x) * jnp.abs(x) ** p
 
@@ -1308,7 +1304,7 @@ def _sb_jax(
 
 
 class PipelineTerms(NamedTuple):
-    """The two physical terms one pipeline evaluation yields (ticket 25).
+    """The two physical terms one pipeline evaluation yields.
 
     ``delta_neff`` is the signed effective-index shift the optimizer has always
     maximized; ``modal_loss_db_cm`` is the first-order modal free-carrier loss
@@ -1363,7 +1359,7 @@ def _pre_eigensolve(
 
     # CT reports carrier densities in cm^-3 (same unit system as the doping
     # input); Soref-Bennett consumes m^-3 per CarrierDensityField. Convert
-    # at the component boundary (ticket 17).
+    # at the component boundary.
     n0 = n0 * _CM3_TO_M3
     p0 = p0 * _CM3_TO_M3
     n1 = n1 * _CM3_TO_M3
@@ -1426,7 +1422,7 @@ def design_epsilon_from_theta(
     -> mesh transfer, and returns the ``(epsilon_bg, epsilon_pert)`` design-cell
     permittivity fields the two gyptis solves consume. Split out of
     :func:`pipeline` so the same permittivity the objective was evaluated on can
-    be handed to the mode-field query for the headline figure (ticket 07),
+    be handed to the mode-field query for the headline figure,
     rather than reconstructing the chain a second way.
 
     Arguments match :func:`pipeline`.
@@ -1436,8 +1432,14 @@ def design_epsilon_from_theta(
     if components is None:
         components = _DEFAULT_COMPONENTS
     epsilon_bg, epsilon_pert, _n0, _p0 = _pre_eigensolve(
-        theta, H, H_sum, mesh_ref, background_epsilon, design_transfer,
-        design_nodes, components,
+        theta,
+        H,
+        H_sum,
+        mesh_ref,
+        background_epsilon,
+        design_transfer,
+        design_nodes,
+        components,
     )
     return epsilon_bg, epsilon_pert
 
@@ -1456,8 +1458,8 @@ def pipeline_with_terms(
 ) -> tuple[jax.Array, PipelineTerms]:
     """:func:`pipeline` returning ``(objective, terms)`` for ``has_aux`` callers.
 
-    The objective is ``delta_neff - loss_weight * modal_loss_db_cm`` (ticket
-    25); with ``loss_weight == 0`` it is exactly ``delta_neff`` and the loss is
+    The objective is ``delta_neff - loss_weight * modal_loss_db_cm``;
+    with ``loss_weight == 0`` it is exactly ``delta_neff`` and the loss is
     only reported (``nan`` when no ``mode_overlap`` is bound). See
     :func:`pipeline` for the arguments.
     """
@@ -1474,8 +1476,14 @@ def pipeline_with_terms(
         components = _DEFAULT_COMPONENTS
 
     epsilon_bg, epsilon_pert, n0_cm3, p0_cm3 = _pre_eigensolve(
-        theta, H, H_sum, mesh_ref, background_epsilon, design_transfer,
-        design_nodes, components,
+        theta,
+        H,
+        H_sum,
+        mesh_ref,
+        background_epsilon,
+        design_transfer,
+        design_nodes,
+        components,
     )
 
     # Background epsilon does not depend on rho. Cache its eigenmode while
@@ -1508,7 +1516,9 @@ def pipeline_with_terms(
         if design_transfer is None:
             alpha_cells = alpha_nodes
         else:
-            alpha_cells = jnp.asarray(design_transfer, dtype=alpha_nodes.dtype) @ alpha_nodes
+            alpha_cells = (
+                jnp.asarray(design_transfer, dtype=alpha_nodes.dtype) @ alpha_nodes
+            )
         loss = modal_loss_db_cm(alpha_cells, weights, neff_0)
 
     objective = delta_neff if loss_weight == 0.0 else delta_neff - loss_weight * loss
@@ -1541,8 +1551,8 @@ def pipeline(
         background_epsilon: Background Si relative permittivity
             (default: ``n_si^2 = 3.4757^2``).
         design_transfer: Dense ``(n_design_cells, n_nodes)`` mesh-transfer matrix
-            carrying the nodal perturbation onto the gyptis design cells (ticket
-            04). ``None`` maps the perturbation node-for-node (identity).
+            carrying the nodal perturbation onto the gyptis design cells.
+            ``None`` maps the perturbation node-for-node (identity).
         design_nodes: Which shared-mesh nodes ``theta`` addresses. The filtered
             field is scattered back to full node order before the doping map, so
             everything downstream still sees ``(n_nodes,)``. ``None`` means
@@ -1550,7 +1560,7 @@ def pipeline(
         components: Live differentiable components to compose. Defaults to the
             in-process components built from the local tesseract apis.
         loss_weight: Weight ``w`` of the modal free-carrier loss in the
-            objective ``Δneff - w * alpha_mode`` [neff per dB/cm] (ticket 25).
+            objective ``Δneff - w * alpha_mode`` [neff per dB/cm].
             ``0`` (default) optimizes Δneff alone.
         mode_overlap: ``(n_design_cells,)`` mode-overlap weights from
             :func:`read_mode_overlap`. Required when ``loss_weight > 0``;

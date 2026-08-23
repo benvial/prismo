@@ -6,25 +6,29 @@ build-backend = "hatchling.build"
 name = "prismo"
 dynamic = ["version"]
 description = "Differentiable PN-junction photonic phase shifter: ChargeTransport.jl + gyptis composed as Tesseracts"
-authors = [{ name = "prismo" }]
+authors = [{ name = "Benjamin Vial" }]
 license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = [
+    # Host-side pipeline: talks to the two solver containers over HTTP and
+    # composes their adjoints in JAX. The solvers themselves live in the images.
     "tesseract-core==1.11.0",
+    "prismo_shared",
+    "jax>=0.4.30",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "nlopt>=2.7",
+    "matplotlib>=3.8",
+    "pillow>=10",
     "typer>=0.9.0",
     "gmsh>=4.15.2",
-    # Add more dependencies here
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
-    "jax>=0.4.0",
-    "scipy>=1.8.0",
-    # Interactive development tools
-    "jupyter",
-    "matplotlib",
-    "numpy",
+    "pre-commit",
+    "ruff",
 ]
 docs = [
     "sphinx",
@@ -35,7 +39,11 @@ docs = [
     "sphinx-iconify",
     "sphinx-autodoc-typehints",
     "sphinx-sitemap",
+    "sphinxcontrib-mermaid",
 ]
+
+[tool.uv.sources]
+prismo_shared = { path = "../components/shared_code", editable = true }
 
 [project.scripts]
 "prismo" = "prismo.main:entrypoint"
@@ -56,3 +64,6 @@ version-file = "prismo/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["prismo"]
+
+[tool.pytest.ini_options]
+markers = ["slow: takes more than a few seconds (deselect with -m 'not slow')"]

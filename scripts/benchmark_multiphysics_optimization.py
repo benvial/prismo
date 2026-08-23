@@ -49,7 +49,7 @@ def _parse_args() -> argparse.Namespace:
         default=Path("outputs/waveguide.msh"),
         help="Shared waveguide mesh; generated when absent.",
     )
-    # Micrometres, like the mesh coordinates it is compared against (ticket 15).
+    # Micrometres, like the mesh coordinates it is compared against.
     parser.add_argument("--r-min", type=float, default=0.05)
     parser.add_argument(
         "--mode",
@@ -133,10 +133,10 @@ def _run_gyptis_benchmark(iterations: int) -> list[dict[str, object]]:
     """Cold/warm apply()/vector_jacobian_product() on the design-epsilon field.
 
     The design field is sized from the component's own design region: the
-    unified mesh (ticket 05) fixed how many DG0 design cells the rib interior
+    unified mesh fixed how many DG0 design cells the rib interior
     has, and ``apply`` rejects any other length. A hardcoded four-domain
     ``epsilon`` vector -- the input the layered model took before the unified
-    mesh -- is what made this benchmark dead code (ticket 15).
+    mesh -- is what made this benchmark dead code.
     """
     import numpy as np
 
@@ -204,7 +204,7 @@ def _prepare_full_pipeline(args: argparse.Namespace, components: Any) -> Any:
     what let this script drift out of contract with the code it benchmarks: it
     authored the *local* rib mesh in container mode and then passed that mesh's
     path where ``build_design_transfer`` expects design-cell vertices, so the
-    container benchmark raised before timing anything (ticket 15).
+    container benchmark raised before timing anything.
     """
     from prismo.main import build_pipeline_inputs
 
@@ -260,7 +260,7 @@ def main() -> None:
         def objective(theta: Any) -> Any:
             # ``mesh_ref`` included: without it ChargeTransport falls back to
             # its 1D device, and the timings would describe a solve the real
-            # callback never runs (ticket 15).
+            # callback never runs.
             return pipeline(
                 theta,
                 H=inputs.H_dense,

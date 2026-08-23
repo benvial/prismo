@@ -132,7 +132,7 @@ class TestMeshGenerationGmsh:
 
         ExtendableGrids only reads dim-(d-1) elements as boundary faces;
         contact physical groups must therefore be curves (dim 1), not
-        surfaces (ticket 17).
+        surfaces.
         """
         mesh_file = build_rib_waveguide_mesh_via_gmsh(
             output_path, RibWaveguideGeometry()
@@ -162,9 +162,7 @@ class TestMeshGenerationGmsh:
         assert sum(len(tags) for tags in elem_tags) > 0
 
     def test_build_mesh_node_count(self, gmsh, output_path):
-        build_rib_waveguide_mesh_via_gmsh(
-            output_path, RibWaveguideGeometry()
-        )
+        build_rib_waveguide_mesh_via_gmsh(output_path, RibWaveguideGeometry())
 
         gmsh.open(str(output_path))
         node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
@@ -266,7 +264,7 @@ class TestMeshRefCompat:
         ChargeTransport's finite-volume operator a null space and its adjoint
         solve raises SingularException -- the `make run-containers` crash. The
         generator merges duplicate CAD entities, so every node coordinate is
-        unique. Ref: .scratch/chargetransport-mesh-node-ordering.
+        unique.
         """
         build_rib_waveguide_mesh(output_path)
         coords = read_mesh_node_coordinates(output_path)
@@ -349,7 +347,7 @@ class TestSiliconTriangulation:
 
 
 class TestSharedMeshContract:
-    """The local mesh author must match the shared-mesh contract (ticket 15).
+    """The local mesh author must match the shared-mesh contract.
 
     ChargeTransport reads whichever mesh the run path authored: gyptis'
     unified mesh on the container path, this module's rib mesh on the local

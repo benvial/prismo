@@ -3,11 +3,10 @@
 Public interface under test: apply() + vector_jacobian_product() in
 tesseract_api.py. The forward accepts a design-region permittivity *field*
 (one value per DG0 design cell) with constant surroundings, and the adjoint
-returns a per-design-cell cotangent (tickets 02/03).
+returns a per-design-cell cotangent.
 
 Covers schema validation, contract shapes, the hard error raised when
-gyptis/FEniCS is absent (ticket 04 -- no physics-free effective-medium
-fallback), and gyptis-backed integration tests (guided mode, spatial response,
+gyptis/FEniCS is absent, and gyptis-backed integration tests (guided mode, spatial response,
 single-pass field VJP vs finite differences).
 """
 
@@ -53,9 +52,9 @@ def _gyptis_available() -> bool:
 def n_design() -> int:
     """How many DG0 design cells the rib interior actually has.
 
-    The unified mesh (ticket 05) fixed this, and ``apply`` rejects any other
+    The unified mesh fixed this, and ``apply`` rejects any other
     length. Hardcoding a short field instead made every apply/vjp contract test
-    raise ``ValueError`` rather than exercise the contract (ticket 15), so the
+    raise ``ValueError`` rather than exercise the contract, so the
     size is read from the component's own design region whenever a backend can
     answer. Cached: each query rebuilds and remeshes the whole waveguide, and
     the design region does not change within a run.
@@ -188,7 +187,7 @@ def test_vjp_linear_in_cotangent() -> None:
 
 
 # ---------------------------------------------------------------------------
-# No physics-free fallback (gyptis / FEniCS absent) -- ticket 04
+# No physics-free fallback (gyptis / FEniCS absent)
 # ---------------------------------------------------------------------------
 
 
@@ -263,7 +262,7 @@ def test_vjp_field_matches_finite_difference() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Shared unified mesh (ticket 14)
+# Shared unified mesh
 # ---------------------------------------------------------------------------
 
 
@@ -390,7 +389,7 @@ def test_unified_mesh_has_no_orphan_nodes(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mode field (ticket 07 headline figure)
+# Mode field
 # ---------------------------------------------------------------------------
 
 
@@ -420,7 +419,9 @@ def test_mode_field_returns_a_guided_profile_on_the_rib() -> None:
         _api._LAYER_THICKNESS["substrate"] + _api._LAYER_THICKNESS["slab"]
     )
     assert abs(peak[0]) < _api._RIB_HALF_WIDTH, f"|E| peaks off the rib at {peak}"
-    assert y0 - _api._LAYER_THICKNESS["slab"] < peak[1] < y0 + _api._LAYER_THICKNESS["rib"]
+    assert (
+        y0 - _api._LAYER_THICKNESS["slab"] < peak[1] < y0 + _api._LAYER_THICKNESS["rib"]
+    )
 
     in_rib_column = np.abs(coords[:, 0]) < _api._RIB_HALF_WIDTH
     energy = abs_e**2
@@ -440,7 +441,7 @@ def test_mode_field_does_not_advance_the_tracked_branch() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mode tracking failure modes (ticket 15 defect 6)
+# Mode tracking failure modes
 # ---------------------------------------------------------------------------
 
 
@@ -495,9 +496,8 @@ def test_tracking_ignores_closer_non_guided_eigenvalues() -> None:
 
     Nearest-eigenvalue with no window applied locks tracking onto whatever
     converged closest -- including a spurious or radiating root -- and, since
-    ``apply`` then records that as the branch, every later solve follows it
-    (ticket 15). The window is checked on the *candidates*, not just on the
-    first solve.
+    ``apply`` then records that as the branch, every later solve follows it. The
+    window is checked on the *candidates*, not just on the first solve.
     """
     # A deliberately narrow window, so a non-guided root can sit nearer the
     # reference than any guided one: neff must land in (2.0, 2.2).
@@ -606,16 +606,18 @@ def test_solve_identity_separates_mode_targets() -> None:
 
 def test_eigenpair_budget_grows_with_the_targeted_order() -> None:
     assert _api._eigenpair_budget(0) == _api._BASE_EIGENPAIRS
-    assert _api._eigenpair_budget(2) > _api._eigenpair_budget(1) > _api._eigenpair_budget(0)
+    assert (
+        _api._eigenpair_budget(2)
+        > _api._eigenpair_budget(1)
+        > _api._eigenpair_budget(0)
+    )
 
 
 @pytest.mark.skipif(not _gyptis_available(), reason="requires the gyptis backend")
 def test_first_order_mode_is_slower_than_the_fundamental() -> None:
     design = np.full(n_design(), _api.DEFAULT_CORE_EPSILON)
     fundamental = float(_api.apply(make_inputs(design)).neff_sq)
-    higher = float(
-        _api.apply(InputSchema(design_epsilon=design, mode_index=1)).neff_sq
-    )
+    higher = float(_api.apply(InputSchema(design_epsilon=design, mode_index=1)).neff_sq)
     assert higher < fundamental
     assert _api.DEFAULT_CLAD_EPSILON < higher
 
@@ -637,7 +639,7 @@ def test_a_guided_solve_advances_the_tracked_branch() -> None:
 
 
 def test_a_non_guided_solve_leaves_the_tracked_branch_alone() -> None:
-    """The permanent-redirection failure mode (ticket 15).
+    """The permanent-redirection failure mode.
 
     ``apply`` used to record whatever ``_select_index`` returned. One shift
     retry that missed the branch and came back with a spurious eigenpair would
@@ -665,7 +667,7 @@ def test_a_first_non_guided_solve_records_nothing() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Shift-invert factorisation (ticket 23)
+# Shift-invert factorisation
 # ---------------------------------------------------------------------------
 
 
@@ -675,7 +677,7 @@ def test_shift_invert_uses_a_pivoting_factorisation_at_the_stated_tolerance() ->
 
     On the indefinite waveguide system that LU is accurate to ~1e-5, which
     made lambda a non-smooth function of the design and put a 2e-3 relative
-    noise floor under Delta_neff (ticket 23). The configured pivoting solver
+    noise floor under Delta_neff. The configured pivoting solver
     and the tolerance are what keep the eigenvalue smooth; pin both on a tiny
     diagonal problem whose eigenvalues are known exactly.
     """
@@ -700,13 +702,14 @@ def test_shift_invert_uses_a_pivoting_factorisation_at_the_stated_tolerance() ->
     assert solver.getTolerances()[0] == pytest.approx(_api._EIGENSOLVER_TOLERANCE)
 
     nearest = min(
-        (solver.getEigenvalue(i) for i in range(nconv)), key=lambda lam: abs(lam - shift)
+        (solver.getEigenvalue(i) for i in range(nconv)),
+        key=lambda lam: abs(lam - shift),
     )
     assert nearest.real == pytest.approx(6.0, abs=1e-10)
 
 
 # ---------------------------------------------------------------------------
-# Geometry knobs (ticket 25): contact offset and domain width from the env
+# Geometry knobs: contact offset and domain width from the env
 # ---------------------------------------------------------------------------
 
 
@@ -716,10 +719,17 @@ def test_geometry_defaults_are_the_spike_recipe() -> None:
 
 
 def test_positive_env_float_reads_and_validates() -> None:
-    assert _api._positive_env_float("PRISMO_GYPTIS_WIDTH", 2.0, {"PRISMO_GYPTIS_WIDTH": "3.0"}) == 3.0
+    assert (
+        _api._positive_env_float(
+            "PRISMO_GYPTIS_WIDTH", 2.0, {"PRISMO_GYPTIS_WIDTH": "3.0"}
+        )
+        == 3.0
+    )
     assert _api._positive_env_float("PRISMO_GYPTIS_WIDTH", 2.0, {}) == 2.0
     with pytest.raises(ValueError, match="PRISMO_GYPTIS_WIDTH"):
-        _api._positive_env_float("PRISMO_GYPTIS_WIDTH", 2.0, {"PRISMO_GYPTIS_WIDTH": "-1"})
+        _api._positive_env_float(
+            "PRISMO_GYPTIS_WIDTH", 2.0, {"PRISMO_GYPTIS_WIDTH": "-1"}
+        )
 
 
 def test_contacts_must_sit_inside_the_domain() -> None:

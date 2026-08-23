@@ -7,10 +7,7 @@
 # Persistent worker pattern: Python owns one Julia process for the Tesseract
 # lifecycle and exchanges NPY/NPZ file references over JSON lines.
 # A missing Julia backend is a hard error -- there is no physics-free identity
-# fallback that would fabricate carrier densities (rethink ticket 04).
-#
-# Ref: tickets 02 (container + I/O), 03 (forward API), 04 (adjoint),
-#      06 (container build).
+# fallback that would fabricate carrier densities.
 
 import atexit
 import hashlib
@@ -33,7 +30,7 @@ from tesseract_core.runtime import Array, Differentiable, Float64
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
 
-# Backstop wall-clock limit for one Julia worker request (ticket 18). The solve
+# Backstop wall-clock limit for one Julia worker request. The solve
 # itself is bounded *inside* Julia: ``ct_common.jl`` checks a wall-clock budget
 # (``PRISMO_CT_SOLVE_BUDGET_S``, default 120 s) in every continuation loop and
 # returns ``ok: false`` with a descriptive error when it runs out, so a hard
@@ -46,7 +43,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
 _JULIA_TIMEOUT_S = float(os.environ.get("PRISMO_CT_JULIA_TIMEOUT_S", "600"))
 
 # Precompile-warmed PackageCompiler sysimage baked into the Julia base image
-# (ticket 17). Without it the first solve pays ~22s of JIT compilation.
+# . Without it the first solve pays ~22s of JIT compilation.
 # Absent locally (plain ``julia script.jl`` still works, just slower).
 _JULIA_SYSIMAGE = Path(
     os.environ.get("PRISMO_CT_JULIA_SYSIMAGE", "/opt/julia_sysimage/prismo_ct.so")
@@ -65,7 +62,7 @@ class InputSchema(BaseModel):
             the persistent worker's warm solutions (equilibrium and biased
             Newton starting points) so the next solve is cold, i.e. a function
             of the doping alone rather than of the solve history -- the cold
-            re-evaluation of ticket 20. ``reset`` needs no ``doping``.
+            re-evaluation after an optimization. ``reset`` needs no ``doping``.
         doping: Net doping concentration at every mesh node [cm⁻³].
             Positive = n-type, negative = p-type. Required for ``"solve"``.
         mesh_ref: Reference to the shared Gmsh 2D mesh file.

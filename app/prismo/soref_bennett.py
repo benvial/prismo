@@ -49,13 +49,8 @@ def soref_bennett(
     if coeffs is None:
         coeffs = SorefBennettCoefficients()
 
-    if (
-        carriers.equilibrium_electrons is None
-        or carriers.equilibrium_holes is None
-    ):
-        raise ValueError(
-            "Equilibrium carrier densities required for Soref-Bennett"
-        )
+    if carriers.equilibrium_electrons is None or carriers.equilibrium_holes is None:
+        raise ValueError("Equilibrium carrier densities required for Soref-Bennett")
 
     n_e = np.asarray(carriers.electrons, dtype=float)
     n_h = np.asarray(carriers.holes, dtype=float)
@@ -69,7 +64,7 @@ def soref_bennett(
     # Antisymmetric extension of the (injection-calibrated) model:
     # sign(dN) * |dN|^B. Reverse bias depletes carriers (dN < 0), where a
     # bare fractional power is undefined; with the odd extension, depletion
-    # raises the refractive index and lowers absorption (ticket 17).
+    # raises the refractive index and lowers absorption.
     def _signed_pow(x: np.ndarray, p: float) -> np.ndarray:
         return np.sign(x) * np.abs(x) ** p
 
@@ -77,9 +72,8 @@ def soref_bennett(
         coeffs.A_e * _signed_pow(dn_e, coeffs.B_e)
         + coeffs.A_h * _signed_pow(dn_h, coeffs.B_h)
     )
-    dalpha = (
-        coeffs.C_e * _signed_pow(dn_e, coeffs.D_e)
-        + coeffs.C_h * _signed_pow(dn_h, coeffs.D_h)
+    dalpha = coeffs.C_e * _signed_pow(dn_e, coeffs.D_e) + coeffs.C_h * _signed_pow(
+        dn_h, coeffs.D_h
     )
     depsilon = 2.0 * coeffs.background_index * dn
 

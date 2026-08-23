@@ -1,7 +1,8 @@
 """Sphinx configuration for prismo documentation."""
 
 import sys
-from importlib.metadata import PackageNotFoundError, version as get_version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as get_version
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ extensions = [
     "sphinx_iconify",
     "sphinx_autodoc_typehints",
     "sphinx_sitemap",
+    "sphinxcontrib.mermaid",
 ]
 
 html_theme = "shibuya"
@@ -63,6 +65,31 @@ html_context = {
 
 templates_path = ["_templates"]
 
+myst_enable_extensions = ["dollarmath", "amsmath", "colon_fence"]
+myst_fence_as_directive = ["mermaid"]
+
+# Mermaid: bigger type, natural height, diagrams scale to the content column.
+mermaid_height = "auto"
+mermaid_init_config = {
+    "startOnLoad": False,
+    "themeVariables": {"fontSize": "18px"},
+    "flowchart": {
+        "useMaxWidth": False,
+        "htmlLabels": True,
+        "nodeSpacing": 40,
+        "rankSpacing": 45,
+        "padding": 12,
+        "wrappingWidth": 360,
+    },
+    "sequence": {
+        "useMaxWidth": False,
+        "messageFontSize": 16,
+        "actorFontSize": 16,
+        "noteFontSize": 16,
+    },
+}
+myst_heading_anchors = 3
+
 # sphinx-autodoc-typehints
 autodoc_typehints = "description"
 typehints_document_rtype = False
@@ -92,6 +119,7 @@ exclude_patterns = [
     ".DS_Store",
     "research",
     "agents",
+    "adr",
 ]
 
 intersphinx_mapping = {
@@ -100,4 +128,4 @@ intersphinx_mapping = {
 
 
 def setup(app: Any) -> None:
-    pass
+    """Sphinx extension hook (no custom setup needed)."""

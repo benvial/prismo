@@ -4,16 +4,16 @@
 # Tesseract API module for prismo_gyptis
 # Electromagnetic eigenmode component (gyptis / FEniCS).
 #
-# Field-epsilon implementation (tickets 02/03): the design region carries a
+# Field-epsilon implementation: the design region carries a
 # spatially-varying permittivity -- one value per DG0 design cell -- injected as
 # a scalar dolfin.Function over the silicon rib interior. The forward eigensolve
 # and the field-valued Hellmann-Feynman adjoint share a single two-sided SLEPc
-# solve (spike 01 decision 3); the adjoint assembles a per-design-cell cotangent
-# in one pass (decision 4). A missing gyptis/FEniCS backend is a hard error --
+# solve; the adjoint assembles a per-design-cell cotangent
+# in one pass. A missing gyptis/FEniCS backend is a hard error --
 # there is no physics-free effective-medium fallback that would fabricate an
-# effective index (rethink ticket 04).
+# effective index.
 #
-# Unified mesh (rethink ticket 05): the geometry is the single source of truth
+# Unified mesh: the geometry is the single source of truth
 # for BOTH solvers. ``RibBoxPML2D`` extends gyptis ``LayeredBoxPML2D`` to emit a
 # real SOI rib cross-section -- rib + slab + oxide clad/substrate + a matched PML
 # frame + ``contact_anode``/``contact_cathode`` lines on the slab shoulders, with
@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field
 from tesseract_core.runtime import Array, Differentiable, Float64
 
 #
-# Geometry / physics constants (spike 01)
+# Geometry / physics constants
 #
 
 WAVELENGTH: float = 1.55  # free-space wavelength, micrometres
@@ -44,7 +44,7 @@ WAVELENGTH: float = 1.55  # free-space wavelength, micrometres
 # Silicon rib in oxide; surroundings stay constant (spec: only the rib interior
 # is modulated). The oxide permittivity is n_ox**2 with n_ox = 1.444 (matching
 # the ChargeTransport/shared-mesh oxide index), reconciling the stray clad =
-# substrate = 2.10 the slab-only model carried (audit P3 / ticket 05).
+# substrate = 2.10 an earlier slab-only model carried.
 N_SILICON: float = 3.4757
 N_OXIDE: float = 1.444
 DEFAULT_CORE_EPSILON: float = N_SILICON**2  # ~12.08
@@ -52,7 +52,7 @@ DEFAULT_OXIDE_EPSILON: float = N_OXIDE**2  # ~2.085
 DEFAULT_CLAD_EPSILON: float = DEFAULT_OXIDE_EPSILON
 DEFAULT_SUBSTRATE_EPSILON: float = DEFAULT_OXIDE_EPSILON
 
-# SOI rib cross-section, micrometres (spike 01 recipe). A full-width silicon slab
+# SOI rib cross-section, micrometres. A full-width silicon slab
 # layer keeps ``pml_x_slab`` matched to silicon; the rib is the only embedded
 # surgery and, inset from the x-PML, never touches one. Layer stack bottom->top:
 # substrate (oxide) / slab (silicon) / rib band (oxide + embedded silicon rib) /
@@ -91,9 +91,9 @@ def _validate_geometry(width: float, contact_offset: float) -> None:
         )
 
 
-# Slab/contact geometry knobs (ticket 25): the physical box width and the gap
+# Slab/contact geometry knobs: the physical box width and the gap
 # from the rib edge to the near contact edge, in µm. Foundry designs keep the
-# contacts 0.5-1 µm from the rib; the spike recipe's 0.2 µm puts them in the
+# contacts 0.5-1 µm from the rib; the default 0.2 µm puts them in the
 # mode tail. Read once at import like the mesh size, so every operation of a
 # served container builds the same geometry.
 _WIDTH: float = _positive_env_float("PRISMO_GYPTIS_WIDTH", _DEFAULT_WIDTH)
@@ -138,8 +138,7 @@ class InputSchema(BaseModel):
             transfer operator. ``"write_mesh"`` emits the shared unified ``.msh``
             (as text) for the ChargeTransport container and the transfer operator.
             ``"mode_field"`` solves and returns the tracked mode's ``|E|``
-            profile sampled at the mesh vertices, for the headline mode figure
-            (ticket 07).
+            profile sampled at the mesh vertices, for the headline mode figure.
         design_epsilon: Relative permittivity per design cell -- the modulated
             silicon on the rib interior, one value per DG0 cell (order given by
             :func:`design_cell_centroids`). This is the only differentiated input.
@@ -159,9 +158,9 @@ class InputSchema(BaseModel):
             raises rather than silently returning a lower-order one.
     """
 
-    operation: Literal[
-        "solve", "design_cell_centroids", "write_mesh", "mode_field"
-    ] = "solve"
+    operation: Literal["solve", "design_cell_centroids", "write_mesh", "mode_field"] = (
+        "solve"
+    )
     design_epsilon: Differentiable[Array[(None,), Float64]] | None = None
     core_epsilon: float = DEFAULT_CORE_EPSILON
     clad_epsilon: float = DEFAULT_CLAD_EPSILON
@@ -184,7 +183,7 @@ class OutputSchema(BaseModel):
         design_cell_vertices: ``(n_design, 3, 2)`` vertex coordinates of each
             design cell, in ``design_epsilon`` order, returned by ``write_mesh``.
             The host matches these to shared-mesh node indices to assemble the
-            exact node->DG0-cell restriction operator (ticket 05).
+            exact node->DG0-cell restriction operator.
         mode_abs_e: ``(n_vertices,)`` magnitude ``|E|`` of the tracked mode at
             every mesh vertex, normalized to a peak of 1, returned by the
             ``mode_field`` operation. The eigenvector carries an arbitrary
@@ -215,7 +214,7 @@ class OutputSchema(BaseModel):
 # ``pure_callback``s, so under ``jit`` XLA -- not the pipeline -- decides which
 # runs last. Keeping only the most-recent forward therefore let a background
 # apply scheduled after the perturbed one evict the very session the perturbed
-# adjoint was about to retrieve (ticket 15). Both are opened under one scope,
+# adjoint was about to retrieve. Both are opened under one scope,
 # the constant surroundings they share, so the perturbed session survives
 # either order. That scope does not turn over between evaluations, so the
 # retention cap -- not the scope -- is what keeps the eigenstates from
@@ -229,7 +228,7 @@ _session_registry = SolveSessionRegistry(max_sessions=_MAX_RETAINED_SOLVES)
 # nearest eigenvalue keeps every call on the same physical mode. "Largest neff
 # in the guided window" cannot: near-degenerate modes swap rank under
 # perturbations far smaller than their spacing, so neff_sq jumps between
-# neighbouring inputs and no finite-difference reference survives (ticket 13).
+# neighbouring inputs and no finite-difference reference survives.
 # The key carries the targeted mode index as well as the constant
 # surroundings: a higher-order target on the same geometry is its own branch.
 GeometryKey = tuple[float, float, float, int]
@@ -279,8 +278,8 @@ def _band_columns() -> tuple[tuple[float, float], ...]:
     curves along their shared interface are exactly coincident and
     ``remove_all_duplicates`` (run at the end of ``LayeredBoxPML2D.__init__``)
     merges each pair into one curve owned by both bands. Cutting the two bands
-    independently -- or fragmenting one of them afterwards, as this geometry did
-    until ticket 14 -- leaves each side with its own curve and its own 1D mesh.
+    independently -- or fragmenting one of them afterwards, as an earlier version of
+    this geometry did -- leaves each side with its own curve and its own 1D mesh.
     The silicon domain ChargeTransport then solves on falls into two
     disconnected pieces: a slab carrying both contacts, and a rib island that
     never sees the applied bias and whose quasi-Fermi levels are fixed only up
@@ -412,7 +411,7 @@ def _rib_box_pml_2d() -> Any:
 # on the three constant permittivities, so rebuilding it on every operation
 # both remeshed the identical geometry and leaked its ``tempfile.mkdtemp`` mesh
 # directory once per objective evaluation -- several hundred directories over a
-# long optimization (ticket 16). Reuse is safe: ``_assemble_AB`` rebuilds the
+# long optimization. Reuse is safe: ``_assemble_AB`` rebuilds the
 # formulation's property dict from the scalar background before overwriting the
 # rib field, so successive solves on one simulation are idempotent, and the
 # adjoint/mode readers touch only epsilon-independent state (function space,
@@ -428,9 +427,9 @@ def _build_waveguide(
 ) -> tuple[Any, float]:
     """Build (or reuse) the unified SOI rib waveguide.
 
-    The geometry is the single source of truth shared with ChargeTransport
-    (ticket 05). ``build()`` meshes and writes the ``.msh`` into a per-build temp
-    directory (uid-9999-writable), recorded on ``geom.msh_file`` for the
+    The geometry is the single source of truth shared with ChargeTransport.
+    ``build()`` meshes and writes the ``.msh`` into a per-build temp directory
+    (uid-9999-writable), recorded on ``geom.msh_file`` for the
     ``write_mesh`` operation to read back. Built once per constant-surroundings
     key and cached (see ``_waveguide_cache``).
 
@@ -487,8 +486,7 @@ def _design_mask(simu: Any) -> tuple[Any, np.ndarray, np.ndarray]:
 
     Design cells are the silicon rib interior: DG0 cells whose centroid lies in
     the rib rectangle. The rib is inset from the x-PML by construction and sits
-    in the rib band away from the y-PMLs, so no design cell touches a PML
-    (ticket 05).
+    in the rib band away from the y-PMLs, so no design cell touches a PML.
     """
     dolfin = _ensure_dolfin()
     mesh = simu.formulation.function_space.mesh()
@@ -529,7 +527,7 @@ def design_cell_centroids(
 
     The mask depends only on the fixed geometry, not on the permittivity values,
     so the pipeline can call this once to size and build its mesh-transfer
-    operator (ticket 04). Requires gyptis/FEniCS.
+    operator. Requires gyptis/FEniCS.
     """
     simu, _k0 = _build_waveguide(core_epsilon, clad_epsilon, substrate_epsilon)
     _dg0, coords, mask = _design_mask(simu)
@@ -541,7 +539,7 @@ def _design_cell_vertices(simu: Any, dg0: Any, mask: np.ndarray) -> np.ndarray:
 
     In ``design_epsilon`` (DG0-dof) order. On the shared mesh the host matches
     these coordinates to gmsh node indices to assemble the exact node->DG0-cell
-    restriction operator (ticket 05); a design cell is a triangle whose three
+    restriction operator; a design cell is a triangle whose three
     vertices are shared-mesh nodes.
     """
     dolfin = _ensure_dolfin()
@@ -583,7 +581,7 @@ def write_mesh(
 
 
 #
-# Two-sided eigensolve (shared by forward + adjoint; spike 01 decision 3)
+# Two-sided eigensolve (shared by forward + adjoint)
 #
 
 
@@ -599,8 +597,7 @@ def _pin_orphan_dofs(A: Any, B: Any) -> None:
 
     The shared mesh no longer produces any: it used to embed the Ohmic contact
     lines into the silicon surfaces, which left orphan mesh nodes behind, and the
-    contacts are now ordinary edges of the silicon columns (ticket 14, asserted
-    by ``test_unified_mesh_has_no_orphan_nodes``). This stays as a cheap guard so
+    contacts are now ordinary edges of the silicon columns. This stays as a cheap guard so
     a future geometry change degrades into a harmless spurious eigenvalue rather
     than a factorization failure.
     """
@@ -629,7 +626,7 @@ def _assemble_AB(simu: Any, eps_core_field: Any) -> tuple[Any, Any]:
 
     form = simu.formulation
     # Rebuild the property dict from the scalar background first so the PMLs stay
-    # matched to the scalar background (spike 01 decision 2), then overwrite the
+    # matched to the scalar background, then overwrite the
     # silicon rib interior -- the design region -- with the DG0 field.
     form._epsilon = form.epsilon.as_property(dim=3)
     form._epsilon["rib_silicon"] = eps_core_field
@@ -660,12 +657,12 @@ def _assemble_AB(simu: Any, eps_core_field: Any) -> tuple[Any, Any]:
 # it: the spectrum does not depend on sigma, only the spectral transform used to
 # reach it, so a retry returns the same eigenpairs rather than a different
 # answer. Retrying is what makes a degenerate design input a slower solve
-# instead of a 500 (ticket 13).
+# instead of a 500.
 _SHIFT_RETRY_OFFSETS = (0.0, 1e-6, -1e-6, 1e-4, -1e-4, 1e-2)
 
 
 # Direct solver behind the shift-invert transform, and the Krylov-Schur
-# tolerance (ticket 23). PETSc's native sparse LU has no threshold pivoting,
+# tolerance. PETSc's native sparse LU has no threshold pivoting,
 # and on this indefinite saddle-point system (A carries zero diagonals) its
 # back-substitution is accurate to only ~1e-5 relative: every Ritz pair
 # "converges" in the transformed operator while its true residual stays at
@@ -673,7 +670,7 @@ _SHIFT_RETRY_OFFSETS = (0.0, 1e-6, -1e-6, 1e-4, -1e-4, 1e-2)
 # roundoff pattern changes with the input -- neighbouring designs whose
 # epsilon differ by 5e-11 return lambda values that jump by 5e-7 relative. That
 # was the ~2e-3 relative noise floor on Delta_neff that stalled the optimizer
-# around the ticket-22 optimum. UMFPACK, MUMPS and SuperLU all pivot, all
+# around an earlier optimum. UMFPACK, MUMPS and SuperLU all pivot, all
 # agree with an independent ARPACK solve to 1e-13, and leave lambda smooth to
 # 1e-13 along the same line; UMFPACK was the fastest of the three here. The
 # tolerance is then meaningful again: 1e-10 puts the true residual at 1e-13
@@ -869,7 +866,7 @@ def _solve_state(
     The state carries ``guided``: whether the selected eigenpair landed in the
     physical guided window. ``apply`` gates the tracked-branch update on it, so
     a shift retry that misses the branch costs one solve rather than
-    redirecting every later solve of this geometry (ticket 15).
+    redirecting every later solve of this geometry.
     """
     A, B = _assemble_AB(simu, eps_core_field)
     target = core_epsilon * k0 * k0
@@ -887,9 +884,16 @@ def _solve_state(
     kz = np.sqrt(lam)
     neff = float(np.real(kz / k0))
     return {
-        "A": A, "B": B, "lam": lam, "kz": kz, "neff": neff,
+        "A": A,
+        "B": B,
+        "lam": lam,
+        "kz": kz,
+        "neff": neff,
         "guided": _is_guided(neff, core_epsilon, clad_epsilon),
-        "rx": rx, "cx": cx, "ry": ry, "cy": cy,
+        "rx": rx,
+        "cx": cx,
+        "ry": ry,
+        "cy": cy,
     }
 
 
@@ -903,7 +907,7 @@ def _advance_tracked_lam(
     Only a guided solve may advance the branch. Recording a non-guided one
     would make every later solve of this geometry track *it*, with nothing to
     recover from: the reference is what selection is measured against, so once
-    it moves off the guided window it never comes back (ticket 15).
+    it moves off the guided window it never comes back.
     """
     if state["guided"]:
         tracked[geometry] = state["lam"]
@@ -919,7 +923,7 @@ def _lr_product(matrix: Any, state: dict[str, Any]) -> complex:
 
 
 #
-# Single-pass field sensitivity (spike 01 decision 4; the ticket-03 kernel)
+# Single-pass field sensitivity
 #
 
 
@@ -961,9 +965,7 @@ def _field_numerator(form: Any, dg0: Any, state: dict[str, Any]) -> np.ndarray:
         return assemble_ri(k0_sq * (P[2] * Q[2]) * w * form.dx)
 
     def lrp_form(dens: Any) -> np.ndarray:
-        return (
-            dens(Xr, Yr) + dens(Xc, Yc) + 1j * (dens(Xc, Yr) - dens(Xr, Yc))
-        )
+        return dens(Xr, Yr) + dens(Xc, Yc) + 1j * (dens(Xc, Yr) - dens(Xr, Yc))
 
     return lrp_form(dens_A) - state["lam"] * lrp_form(dens_B)
 
@@ -1025,7 +1027,7 @@ def _forward_solve(
     # Track the branch this geometry was last solved on, so neighbouring design
     # inputs -- an optimizer step, or the two sides of a finite difference --
     # return the same mode rather than whichever near-degenerate mode currently
-    # ranks highest in the guided window (ticket 13).
+    # ranks highest in the guided window.
     geometry: GeometryKey = (
         float(inputs.core_epsilon),
         float(inputs.clad_epsilon),

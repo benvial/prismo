@@ -1,7 +1,4 @@
-"""Tests for the end-to-end differentiable pipeline.
-
-Ref: ticket 14 -- end-to-end pipeline via JAX composition.
-"""
+"""Tests for the end-to-end differentiable pipeline (JAX composition)."""
 
 import numpy as np
 import pytest
@@ -41,7 +38,7 @@ RNG = np.random.default_rng(0)
 
 
 def _components_with(**overrides) -> PipelineComponents:
-    """Physics-free component doubles with specific components replaced (ticket 04)."""
+    """Physics-free component doubles with specific components replaced."""
     return stub_components(**overrides)
 
 
@@ -49,7 +46,7 @@ _DOPING_CEILING = DOPING_REFERENCE_CM3 * (10.0**DOPING_LOG10_SPAN - 1.0)
 
 
 class TestVpiLpi:
-    """VπLπ [V·cm] modulation-efficiency headline from signed Δneff (ticket 03)."""
+    """VπLπ [V·cm] modulation-efficiency headline from signed Δneff."""
 
     _WAVELENGTH_CM = 1.55e-4  # 1.55 µm; must match the gyptis solver point.
 
@@ -73,7 +70,7 @@ class TestVpiLpi:
 
 
 class TestDopingFromTheta:
-    """Signed, zero-referenced net-doping map ``N(theta)`` (ticket 02)."""
+    """Signed, zero-referenced net-doping map ``N(theta)``."""
 
     def test_zero_referenced(self):
         """theta=0 is the junction: net-intrinsic (zero net doping)."""
@@ -101,7 +98,7 @@ class TestDopingFromTheta:
 
         At |N| ~ 3e15 the -5 V depletion width (~1.6 um) far exceeds the 500 nm
         rib, so the rib depletes fully and the reverse-bias carrier field carries
-        no bulk-doping signal for a gradient to validate against (ticket 06).
+        no bulk-doping signal for a gradient to validate against.
         The seed must land in the 1e17-1e18 band a real carrier-depletion
         modulator works in.
         """
@@ -229,7 +226,7 @@ class TestSorefBennettJax:
         Hand-computed for depletion of Delta_N = 1e18 cm^-3 (input densities
         in m^-3): the Soref-Bennett model extended antisymmetrically gives
         dn_index = +(A_e * dN^B_e + A_h * dN^B_h) with dN = 1e18.
-        Ref: ticket 17 — clamping dn at zero made Delta_eps identically zero
+        Regression: clamping dn at zero made Delta_eps identically zero
         under reverse bias.
         """
         from prismo.pipeline import _DEFAULT_COEFFS
@@ -276,7 +273,7 @@ class TestSorefBennettJax:
 
 
 class TestPipelineStub:
-    """Pipeline composed from explicit JAX-native doubles (ticket 04).
+    """Pipeline composed from explicit JAX-native doubles.
 
     The implicit no-backend stubs were deleted; these tests inject physics-free
     doubles through ``components=`` instead of relying on a fabricated default.
@@ -315,7 +312,7 @@ class TestPipelineStub:
         -5 V returns full depletion. The expected Delta n_eff is
         hand-computed from the Soref-Bennett model with dN = 1e18 cm^-3 —
         if the cm^-3 -> m^-3 conversion were missing, the result would be
-        1e6x too small (ticket 17).
+        1e6x too small.
         """
         import prismo.pipeline as pl
 
@@ -370,7 +367,7 @@ class TestPipelineStub:
     def test_objective_is_signed_by_physical_bias_response(self):
         """Signed Δneff: depletion reads positive, injection negative.
 
-        No ``hypot`` magnitude fold anymore (ticket 03). The reverse-bias sign
+        No ``hypot`` magnitude fold anymore. The reverse-bias sign
         is physically determined -- depletion raises the index (+Δneff) and
         carrier injection lowers it (-Δneff) -- so the optimizer maximizes the
         signed value directly rather than rewarding either mode-shift direction.
@@ -455,7 +452,7 @@ class TestPipelineStub:
 
         With the mean-collapse removed, the per-cell design field reaches gyptis
         and its per-cell sensitivity flows back to a spatially-varying rho
-        gradient -- the payoff the feature exists to enable (ticket 05).
+        gradient -- the payoff the feature exists to enable.
         """
 
         def fake_ct(doping, bias_voltage, mesh_ref=None):
@@ -483,7 +480,7 @@ class TestPipelineStub:
         np.testing.assert_allclose(result, 0.0, atol=1e-12)
 
     def test_zero_shift_is_exactly_zero_not_floored(self):
-        """No ``hypot(_, 1e-15)`` fudge: a null shift is exactly 0.0 (ticket 03).
+        """No ``hypot(_, 1e-15)`` fudge: a null shift is exactly 0.0.
 
         Equal carriers at both biases give an identical permittivity field, so
         the signed objective is exactly zero -- not lifted to a ~1e-15 floor.
@@ -526,9 +523,7 @@ class TestPipelineStub:
         result32 = pipeline(jnp.asarray(rho, dtype=jnp.float32), components=components)
         assert result32.dtype == jnp.float32
 
-        result64 = pipeline(
-            jnp.asarray(rho, dtype=jnp.float64), components=components
-        )
+        result64 = pipeline(jnp.asarray(rho, dtype=jnp.float64), components=components)
         assert result64.dtype == jnp.float64
 
 
@@ -568,7 +563,7 @@ class TestContainerPipeline:
         assert gyptis.inputs["operation"] == "mode_field"
         np.testing.assert_allclose(gyptis.inputs["design_epsilon"], [12.0, 12.1])
         # The background must match the solve components': it keys the tracked
-        # mode branch as well as the device being solved (ticket 13).
+        # mode branch as well as the device being solved.
         assert gyptis.inputs["core_epsilon"] == 11.5
         np.testing.assert_allclose(abs_e, [0.5, 1.0, 0.25])
         np.testing.assert_allclose(coords, [[0.0, 0.0], [0.1, 0.0], [0.2, 0.0]])
@@ -606,9 +601,7 @@ class TestContainerPipeline:
                 return {"design_epsilon": [0.0] * len(inputs["design_epsilon"])}
 
         gyptis = FakeGyptis()
-        perturbed, background = build_gyptis_components(
-            container=gyptis, mode_index=1
-        )
+        perturbed, background = build_gyptis_components(container=gyptis, mode_index=1)
         eps = np.array([12.0, 12.1])
         perturbed.forward(eps, 12.08)
         background.forward(eps, 12.08)
@@ -768,7 +761,7 @@ class TestContainerPipeline:
         sees a uniform field. Unlike ``test_pipeline_gradient_is_spatially_
         resolved`` -- which uses the JAX gyptis stub -- this drives the container
         forward/VJP built by ``build_gyptis_components`` and the transfer wiring
-        ticket 08 adds.
+        of the container setup.
         """
         # Shared mesh: a unit square split into two silicon triangles. Each design
         # cell is one of those triangles, its vertices are shared-mesh nodes.
@@ -841,7 +834,7 @@ class TestContainerPipeline:
 
 
 class TestBuildDesignTransfer:
-    """The container setup assembles the real mesh-transfer matrix (ticket 05)."""
+    """The container setup assembles the real mesh-transfer matrix."""
 
     def test_assembles_real_operator_from_design_cell_vertices(self):
         """The production helper drives the real ``build_mesh_transfer_operator``.
@@ -1175,7 +1168,7 @@ def _fake_container_env(monkeypatch) -> dict[str, object]:
     # Keep the component builders from touching the fake containers further.
     monkeypatch.setattr(
         "prismo.pipeline.build_chargetransport_component",
-        lambda container=None, local_api=None: (lambda *a, **k: None),
+        lambda container=None, local_api=None: lambda *a, **k: None,
     )
     monkeypatch.setattr(
         "prismo.pipeline.build_gyptis_components",
@@ -1193,8 +1186,7 @@ class TestChargeTransportMeshDelivery:
     The CT container has no access to host paths, so a host ``mesh_ref.path``
     is useless inside it -- the worker silently falls back to its 1D device and
     the gmsh-order lateral junction becomes a many-junction line the -5 V solve
-    cannot converge on. The fix is a read-only bind mount plus a rewritten path
-    (ticket 02). Ref: .scratch/chargetransport-mesh-node-ordering.
+    cannot converge on. The fix is a read-only bind mount plus a rewritten path.
     """
 
     def test_write_gyptis_mesh_persists_host_owned_mesh(self, tmp_path):
@@ -1254,9 +1246,7 @@ class TestChargeTransportMeshDelivery:
         mesh_dir = tmp_path / "outputs"
         init_tesseract_containers(mesh_dir=mesh_dir)
 
-        assert captured["ct_volumes"] == [
-            f"{mesh_dir.resolve()}:{_CT_MESH_MOUNT}:ro"
-        ]
+        assert captured["ct_volumes"] == [f"{mesh_dir.resolve()}:{_CT_MESH_MOUNT}:ro"]
         # The mount directory is created so the bind mount always resolves.
         assert mesh_dir.exists()
 
@@ -1273,7 +1263,7 @@ class TestChargeTransportMeshDelivery:
     def test_init_passes_the_geometry_knobs_to_the_gyptis_mesh_author(
         self, monkeypatch, tmp_path
     ):
-        """Contact offset and domain width (ticket 25) reach the mesh author."""
+        """Contact offset and domain width reach the mesh author."""
         captured = _fake_container_env(monkeypatch)
 
         init_tesseract_containers(
@@ -1307,7 +1297,7 @@ class TestChargeTransportMeshDelivery:
         assert captured["ct_environment"] == {"PRISMO_CT_JULIA_TIMEOUT_S": "600"}
 
     def test_init_forwards_the_ct_solve_budget_override(self, monkeypatch, tmp_path):
-        """The Julia-side solve budget (ticket 18) follows the host override too."""
+        """The Julia-side solve budget follows the host override too."""
         captured = _fake_container_env(monkeypatch)
         monkeypatch.setenv("PRISMO_CT_SOLVE_BUDGET_S", "300")
 
@@ -1315,10 +1305,8 @@ class TestChargeTransportMeshDelivery:
 
         assert captured["ct_environment"] == {"PRISMO_CT_SOLVE_BUDGET_S": "300"}
 
-    def test_dev_mounts_shadow_both_component_apis(
-        self, monkeypatch, tmp_path, capsys
-    ):
-        """``PRISMO_DEV_MOUNTS=1`` mounts the host api + prismo_shared (ticket 21)."""
+    def test_dev_mounts_shadow_both_component_apis(self, monkeypatch, tmp_path, capsys):
+        """``PRISMO_DEV_MOUNTS=1`` mounts the host api + prismo_shared."""
         import prismo.pipeline as pl
 
         captured = _fake_container_env(monkeypatch)
@@ -1330,8 +1318,9 @@ class TestChargeTransportMeshDelivery:
         gy_api = (pl._COMPONENTS_DIR / "gyptis" / "tesseract_api.py").resolve()
         shared = (pl._SHARED_CODE_DIR / "prismo_shared").resolve()
         assert f"{ct_api}:{pl._DEV_API_MOUNT}:ro" in captured["ct_volumes"]
-        assert f"{shared}:{pl._DEV_PYTHONPATH_ROOT}/prismo_shared:ro" in (
-            captured["ct_volumes"]
+        assert (
+            f"{shared}:{pl._DEV_PYTHONPATH_ROOT}/prismo_shared:ro"
+            in (captured["ct_volumes"])
         )
         assert captured["gyptis_volumes"] == [
             f"{gy_api}:{pl._DEV_API_MOUNT}:ro",
@@ -1401,7 +1390,9 @@ class TestDesignNodes:
         """The fallback keeps one variable per mesh node."""
         nodes = DesignNodes.all_nodes(3)
         assert len(nodes) == 3
-        np.testing.assert_allclose(nodes.scatter(jnp.asarray([1.0, 2.0, 3.0])), [1, 2, 3])
+        np.testing.assert_allclose(
+            nodes.scatter(jnp.asarray([1.0, 2.0, 3.0])), [1, 2, 3]
+        )
 
     def test_pipeline_matches_the_scattered_full_field(self):
         """Restricting the design set changes the variables, not the physics.
@@ -1410,6 +1401,7 @@ class TestDesignNodes:
         equivalent full-length field produces, so the smaller MMA problem
         optimizes the same function.
         """
+
         def fake_ct(doping, bias_voltage, mesh_ref=None):
             carriers = jnp.where(bias_voltage == 0.0, doping, jnp.zeros_like(doping))
             return carriers, carriers

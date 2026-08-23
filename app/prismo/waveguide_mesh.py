@@ -5,7 +5,7 @@ Both the ChargeTransport.jl and gyptis Tesseracts consume the same mesh file at 
 ``MeshRef.path``.  Physical-group naming is defined here so both integrators
 agree on which subdomains are contacts, silicon, and oxide.
 
-Units and vocabulary follow the *shared-mesh contract*, not SI (ticket 15).
+Units and vocabulary follow the *shared-mesh contract*, not SI.
 A container run authors the shared mesh with gyptis, an in-process run authors
 it here, and ChargeTransport reads whichever one was written: ``ct_common.jl``
 scales the grid it loads by ``MICROMETRES_TO_METRES`` and collects its silicon
@@ -300,19 +300,21 @@ def _build_mesh_rectangles(
     # Contacts are dim-1 physical groups on the top edge of the contact
     # patches: ChargeTransport.jl applies voltages to boundary REGIONS
     # (curves in 2D), and ExtendableGrids only reads dim-1 elements as
-    # boundary faces (ticket 17). The metal patches themselves stay part of
+    # boundary faces. The metal patches themselves stay part of
     # the silicon domain for the electrical solve.
     slab_surfs.extend(anode_surfs)
     slab_surfs.extend(cathode_surfs)
 
     # gyptis' vocabulary, not a local one: ChargeTransport collects its silicon
     # domain from ``slab`` + ``rib_silicon`` whichever author wrote the shared
-    # mesh (ticket 15).
+    # mesh.
     _add_physical_group(gmsh, 2, slab_surfs, "slab")
     _add_physical_group(gmsh, 2, rib_silicon_surfs, "rib_silicon")
     _add_physical_group(gmsh, 2, oxide_surfs, "oxide")
     _add_physical_group(gmsh, 1, [_top_curves[s] for s in anode_surfs], "contact_anode")
-    _add_physical_group(gmsh, 1, [_top_curves[s] for s in cathode_surfs], "contact_cathode")
+    _add_physical_group(
+        gmsh, 1, [_top_curves[s] for s in cathode_surfs], "contact_cathode"
+    )
 
     gmsh.model.mesh.generate(2)
 
@@ -367,8 +369,8 @@ def read_mesh_node_coordinates(mesh_path: str | Path) -> np.ndarray:
 
         # The whole pipeline addresses nodal fields by position in this array
         # while ChargeTransport addresses them by ExtendableGrids' 1..N
-        # renumbering of the gmsh node tags (``invperm(node_tags)``,
-        # docs/research/chargetransport-gmsh-mesh.md). The two coincide exactly
+        # renumbering of the gmsh node tags (``invperm(node_tags)``).
+        # The two coincide exactly
         # when the tags are 1..N in order -- which both mesh authors produce --
         # so assert it here with a clear message rather than letting a
         # renumbered mesh silently scramble the doping the Julia solver reads.
