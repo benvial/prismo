@@ -1,18 +1,17 @@
 :layout: landing
 :description: Differentiable PN-junction photonic phase shifter.
 
-.. container:: title-bar
+.. raw:: html
 
-   .. image:: _static/prismo-name.svg
-      :alt: prismo
-      :width: 400px
+    <div class="logo-homepage sy-head-brand">
+        <img class="light-logo" src="_static/prismo-name.svg" alt="prismo" height="28" loading="lazy">
+        <img class="dark-logo" src="_static/prismo-name-dark.svg" alt="prismo" height="28" loading="lazy">
+    </div>
 
 
 .. rst-class:: lead
 
-    Free-form doping inverse design of a silicon PN-junction phase shifter:
-    ChargeTransport.jl (Julia, discrete adjoint) and gyptis/FEniCS
-    (eigen-adjoint) composed as Tesseracts into one ``jax.grad``.
+    Free-form doping inverse design of a silicon PN-junction phase shifter
 
 .. container:: buttons
 

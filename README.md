@@ -2,7 +2,7 @@
 
 **P**hotonic **R**econfigurable **I**ntegrated **S**emiconductor **M**ultiphysics **O**ptimization
 
-*Free-form doping design of a silicon PN-junction phase shifter, with the gradient
+*Free-form doping inverse design of a silicon PN-junction phase shifter, with the gradient
 flowing from the optical mode back through a Julia semiconductor solver — two
 solvers, two languages, two adjoints, one `jax.grad`.*
 

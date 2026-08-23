@@ -77,3 +77,8 @@ html pre.mermaid [id$="-filled-head"] path {
     fill: var(--slate-11) !important;
     stroke: var(--slate-11) !important;
 }
+
+.logo-homepage img {
+  height: 110px;
+}
+
