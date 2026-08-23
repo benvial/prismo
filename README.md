@@ -129,6 +129,10 @@ $ make validate-gradient-containers
 # Line-scan the objective around a checkpoint design (smoothness / noise-floor probe)
 $ make probe-objective-containers RUN_ARGS="--design outputs/checkpoint.json"
 
+# Trade Δneff against modal free-carrier loss (objective Δneff − w·α, w in neff per dB/cm),
+# start from a U-shaped junction, and move the contacts 0.5 µm from the rib
+$ make run-containers RUN_ARGS="--loss-weight 1e-6 --seed u --contact-offset 0.5"
+
 # Clean build artifacts and caches
 $ make clean
 ```
@@ -136,6 +140,11 @@ $ make clean
 There is no stub solver path: `make run` and `make validate-gradient` without
 the containers raise rather than substituting a fake forward or gradient. Tests
 inject explicit doubles through the `components=` seam instead.
+
+Every run reports the modal free-carrier loss of the reported design (dB/cm,
+first-order overlap-weighted Soref–Bennett absorption at 0 V) and the
+literature's `VπLπ × α` figure of merit (V·dB) next to VπLπ; `--loss-weight`
+puts the loss into the objective. See *Modal loss* in [CONTEXT.md](CONTEXT.md).
 
 ## Adding regression test cases
 

@@ -136,6 +136,61 @@ class ColdReevaluation:
         return self.rel_discrepancy <= self.tolerance
 
 
+def history_loss_series(history: list[dict]) -> tuple[list[int], list[float]]:
+    """``(iterations, modal_loss_db_cm)`` for the entries that evaluated a loss.
+
+    The optimizer records ``modal_loss_db_cm`` as ``None`` when no mode-overlap
+    weights were bound (ticket 25); a history with no finite loss yields two
+    empty lists and the convergence figure draws no loss panel.
+    """
+    iters: list[int] = []
+    losses: list[float] = []
+    for entry in history:
+        loss = entry.get("modal_loss_db_cm")
+        if loss is None or not np.isfinite(loss):
+            continue
+        iters.append(int(entry["iteration"]))
+        losses.append(float(loss))
+    return iters, losses
+
+
+def _plot_loss_panel(ax: plt.Axes, history: list[dict]) -> None:
+    """Modal loss [dB/cm] and the VπLπ·alpha figure of merit [V·dB] vs iteration."""
+    from prismo.pipeline import loss_figure_of_merit_v_db
+
+    iters, losses = history_loss_series(history)
+    by_iter = {int(h["iteration"]): h for h in history}
+    ax.plot(
+        iters, losses, "o-", markersize=3, color="#d7191c",
+        label=r"modal loss $\alpha$ (0 V)",
+    )
+    ax.set_ylabel(r"$\alpha$ [dB/cm]", color="#d7191c")
+    ax.tick_params(axis="y", labelcolor="#d7191c")
+    fom = [
+        (i, loss_figure_of_merit_v_db(by_iter[i]["delta_n_eff"], loss))
+        for i, loss in zip(iters, losses, strict=True)
+    ]
+    finite = [(i, v) for i, v in fom if np.isfinite(v)]
+    handles, labels = ax.get_legend_handles_labels()
+    if finite:
+        ax_fom = ax.twinx()
+        ax_fom.plot(
+            [i for i, _ in finite], [v for _, v in finite],
+            "s--", markersize=3, color="#7b3294", alpha=0.8,
+            label=r"$V_\pi L_\pi \cdot \alpha$ (reported)",
+        )
+        magnitudes = [abs(v) for _, v in finite if v != 0.0]
+        if magnitudes and vpi_axis_is_symlog(magnitudes):
+            ax_fom.set_yscale("symlog", linthresh=min(magnitudes))
+        ax_fom.set_ylabel(r"$V_\pi L_\pi \cdot \alpha$ [V$\cdot$dB]", color="#7b3294")
+        ax_fom.tick_params(axis="y", labelcolor="#7b3294")
+        extra_handles, extra_labels = ax_fom.get_legend_handles_labels()
+        handles, labels = handles + extra_handles, labels + extra_labels
+    ax.legend(handles, labels, loc="best")
+    ax.set_xlabel("Iteration")
+    ax.grid(True, alpha=0.3)
+
+
 def plot_convergence(
     history: list[dict],
     output_dir: str | Path | None = None,
@@ -143,6 +198,9 @@ def plot_convergence(
     cold_reevaluation: ColdReevaluation | None = None,
 ) -> Path:
     """Convergence plot: signed delta_n_eff and reported VpiLpi vs iteration.
+
+    When the history carries a modal loss (ticket 25) a second panel draws the
+    loss in dB/cm and the VπLπ·alpha figure of merit in V·dB.
 
     Args:
         history: Per-iteration records from ``optimize_doping``.
@@ -156,7 +214,14 @@ def plot_convergence(
         Path to the saved figure.
     """
     out = _ensure_output_dir(output_dir)
-    fig, ax = plt.subplots(figsize=(6, 4))
+    with_loss = bool(history_loss_series(history)[0])
+    if with_loss:
+        fig, (ax, ax_loss) = plt.subplots(
+            2, 1, figsize=(6, 7), sharex=True, gridspec_kw={"height_ratios": [3, 2]}
+        )
+    else:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax_loss = None
     ax_vpi = None
 
     if not history:
@@ -240,6 +305,8 @@ def plot_convergence(
         handles, labels = handles + extra_handles, labels + extra_labels
     ax.legend(handles, labels, loc="best")
     ax.grid(True, alpha=0.3)
+    if ax_loss is not None:
+        _plot_loss_panel(ax_loss, history)
     fig.tight_layout()
 
     path = out / "convergence.pdf"

@@ -703,3 +703,28 @@ def test_shift_invert_uses_a_pivoting_factorisation_at_the_stated_tolerance() ->
         (solver.getEigenvalue(i) for i in range(nconv)), key=lambda lam: abs(lam - shift)
     )
     assert nearest.real == pytest.approx(6.0, abs=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Geometry knobs (ticket 25): contact offset and domain width from the env
+# ---------------------------------------------------------------------------
+
+
+def test_geometry_defaults_are_the_spike_recipe() -> None:
+    assert _api._DEFAULT_WIDTH == pytest.approx(2.0)
+    assert _api._DEFAULT_CONTACT_OFFSET == pytest.approx(0.20)
+
+
+def test_positive_env_float_reads_and_validates() -> None:
+    assert _api._positive_env_float("PRISMO_GYPTIS_WIDTH", 2.0, {"PRISMO_GYPTIS_WIDTH": "3.0"}) == 3.0
+    assert _api._positive_env_float("PRISMO_GYPTIS_WIDTH", 2.0, {}) == 2.0
+    with pytest.raises(ValueError, match="PRISMO_GYPTIS_WIDTH"):
+        _api._positive_env_float("PRISMO_GYPTIS_WIDTH", 2.0, {"PRISMO_GYPTIS_WIDTH": "-1"})
+
+
+def test_contacts_must_sit_inside_the_domain() -> None:
+    """A contact pushed past the box edge (into the PML) is a configuration error."""
+    _api._validate_geometry(width=2.0, contact_offset=0.2)
+    _api._validate_geometry(width=3.0, contact_offset=0.5)
+    with pytest.raises(ValueError, match="contact"):
+        _api._validate_geometry(width=2.0, contact_offset=0.8)

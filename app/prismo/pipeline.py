@@ -1,10 +1,11 @@
-"""End-to-end differentiable pipeline: signed design field theta -> delta_n_eff.
+"""End-to-end differentiable pipeline: signed design field theta -> objective.
 
 Composes density filter -> doping mapping -> ChargeTransport.jl (0V, -5V)
 -> Soref-Bennett coupling -> gyptis -> delta_n_eff into a single
-JAX-differentiable function.
+JAX-differentiable function, optionally minus a weighted first-order modal
+free-carrier loss (ticket 25, ADR 0004).
 
-Ref: tickets 14 (pipeline composition), 15 (optimization loop).
+Ref: tickets 14 (pipeline composition), 15 (optimization loop), 25 (loss).
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -166,6 +167,72 @@ def seed_signed_junction(coords: np.ndarray) -> jax.Array:
     )
 
 
+# Junction seeds (ticket 25). The MMA optimum is local, so the run can start
+# from more than the lateral junction: a vertical (P over N) and a U-shaped
+# (N wrapped under and beside a P core) topology, the 2D cross-sections of the
+# literature's higher-perimeter junctions. Every seed keeps n-type on the left
+# slab edge (anode) and p-type on the right slab edge (cathode at -5 V), so
+# both carrier populations reach their contact and the seed is reverse-biased.
+SEED_KINDS: tuple[str, ...] = ("lateral", "vertical", "u")
+# Width of the p-type column kept along the rib's right wall (vertical and U
+# seeds) and of the n-type wall along the rib's left wall (U seed), as a
+# fraction of the rib width: the p core must reach the p slab through the wall.
+_SEED_WALL_FRACTION = 0.25
+
+
+def _seed_rib_box(coords: np.ndarray) -> tuple[float, float, float, float, float]:
+    """``(x_left, x_right, y_slab_top, y_top, x_centre)`` of the rib from the design nodes.
+
+    The design nodes span slab + rib; the rib's nodes are those above the
+    vertical midpoint of the whole set (the slab is thinner than the rib), and
+    the slab top is the highest node outside the rib's x-span.
+    """
+    x, y = coords[:, 0], coords[:, 1]
+    y_mid = 0.5 * (float(y.min()) + float(y.max()))
+    in_rib = y > y_mid
+    if not np.any(in_rib):
+        # Flat node set (no rib): treat the whole set as the rib box.
+        in_rib = np.ones_like(in_rib, dtype=bool)
+    x_left, x_right = float(x[in_rib].min()), float(x[in_rib].max())
+    y_top = float(y.max())
+    outside = (x < x_left) | (x > x_right)
+    y_slab_top = float(y[outside].max()) if np.any(outside) else float(y.min())
+    return x_left, x_right, y_slab_top, y_top, float(np.median(x))
+
+
+def seed_design_field(coords: np.ndarray, kind: str = "lateral") -> jax.Array:
+    """Seed one of :data:`SEED_KINDS` on the design nodes at ``|theta| = 0.3``.
+
+    ``lateral``: :func:`seed_signed_junction` -- n-type left of the median x,
+    p-type right of it. ``vertical``: in the rib, n-type below the rib's
+    mid-height and p-type above it; a p column along the rib's right wall
+    joins the p top to the right slab, and the slab itself is lateral so both
+    regions reach their contact. ``u``: n-type wraps under (lower third of the
+    rib) and beside (left wall) a p core that, with the right wall and the
+    right slab, is p-type. All three are reverse-biased with the cathode on
+    the right.
+    """
+    if kind not in SEED_KINDS:
+        raise ValueError(f"unknown seed {kind!r}; expected one of {SEED_KINDS}")
+    if kind == "lateral":
+        return seed_signed_junction(coords)
+
+    x, y = coords[:, 0], coords[:, 1]
+    x_left, x_right, y_slab_top, y_top, _x_centre = _seed_rib_box(coords)
+    rib_width = x_right - x_left
+    rib_height = y_top - y_slab_top
+    wall = _SEED_WALL_FRACTION * rib_width
+    p_column = x > x_right - wall  # p column on the rib's right wall + right slab
+
+    if kind == "vertical":
+        n_type = (y <= y_slab_top + 0.5 * rib_height) & ~p_column
+    else:  # "u"
+        floor = y <= y_slab_top + rib_height / 3.0
+        left_wall = x <= x_left + wall  # rib left wall + left slab
+        n_type = (floor & ~p_column) | left_wall
+    return jnp.where(n_type, _JUNCTION_SEED_THETA, -_JUNCTION_SEED_THETA)
+
+
 def _load_tesseract_api(name: str) -> Any | None:
     api_path = _COMPONENTS_DIR / name / "tesseract_api.py"
     if not api_path.exists():
@@ -200,6 +267,8 @@ def init_tesseract_containers(
     mesh_dir: str | Path | None = None,
     mesh_size: float | None = None,
     mode_index: int = 0,
+    contact_offset: float | None = None,
+    domain_width: float | None = None,
 ) -> PipelineComponents:
     """Start tesseract Docker containers and bundle the live components.
 
@@ -222,6 +291,12 @@ def init_tesseract_containers(
         mode_index: Guided mode the gyptis solves target and track -- ``0`` the
             fundamental, ``k`` the ``k``-th guided mode in descending neff (see
             :func:`build_gyptis_components`).
+        contact_offset: Gap from the rib edge to the near contact edge [µm],
+            passed to the gyptis mesh author as ``PRISMO_GYPTIS_CONTACT_OFFSET``
+            (ticket 25). ``None`` keeps the component's default (0.2 µm).
+        domain_width: Physical box width [µm] (the slab spans it; the PML lies
+            outside), passed as ``PRISMO_GYPTIS_WIDTH``. ``None`` keeps the
+            default (2.0 µm).
     """
     try:
         from tesseract_core import Tesseract  # type: ignore[import-untyped]
@@ -290,6 +365,10 @@ def init_tesseract_containers(
 
     if mesh_size is not None:
         gyptis_env["PRISMO_GYPTIS_MESH_SIZE"] = repr(float(mesh_size))
+    if contact_offset is not None:
+        gyptis_env["PRISMO_GYPTIS_CONTACT_OFFSET"] = repr(float(contact_offset))
+    if domain_width is not None:
+        gyptis_env["PRISMO_GYPTIS_WIDTH"] = repr(float(domain_width))
     try:
         gyptis_tesseract = Tesseract.from_image(
             "prismo_gyptis:latest",
@@ -1080,6 +1159,92 @@ def vpi_lpi_v_cm(delta_neff: float | jax.Array) -> float:
     return abs(REVERSE_BIAS_V) * _WAVELENGTH_CM / (2.0 * dneff)
 
 
+# -- Free-carrier loss (ticket 25) ------------------------------------------------
+
+# Power attenuation 1 cm^-1 (neper) = 10*log10(e) dB/cm.
+NEPER_TO_DB: float = 10.0 / float(np.log(10.0))
+
+
+def free_carrier_absorption_cm(
+    electrons_cm3: jax.Array,
+    holes_cm3: jax.Array,
+    coeffs: SorefBennettCoefficients | None = None,
+) -> jax.Array:
+    """Absolute Soref-Bennett free-carrier absorption per node [cm^-1].
+
+    ``alpha = C_e * N_e^D_e + C_h * N_h^D_h`` from the *absolute* carrier
+    densities (cm^-3), not the equilibrium-subtracted perturbation the
+    permittivity uses: the insertion loss of a doped waveguide is set by every
+    carrier the mode sees. At 1e19 cm^-3 this is ~85 cm^-1 (electrons) and
+    ~60 cm^-1 (holes), i.e. hundreds of dB/cm.
+    """
+    if coeffs is None:
+        coeffs = _DEFAULT_COEFFS
+    return coeffs.C_e * _signed_pow(electrons_cm3, coeffs.D_e) + coeffs.C_h * _signed_pow(
+        holes_cm3, coeffs.D_h
+    )
+
+
+def modal_loss_db_cm(
+    alpha_cells_cm: jax.Array,
+    mode_overlap: jax.Array,
+    neff_background: jax.Array | float,
+    background_index: float = _DEFAULT_COEFFS.background_index,
+) -> jax.Array:
+    """Modal free-carrier loss [dB/cm] from the per-cell absorption, first order.
+
+    With ``w_cell = d(neff^2)/d(eps_cell)`` the mode's sensitivity to the
+    design-cell permittivity (the Hellmann-Feynman adjoint gyptis already
+    computes), an imaginary permittivity ``Im(eps) = n_si*alpha*lambda/(2*pi)``
+    in each cell shifts ``Im(neff^2)`` by ``sum(w*Im(eps))``, and the modal power
+    loss ``2*k0*Im(neff)`` is ``(n_si/neff) * sum(w_cell * alpha_cell)``; the
+    wavelength cancels. For a uniform core this is the textbook
+    confinement-weighted loss ``Gamma * alpha * n_si/neff``. The weights are
+    those of the *unperturbed* (background) mode, frozen: the carrier-induced
+    permittivity shift is ~1e-3 and does not reshape the mode.
+    """
+    alpha_mode_cm = (
+        background_index / neff_background
+    ) * jnp.sum(mode_overlap * alpha_cells_cm)
+    return NEPER_TO_DB * alpha_mode_cm
+
+
+def loss_figure_of_merit_v_db(
+    delta_neff: float | jax.Array, modal_loss_db_cm_value: float | jax.Array
+) -> float:
+    """``VπLπ x alpha`` [V·dB]: the literature's efficiency-loss figure of merit.
+
+    Smaller is better; good depletion modulators reach ~10-30 V·dB. Like
+    VπLπ it is *reported*, not optimized, and inherits VπLπ's sign.
+    """
+    return vpi_lpi_v_cm(delta_neff) * float(modal_loss_db_cm_value)
+
+
+def read_mode_overlap(
+    components: PipelineComponents,
+    n_design_cells: int,
+    background_epsilon: float = DEFAULT_BACKGROUND_EPSILON,
+) -> np.ndarray:
+    """The mode-overlap weights ``d(neff^2)/d(eps_cell)`` at the uniform background.
+
+    One eigensolve plus one eigen-adjoint of the bound gyptis component on the
+    rho-independent background permittivity. The result feeds
+    ``pipeline(mode_overlap=...)`` as a constant: the loss term is first order
+    in the carrier perturbation, so the weights are frozen at the unperturbed
+    mode rather than re-derived (which would need second-order eigen-
+    derivatives the adjoint does not provide).
+    """
+    eps_bg = jnp.full((int(n_design_cells),), float(background_epsilon))
+
+    def neff_sq(eps: jax.Array) -> jax.Array:
+        return jnp.reshape(components.gyptis(eps, float(background_epsilon)), ())
+
+    weights = np.asarray(jax.grad(neff_sq)(eps_bg), dtype=float)
+    if weights.shape != (int(n_design_cells),) or not np.all(np.isfinite(weights)):
+        raise RuntimeError("gyptis returned no usable mode-overlap weights")
+    return weights
+
+
 # -- Soref-Bennett (pure JAX) ----------------------------------------------------
 
 
@@ -1142,32 +1307,35 @@ def _sb_jax(
 # -- Pipeline --------------------------------------------------------------------
 
 
-def design_epsilon_from_theta(
-    theta: jax.Array,
-    H: jax.Array | None = None,
-    H_sum: jax.Array | None = None,
-    mesh_ref: MeshRef | None = None,
-    background_epsilon: float | None = None,
-    design_transfer: jax.Array | None = None,
-    design_nodes: DesignNodes | None = None,
-    components: PipelineComponents | None = None,
-) -> tuple[jax.Array, jax.Array]:
-    """Everything ``pipeline()`` does up to the eigensolves.
+class PipelineTerms(NamedTuple):
+    """The two physical terms one pipeline evaluation yields (ticket 25).
 
-    Runs filter -> signed doping -> both ChargeTransport solves -> Soref-Bennett
-    -> mesh transfer, and returns the ``(epsilon_bg, epsilon_pert)`` design-cell
-    permittivity fields the two gyptis solves consume. Split out of
-    :func:`pipeline` so the same permittivity the objective was evaluated on can
-    be handed to the mode-field query for the headline figure (ticket 07),
-    rather than reconstructing the chain a second way.
-
-    Arguments match :func:`pipeline`.
+    ``delta_neff`` is the signed effective-index shift the optimizer has always
+    maximized; ``modal_loss_db_cm`` is the first-order modal free-carrier loss
+    of the unbiased device (``nan`` when no mode-overlap weights were given).
+    Both are JAX scalars and differentiable; ``pipeline()`` combines them.
     """
-    if background_epsilon is None:
-        background_epsilon = DEFAULT_BACKGROUND_EPSILON
-    if components is None:
-        components = _DEFAULT_COMPONENTS
 
+    delta_neff: jax.Array
+    modal_loss_db_cm: jax.Array
+
+
+def _pre_eigensolve(
+    theta: jax.Array,
+    H: jax.Array | None,
+    H_sum: jax.Array | None,
+    mesh_ref: MeshRef | None,
+    background_epsilon: float,
+    design_transfer: jax.Array | None,
+    design_nodes: DesignNodes | None,
+    components: PipelineComponents,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Filter -> doping -> both ChargeTransport solves -> Soref-Bennett -> transfer.
+
+    Returns ``(epsilon_bg, epsilon_pert, n0_cm3, p0_cm3)``: the two design-cell
+    permittivity fields the eigensolves consume and the equilibrium carriers
+    (cm^-3, full node order) the loss term reads.
+    """
     # 1. Density filter: theta -> theta_tilde (linear; regularizes junction width).
     # Filtering happens on the design nodes, so the filter never averages a
     # silicon node against an oxide variable that carries no physics.
@@ -1208,7 +1376,113 @@ def design_epsilon_from_theta(
     # spatial structure (no mean-collapse): a topology change that redistributes
     # carriers at fixed mean now moves neff.
     bg = jnp.asarray(background_epsilon, dtype=delta_eps.dtype)
-    return _build_design_epsilon(delta_eps, bg, design_transfer)
+    epsilon_bg, epsilon_pert = _build_design_epsilon(delta_eps, bg, design_transfer)
+    return epsilon_bg, epsilon_pert, n0 * _M3_TO_CM3, p0 * _M3_TO_CM3
+
+
+def design_epsilon_from_theta(
+    theta: jax.Array,
+    H: jax.Array | None = None,
+    H_sum: jax.Array | None = None,
+    mesh_ref: MeshRef | None = None,
+    background_epsilon: float | None = None,
+    design_transfer: jax.Array | None = None,
+    design_nodes: DesignNodes | None = None,
+    components: PipelineComponents | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Everything ``pipeline()`` does up to the eigensolves.
+
+    Runs filter -> signed doping -> both ChargeTransport solves -> Soref-Bennett
+    -> mesh transfer, and returns the ``(epsilon_bg, epsilon_pert)`` design-cell
+    permittivity fields the two gyptis solves consume. Split out of
+    :func:`pipeline` so the same permittivity the objective was evaluated on can
+    be handed to the mode-field query for the headline figure (ticket 07),
+    rather than reconstructing the chain a second way.
+
+    Arguments match :func:`pipeline`.
+    """
+    if background_epsilon is None:
+        background_epsilon = DEFAULT_BACKGROUND_EPSILON
+    if components is None:
+        components = _DEFAULT_COMPONENTS
+    epsilon_bg, epsilon_pert, _n0, _p0 = _pre_eigensolve(
+        theta, H, H_sum, mesh_ref, background_epsilon, design_transfer,
+        design_nodes, components,
+    )
+    return epsilon_bg, epsilon_pert
+
+
+def pipeline_with_terms(
+    theta: jax.Array,
+    H: jax.Array | None = None,
+    H_sum: jax.Array | None = None,
+    mesh_ref: MeshRef | None = None,
+    background_epsilon: float | None = None,
+    design_transfer: jax.Array | None = None,
+    design_nodes: DesignNodes | None = None,
+    components: PipelineComponents | None = None,
+    loss_weight: float = 0.0,
+    mode_overlap: jax.Array | np.ndarray | None = None,
+) -> tuple[jax.Array, PipelineTerms]:
+    """:func:`pipeline` returning ``(objective, terms)`` for ``has_aux`` callers.
+
+    The objective is ``delta_neff - loss_weight * modal_loss_db_cm`` (ticket
+    25); with ``loss_weight == 0`` it is exactly ``delta_neff`` and the loss is
+    only reported (``nan`` when no ``mode_overlap`` is bound). See
+    :func:`pipeline` for the arguments.
+    """
+    loss_weight = float(loss_weight)
+    if loss_weight < 0.0:
+        raise ValueError("loss_weight must be non-negative")
+    if loss_weight > 0.0 and mode_overlap is None:
+        raise ValueError(
+            "a positive loss_weight needs mode_overlap weights (read_mode_overlap)"
+        )
+    if background_epsilon is None:
+        background_epsilon = DEFAULT_BACKGROUND_EPSILON
+    if components is None:
+        components = _DEFAULT_COMPONENTS
+
+    epsilon_bg, epsilon_pert, n0_cm3, p0_cm3 = _pre_eigensolve(
+        theta, H, H_sum, mesh_ref, background_epsilon, design_transfer,
+        design_nodes, components,
+    )
+
+    # Background epsilon does not depend on rho. Cache its eigenmode while
+    # keeping the perturbed solve and eigen-adjoint live for every rho.
+    neff_sq_0 = components.gyptis_background(epsilon_bg, background_epsilon)
+    neff_sq_1 = components.gyptis(epsilon_pert, background_epsilon)
+
+    neff_0 = jnp.sqrt(jnp.maximum(neff_sq_0, 0.0))
+    neff_1 = jnp.sqrt(jnp.maximum(neff_sq_1, 0.0))
+
+    # Signed Δneff = Re[neff(-5V)] - Re[neff(0)]: the honest objective. Depletion
+    # raises the index, so a physical optimum is positive; the sign is physically
+    # determined, so the optimizer maximizes Δneff directly -- no epsilon fudge,
+    # no magnitude folding that would reward a wrong-polarity mode shift.
+    delta_neff = neff_1 - neff_0
+
+    if mode_overlap is None:
+        loss = jnp.asarray(jnp.nan, dtype=delta_neff.dtype)
+    else:
+        weights = jnp.asarray(mode_overlap, dtype=delta_neff.dtype)
+        if weights.shape != epsilon_bg.shape:
+            raise ValueError(
+                f"mode_overlap has shape {weights.shape}; expected one weight per "
+                f"design cell {epsilon_bg.shape}"
+            )
+        # Loss of the unbiased device: the absolute 0 V carriers, carried onto
+        # the design cells by the same transfer as the permittivity, summed
+        # against the background mode's sensitivity weights.
+        alpha_nodes = free_carrier_absorption_cm(n0_cm3, p0_cm3)
+        if design_transfer is None:
+            alpha_cells = alpha_nodes
+        else:
+            alpha_cells = jnp.asarray(design_transfer, dtype=alpha_nodes.dtype) @ alpha_nodes
+        loss = modal_loss_db_cm(alpha_cells, weights, neff_0)
+
+    objective = delta_neff if loss_weight == 0.0 else delta_neff - loss_weight * loss
+    return objective, PipelineTerms(delta_neff=delta_neff, modal_loss_db_cm=loss)
 
 
 def pipeline(
@@ -1220,8 +1494,10 @@ def pipeline(
     design_transfer: jax.Array | None = None,
     design_nodes: DesignNodes | None = None,
     components: PipelineComponents | None = None,
+    loss_weight: float = 0.0,
+    mode_overlap: jax.Array | np.ndarray | None = None,
 ) -> jax.Array:
-    """Signed design field theta -> Delta n_eff differentiable pipeline.
+    """Signed design field theta -> objective (Δneff, optionally loss-penalized).
 
     Args:
         theta: Signed design field per design node in [-1, 1], shape
@@ -1243,19 +1519,21 @@ def pipeline(
             ``theta`` already spans every mesh node.
         components: Live differentiable components to compose. Defaults to the
             in-process components built from the local tesseract apis.
+        loss_weight: Weight ``w`` of the modal free-carrier loss in the
+            objective ``Δneff - w * alpha_mode`` [neff per dB/cm] (ticket 25).
+            ``0`` (default) optimizes Δneff alone.
+        mode_overlap: ``(n_design_cells,)`` mode-overlap weights from
+            :func:`read_mode_overlap`. Required when ``loss_weight > 0``;
+            without them the loss is not evaluated.
 
     Returns:
-        Signed effective-index shift ``Δneff = Re[neff(-5V)] - Re[neff(0)]``.
-        Smooth and differentiable through zero; depletion (the physical bias
-        response) makes it positive. Report ``VπLπ`` from it via
-        :func:`vpi_lpi_v_cm`.
+        Signed effective-index shift ``Δneff = Re[neff(-5V)] - Re[neff(0)]``,
+        minus ``loss_weight`` times the modal loss in dB/cm. Smooth and
+        differentiable through zero; depletion (the physical bias response)
+        makes Δneff positive. Report ``VπLπ`` from it via :func:`vpi_lpi_v_cm`
+        and the two terms via :func:`pipeline_with_terms`.
     """
-    if background_epsilon is None:
-        background_epsilon = DEFAULT_BACKGROUND_EPSILON
-    if components is None:
-        components = _DEFAULT_COMPONENTS
-
-    epsilon_bg, epsilon_pert = design_epsilon_from_theta(
+    objective, _terms = pipeline_with_terms(
         theta,
         H=H,
         H_sum=H_sum,
@@ -1264,18 +1542,7 @@ def pipeline(
         design_transfer=design_transfer,
         design_nodes=design_nodes,
         components=components,
+        loss_weight=loss_weight,
+        mode_overlap=mode_overlap,
     )
-
-    # Background epsilon does not depend on rho. Cache its eigenmode while
-    # keeping the perturbed solve and eigen-adjoint live for every rho.
-    neff_sq_0 = components.gyptis_background(epsilon_bg, background_epsilon)
-    neff_sq_1 = components.gyptis(epsilon_pert, background_epsilon)
-
-    neff_0 = jnp.sqrt(jnp.maximum(neff_sq_0, 0.0))
-    neff_1 = jnp.sqrt(jnp.maximum(neff_sq_1, 0.0))
-
-    # Signed Δneff = Re[neff(-5V)] - Re[neff(0)]: the honest objective. Depletion
-    # raises the index, so a physical optimum is positive; the sign is physically
-    # determined, so the optimizer maximizes Δneff directly -- no epsilon fudge,
-    # no magnitude folding that would reward a wrong-polarity mode shift.
-    return neff_1 - neff_0
+    return objective

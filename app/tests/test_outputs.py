@@ -102,6 +102,31 @@ class TestConvergencePlot:
             assert plot_convergence(history, output_dir=tmp).exists()
 
 
+    def test_draws_a_loss_panel_when_the_history_carries_a_loss(self):
+        """Ticket 25: modal loss [dB/cm] and VπLπ·alpha [V·dB] get their own panel."""
+        history = _make_history()
+        for i, entry in enumerate(history):
+            entry["modal_loss_db_cm"] = 300.0 - 10.0 * i
+            entry["objective"] = entry["delta_n_eff"] - 1e-6 * entry["modal_loss_db_cm"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = plot_convergence(history, output_dir=tmp)
+            assert path.exists()
+        # The panel reads the loss series through the same helper the figure uses.
+        from prismo.outputs import history_loss_series
+
+        iters, losses = history_loss_series(history)
+        assert iters == list(range(1, 11))
+        assert losses[0] == pytest.approx(300.0)
+
+    def test_no_loss_panel_without_loss_entries(self):
+        from prismo.outputs import history_loss_series
+
+        assert history_loss_series(_make_history()) == ([], [])
+        history = _make_history()
+        history[0]["modal_loss_db_cm"] = None
+        assert history_loss_series(history) == ([], [])
+
+
 class TestDopingFieldPlot:
     def test_generates_pdf(self):
         coords = _make_coords()

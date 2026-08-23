@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import typer
 from typer.testing import CliRunner
 
 runner = CliRunner()
@@ -1198,3 +1199,278 @@ def test_container_run_survives_a_failing_cold_resolve(
     out = capsys.readouterr().out
     assert "WARNING: cold re-solve of the reported design FAILED" in out
     assert "Best Delta_n_eff (warm) = +1.000000e-03" in out
+
+
+# ---------------------------------------------------------------------------
+# Ticket 25: loss-aware objective, junction seeds, geometry knobs
+# ---------------------------------------------------------------------------
+
+
+def _rib_coords() -> np.ndarray:
+    """A rib-on-slab node set (µm) so the non-lateral seeds have a rib to find."""
+    slab = np.array([[x, y] for y in (0.0, 0.1) for x in np.linspace(-1.0, 1.0, 9)])
+    rib = np.array([[x, y] for y in (0.2, 0.32) for x in np.linspace(-0.25, 0.25, 5)])
+    return np.vstack([slab, rib])
+
+
+def test_run_seed_option_selects_the_initial_design(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import prismo.main as main_module
+    import prismo.optimizer as optimizer_module
+    import prismo.outputs as outputs_module
+    import prismo.waveguide_mesh as mesh_module
+    from prismo.pipeline import seed_design_field
+
+    coords = _rib_coords()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        optimizer_module,
+        "optimize_doping",
+        lambda **kwargs: (captured.update(kwargs) or (kwargs["initial_rho"], [])),
+    )
+    monkeypatch.setattr(outputs_module, "generate_outputs", lambda **kwargs: [])
+    _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
+
+    main_module._run_pipeline(
+        r_min=50e-9,
+        max_iter=1,
+        ftol_rel=1e-5,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        no_jit=True,
+        use_containers=True,
+        components=_container_components([[0.0, 0.25], [0.1, 0.25]]),
+        seed="u",
+    )
+
+    expected = np.asarray(seed_design_field(coords, "u"))
+    np.testing.assert_array_equal(captured["initial_rho"], expected)
+    assert not np.array_equal(expected, np.asarray(seed_design_field(coords, "lateral")))
+
+
+def test_run_binds_loss_weight_and_mode_overlap_to_the_optimizer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Overlap weights + weight reach the optimizer; headline reports loss and FOM."""
+    import prismo.main as main_module
+    import prismo.optimizer as optimizer_module
+    import prismo.outputs as outputs_module
+    import prismo.waveguide_mesh as mesh_module
+
+    coords = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+    captured: dict[str, object] = {}
+    calls: list[str] = []
+    history = [
+        {"iteration": 1, "objective": 4e-4, "delta_n_eff": 5e-4,
+         "modal_loss_db_cm": 100.0, "delta_rho": 0.0, "grad_norm": 1e-4, "wall_time": 0.1},
+        {"iteration": 2, "objective": 7e-4, "delta_n_eff": 1e-3,
+         "modal_loss_db_cm": 300.0, "delta_rho": 1e-3, "grad_norm": 1e-4, "wall_time": 0.2},
+    ]
+    components = _solve_components_with_reset(
+        _container_components([[0.5, 0.0], [1.5, 0.0]]), calls
+    )
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+
+    def fake_optimize(**kwargs):
+        captured.update(kwargs)
+        return np.asarray([0.2, 0.3, 0.4]), history
+
+    monkeypatch.setattr(optimizer_module, "optimize_doping", fake_optimize)
+    monkeypatch.setattr(outputs_module, "generate_outputs", lambda **kwargs: [])
+    _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
+
+    main_module._run_pipeline(
+        r_min=50e-9,
+        max_iter=2,
+        ftol_rel=1e-5,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        no_jit=True,
+        use_containers=True,
+        components=components,
+        loss_weight=1e-6,
+    )
+
+    assert captured["loss_weight"] == pytest.approx(1e-6)
+    # The mean-field gyptis double has d(neff^2)/d(eps_cell) = 1/n over the two
+    # design cells of the stubbed transfer.
+    np.testing.assert_allclose(captured["mode_overlap"], [0.5, 0.5])
+    out = capsys.readouterr().out
+    assert "Loss weight: 1e-06" in out
+    # The best design is the best *objective*; its loss and FOM are reported.
+    assert "Best objective (warm) = +7.000000e-04" in out
+    assert "modal loss" in out.lower()
+    assert "V·dB" in out
+
+
+def test_run_without_a_gyptis_backend_needs_no_overlap_unless_weighted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import prismo.main as main_module
+    import prismo.optimizer as optimizer_module
+    import prismo.outputs as outputs_module
+    import prismo.waveguide_mesh as mesh_module
+
+    coords = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        optimizer_module,
+        "optimize_doping",
+        lambda **kwargs: (captured.update(kwargs) or (kwargs["initial_rho"], [])),
+    )
+    monkeypatch.setattr(outputs_module, "generate_outputs", lambda **kwargs: [])
+    _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
+    common = dict(
+        r_min=50e-9,
+        max_iter=1,
+        ftol_rel=1e-5,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        no_jit=True,
+        use_containers=True,
+        components=_container_components([[0.5, 0.0], [1.5, 0.0]]),  # gyptis=None
+    )
+
+    main_module._run_pipeline(**common)
+    assert captured["mode_overlap"] is None
+    assert "mode-overlap weights unavailable" in capsys.readouterr().out
+
+    with pytest.raises(RuntimeError, match="loss-weight"):
+        main_module._run_pipeline(**common, loss_weight=1e-6)
+
+
+def test_cli_run_exposes_the_ticket_25_knobs() -> None:
+    main_module = import_module("prismo.main")
+    result = runner.invoke(main_module.app, ["run", "--help"])
+    assert result.exit_code == 0, result.output
+    for flag in ("--loss-weight", "--seed", "--contact-offset", "--domain-width"):
+        assert flag in result.stdout
+    # The default filter radius spans 3-4 elements of the 0.04 µm container mesh.
+    assert main_module._DEFAULT_R_MIN == pytest.approx(0.10)
+
+
+def test_container_run_forwards_the_geometry_knobs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--contact-offset`` / ``--domain-width`` reach the container init."""
+    import prismo.main as main_module
+    import prismo.pipeline as pipeline_module
+
+    captured: dict[str, object] = {}
+
+    def fake_init(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(pipeline_module, "init_tesseract_containers", fake_init)
+    result = runner.invoke(
+        main_module.app,
+        ["run", "--use-containers", "--contact-offset", "0.5", "--domain-width", "3.0"],
+    )
+    assert result.exit_code != 0
+    assert captured["contact_offset"] == pytest.approx(0.5)
+    assert captured["domain_width"] == pytest.approx(3.0)
+
+
+def test_local_geometry_takes_the_contact_offset_and_width() -> None:
+    import prismo.main as main_module
+    from prismo.waveguide_mesh import RibWaveguideGeometry
+
+    geometry = main_module._local_geometry(
+        RibWaveguideGeometry, None, contact_offset=0.5, domain_width=3.0
+    )
+    assert geometry.contact_offset == pytest.approx(0.5)
+    assert geometry.box_width == pytest.approx(3.0)
+    with pytest.raises(typer.BadParameter):
+        main_module._local_geometry(RibWaveguideGeometry, None, contact_offset=-0.1)
+
+
+def test_bad_geometry_knobs_fail_before_any_container_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bad ``--contact-offset``/``--seed`` is a CLI error, not a container one."""
+    import prismo.main as main_module
+    import prismo.pipeline as pipeline_module
+
+    started: list[str] = []
+    monkeypatch.setattr(
+        pipeline_module,
+        "init_tesseract_containers",
+        lambda **kwargs: started.append("init") or None,
+    )
+    for command in ("run", "validate-gradient", "probe-objective"):
+        for args in (["--contact-offset", "-0.1"], ["--seed", "diagonal"], ["--domain-width", "0"]):
+            result = runner.invoke(main_module.app, [command, "--use-containers", *args])
+            assert result.exit_code != 0, (command, args)
+            assert "must be" in result.output, (command, args, result.output)
+    assert started == []
+
+
+def test_diagnostic_commands_expose_seed_and_geometry_knobs() -> None:
+    main_module = import_module("prismo.main")
+    for command in ("validate-gradient", "probe-objective"):
+        result = runner.invoke(main_module.app, [command, "--help"])
+        assert result.exit_code == 0, result.output
+        for flag in ("--loss-weight", "--seed", "--contact-offset", "--domain-width"):
+            assert flag in result.stdout, (command, flag)
+
+
+def test_gradient_validation_uses_the_requested_seed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import prismo.main as main_module
+    import prismo.outputs as outputs_module
+    import prismo.waveguide_mesh as mesh_module
+    from prismo.pipeline import seed_design_field
+
+    coords = _rib_coords()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        mesh_module,
+        "read_mesh_silicon_triangulation",
+        lambda _: np.empty((0, 3), dtype=np.intp),
+    )
+
+    def fake_validate(pipeline_fn, rho, **kwargs):
+        captured["rho"] = np.asarray(rho)
+        return types.SimpleNamespace(
+            passed=True, worst_rel_error=0.0, tolerance=1e-2,
+            best_rel_errors=[0.0], figure_path=tmp_path / "gv.pdf",
+        )
+
+    monkeypatch.setattr(outputs_module, "validate_gradient", fake_validate)
+    main_module._run_gradient_validation(
+        r_min=0.1,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        tolerance=1e-2,
+        n_directions=1,
+        use_containers=False,
+        components=None,
+        seed="vertical",
+    )
+    np.testing.assert_array_equal(captured["rho"], np.asarray(seed_design_field(coords, "vertical")))
+
+
+def test_local_geometry_rejects_contacts_outside_the_box() -> None:
+    import prismo.main as main_module
+    from prismo.waveguide_mesh import RibWaveguideGeometry
+
+    with pytest.raises(typer.BadParameter, match="outside"):
+        main_module._local_geometry(
+            RibWaveguideGeometry, None, contact_offset=1.5, domain_width=3.0
+        )

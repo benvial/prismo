@@ -4,8 +4,9 @@ Wraps the JAX-differentiable pipeline in NLopt's MMA, one fresh MMA subproblem
 per outer step inside a move-limit box (ticket 19).
 Design variables: the signed design field theta in [-1, 1], one entry per
 design node (the silicon nodes of the shared mesh; see ``pipeline.DesignNodes``).
-Objective: maximize signed delta_n_eff (or minimize -delta_n_eff).
-Ref: tickets 15, 19.
+Objective: maximize signed delta_n_eff, optionally minus a weighted modal
+free-carrier loss (ticket 25).
+Ref: tickets 15, 19, 25.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from prismo.pipeline import (
     DesignNodes,
     PipelineComponents,
     default_components,
-    pipeline,
+    pipeline_with_terms,
 )
 
 _HistoryEntry = dict[str, Any]
@@ -108,6 +109,8 @@ def optimize_doping(
     design_nodes: DesignNodes | None = None,
     mesh_ref: MeshRef | None = None,
     components: PipelineComponents | None = None,
+    loss_weight: float = 0.0,
+    mode_overlap: np.ndarray | jax.Array | None = None,
 ) -> tuple[np.ndarray, list[_HistoryEntry]]:
     """Run the move-limited MMA optimization loop.
 
@@ -155,10 +158,20 @@ def optimize_doping(
             1D fallback device.
         components: Live pipeline components to compose. Defaults to the
             in-process components (see ``pipeline``).
+        loss_weight: Weight of the modal free-carrier loss in the objective
+            ``delta_neff - loss_weight * loss_db_cm`` (ticket 25). ``0`` keeps
+            the pure Δneff objective; the loss is still recorded when
+            ``mode_overlap`` is given.
+        mode_overlap: ``(n_design_cells,)`` mode-overlap weights from
+            ``pipeline.read_mode_overlap``; required for a positive
+            ``loss_weight``.
 
     Returns:
         ``(rho_opt, history)`` where ``rho_opt`` is the best design whose
-        physics solved and ``history`` is a list of per-evaluation records.
+        physics solved and ``history`` is a list of per-evaluation records:
+        ``objective`` (what MMA maximized), ``delta_n_eff``,
+        ``modal_loss_db_cm`` (``None`` when not evaluated), step and timing
+        fields.
 
     Raises:
         OptimizationCancelled: If the user interrupts with Ctrl-C.
@@ -190,8 +203,8 @@ def optimize_doping(
     if components is None:
         components = default_components()
 
-    def _pipe(rho: jax.Array) -> jax.Array:
-        return pipeline(
+    def _pipe(rho: jax.Array) -> tuple[jax.Array, Any]:
+        return pipeline_with_terms(
             rho,
             H=H,
             H_sum=H_sum,
@@ -199,9 +212,11 @@ def optimize_doping(
             design_transfer=design_transfer,
             design_nodes=design_nodes,
             components=components,
+            loss_weight=loss_weight,
+            mode_overlap=mode_overlap,
         )
 
-    value_and_grad_fn = jax.value_and_grad(_pipe)
+    value_and_grad_fn = jax.value_and_grad(_pipe, has_aux=True)
     if use_jit:
         value_and_grad_fn = jax.jit(value_and_grad_fn)
 
@@ -233,8 +248,10 @@ def optimize_doping(
         iter_count = len(history) + 1
         if on_iteration is not None:
             on_iteration(iter_count, rho_np.copy())
-        value, grad = value_and_grad_fn(jnp.asarray(rho_np))
+        (value, terms), grad = value_and_grad_fn(jnp.asarray(rho_np))
         f_val = float(value)
+        delta_neff = float(terms.delta_neff)
+        loss_db_cm = float(terms.modal_loss_db_cm)
         grad_phys = np.asarray(grad, dtype=float)
         callback_time = time.perf_counter() - callback_started_at
 
@@ -246,10 +263,16 @@ def optimize_doping(
         g_norm = float(np.linalg.norm(grad_phys))
         wall = time.perf_counter() - t_start
 
+        # ``objective`` is what MMA maximizes (``delta_n_eff`` when the loss
+        # weight is zero); the two physical terms ride alongside so the
+        # trade-off is visible per iteration. A loss that was not evaluated
+        # (no mode-overlap weights) is ``None``, which JSON can carry.
         history.append(
             {
                 "iteration": iter_count,
-                "delta_n_eff": f_val,
+                "objective": f_val,
+                "delta_n_eff": delta_neff,
+                "modal_loss_db_cm": loss_db_cm if np.isfinite(loss_db_cm) else None,
                 "delta_rho": delta_rho,
                 "max_step": max_step,
                 "move_limit": delta,
@@ -258,9 +281,13 @@ def optimize_doping(
                 "callback_time": callback_time,
             }
         )
+        loss_text = f"alpha={loss_db_cm:.4g}dB/cm  " if np.isfinite(loss_db_cm) else ""
+        objective_text = f"f={f_val:+.6e}  " if loss_weight > 0.0 else ""
         print(
             f"iter {iter_count:4d}  "
-            f"Δneff={f_val:+.6e}  "
+            f"{objective_text}"
+            f"Δneff={delta_neff:+.6e}  "
+            f"{loss_text}"
             f"‖Δρ‖={delta_rho:.4e}  "
             f"max|Δθ|={max_step:.3e}  "
             f"Δ={delta:.3e}  "

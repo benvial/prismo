@@ -25,6 +25,7 @@
 
 import itertools
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -56,7 +57,7 @@ DEFAULT_SUBSTRATE_EPSILON: float = DEFAULT_OXIDE_EPSILON
 # surgery and, inset from the x-PML, never touches one. Layer stack bottom->top:
 # substrate (oxide) / slab (silicon) / rib band (oxide + embedded silicon rib) /
 # clad (oxide).
-_WIDTH: float = 2.0
+_DEFAULT_WIDTH: float = 2.0
 _PML_WIDTH: tuple[float, float] = (0.5, 0.5)
 _LAYER_THICKNESS: dict[str, float] = {
     "substrate": 0.35,
@@ -65,8 +66,41 @@ _LAYER_THICKNESS: dict[str, float] = {
     "clad": 0.35,
 }
 _RIB_HALF_WIDTH: float = 0.25  # 500 nm rib, centred at x=0
-_CONTACT_OFFSET: float = 0.20  # gap from rib edge to the near contact edge
+_DEFAULT_CONTACT_OFFSET: float = 0.20  # gap from rib edge to the near contact edge
 _CONTACT_HALF_WIDTH: float = 0.025  # 50 nm contact line half-width
+
+
+def _positive_env_float(
+    name: str, default: float, env: Mapping[str, str] | None = None
+) -> float:
+    """A positive float knob from the environment, ``default`` when unset."""
+    source = os.environ if env is None else env
+    value = float(source.get(name, default))
+    if value <= 0.0:
+        raise ValueError(f"{name} must be positive [µm]")
+    return value
+
+
+def _validate_geometry(width: float, contact_offset: float) -> None:
+    """Both contact footprints must lie inside the physical box, clear of the PML."""
+    contact_outer = _RIB_HALF_WIDTH + contact_offset + 2 * _CONTACT_HALF_WIDTH
+    if contact_outer >= width / 2.0:
+        raise ValueError(
+            f"contact offset {contact_offset} µm puts the contact edge at "
+            f"{contact_outer} µm, outside the {width} µm wide domain"
+        )
+
+
+# Slab/contact geometry knobs (ticket 25): the physical box width and the gap
+# from the rib edge to the near contact edge, in µm. Foundry designs keep the
+# contacts 0.5-1 µm from the rib; the spike recipe's 0.2 µm puts them in the
+# mode tail. Read once at import like the mesh size, so every operation of a
+# served container builds the same geometry.
+_WIDTH: float = _positive_env_float("PRISMO_GYPTIS_WIDTH", _DEFAULT_WIDTH)
+_CONTACT_OFFSET: float = _positive_env_float(
+    "PRISMO_GYPTIS_CONTACT_OFFSET", _DEFAULT_CONTACT_OFFSET
+)
+_validate_geometry(_WIDTH, _CONTACT_OFFSET)
 # Refine the rib so the fundamental guided mode (n_clad < neff < n_core) is
 # resolved rather than only the coarse-mesh leaky mode. ``PRISMO_GYPTIS_MESH_SIZE``
 # overrides it at container start (the host sets it from ``prismo run
@@ -75,11 +109,9 @@ _CONTACT_HALF_WIDTH: float = 0.025  # 50 nm contact line half-width
 # ``solve``, the VJP, ``mode_field`` -- builds the same geometry; the shared
 # ``.msh``, the design cells, and the transfer operator therefore stay consistent.
 _DEFAULT_CORE_MESH_SIZE: float = 0.04
-_CORE_MESH_SIZE: float = float(
-    os.environ.get("PRISMO_GYPTIS_MESH_SIZE", _DEFAULT_CORE_MESH_SIZE)
+_CORE_MESH_SIZE: float = _positive_env_float(
+    "PRISMO_GYPTIS_MESH_SIZE", _DEFAULT_CORE_MESH_SIZE
 )
-if _CORE_MESH_SIZE <= 0.0:
-    raise ValueError("PRISMO_GYPTIS_MESH_SIZE must be positive [µm]")
 
 # Design region: the silicon rib interior. Every rib cell is modulated; the rib
 # is inset from the x-PML by construction and sits in the rib band away from the

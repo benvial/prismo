@@ -1270,6 +1270,21 @@ class TestChargeTransportMeshDelivery:
 
         assert captured["gyptis_environment"] == {"PRISMO_GYPTIS_MESH_SIZE": "0.015"}
 
+    def test_init_passes_the_geometry_knobs_to_the_gyptis_mesh_author(
+        self, monkeypatch, tmp_path
+    ):
+        """Contact offset and domain width (ticket 25) reach the mesh author."""
+        captured = _fake_container_env(monkeypatch)
+
+        init_tesseract_containers(
+            mesh_dir=tmp_path / "outputs", contact_offset=0.5, domain_width=3.0
+        )
+
+        assert captured["gyptis_environment"] == {
+            "PRISMO_GYPTIS_CONTACT_OFFSET": "0.5",
+            "PRISMO_GYPTIS_WIDTH": "3.0",
+        }
+
     def test_init_defaults_leave_the_container_environments_alone(
         self, monkeypatch, tmp_path
     ):

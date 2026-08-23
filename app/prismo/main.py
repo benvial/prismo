@@ -31,14 +31,65 @@ _MIN_CONTAINER_OBJECTIVE = 1e-12
 # Per-iteration move limit on theta (mirrors ``optimizer.DEFAULT_MOVE_LIMIT``;
 # kept as a literal so ``--help`` never eagerly imports jax/nlopt).
 _DEFAULT_MOVE_LIMIT = 0.05
+# Density-filter radius [µm]: 3-4 elements of the 0.04 µm container mesh, so
+# the result is smooth enough to be an implant mask (ticket 25). The previous
+# 0.05 µm reached one neighbour and left checkerboard-like slab values.
+_DEFAULT_R_MIN = 0.10
+# Junction seeds (``--seed``); mirrors ``pipeline.SEED_KINDS`` as literals so
+# ``--help`` never eagerly imports jax.
+_SEED_CHOICES = ("lateral", "vertical", "u")
 _CHECKPOINT_NAME = "checkpoint.json"
 # Live per-iteration doping frames: ``<prefix><iteration>.png`` in the output dir.
 _LIVE_FRAME_PREFIX = "doping_field_"
 
 
+def _seed_option() -> Any:
+    return typer.Option(
+        "lateral",
+        "--seed",
+        help="Initial junction: lateral (n left / p right), vertical (p over n "
+        "in the rib), or u (n wrapped under and beside a p core)",
+    )
+
+
+def _contact_offset_option() -> Any:
+    return typer.Option(
+        None,
+        "--contact-offset",
+        help="Gap from the rib edge to the near contact edge [µm] "
+        "(default: the mesh author's own, 0.2 µm; foundries use 0.5-1 µm)",
+    )
+
+
+def _domain_width_option() -> Any:
+    return typer.Option(
+        None,
+        "--domain-width",
+        help="Physical box width [µm] the slab spans, PML excluded "
+        "(default: the mesh author's own, 2.0 µm in containers, 3.0 µm local)",
+    )
+
+
+def _check_geometry_knobs(
+    seed: str, contact_offset: float | None, domain_width: float | None
+) -> None:
+    """Reject bad ``--seed`` / geometry values before any container is started.
+
+    The same values reach the gyptis mesh author at container start, where a
+    bad one surfaces as an import failure inside the container rather than as
+    a CLI error; validate here first.
+    """
+    if seed not in _SEED_CHOICES:
+        raise typer.BadParameter(f"--seed must be one of {', '.join(_SEED_CHOICES)}")
+    if contact_offset is not None and contact_offset <= 0.0:
+        raise typer.BadParameter("--contact-offset must be positive [µm]")
+    if domain_width is not None and domain_width <= 0.0:
+        raise typer.BadParameter("--domain-width must be positive [µm]")
+
+
 @app.command()
 def run(
-    r_min: float = typer.Option(0.05, help="Density filter radius [µm]"),
+    r_min: float = typer.Option(_DEFAULT_R_MIN, help="Density filter radius [µm]"),
     max_iter: int = typer.Option(200, help="Max MMA iterations"),
     ftol_rel: float = typer.Option(1e-5, help="Relative tolerance on objective"),
     move_limit: float = typer.Option(
@@ -73,15 +124,28 @@ def run(
         "neff), k = k-th guided mode in descending neff; ranked on the first "
         "eigensolve and tracked by nearest eigenvalue afterwards",
     ),
+    loss_weight: float = typer.Option(
+        0.0,
+        "--loss-weight",
+        min=0.0,
+        help="Weight w of the modal free-carrier loss in the objective "
+        "Δneff - w·alpha [neff per dB/cm]; 0 optimizes Δneff alone and only "
+        "reports the loss (ticket 25). ~4e-6 trades 1e-4 of Δneff against "
+        "25 dB/cm",
+    ),
+    seed: str = _seed_option(),
+    contact_offset: float = _contact_offset_option(),
+    domain_width: float = _domain_width_option(),
 ) -> None:
     """Run the PRISMO differentiable pipeline end-to-end.
 
     Steps:
     1. Generate waveguide mesh (gmsh required, falls back to empty mesh)
     2. Build density filter matrix from mesh node coordinates
-    3. Run NLopt MMA optimization (maximize delta_n_eff)
+    3. Run NLopt MMA optimization (maximize delta_n_eff - loss_weight·alpha)
     4. Generate paper-ready plots
     """
+    _check_geometry_knobs(seed, contact_offset, domain_width)
     from prismo.pipeline import (
         PipelineComponents,
         build_default_components,
@@ -93,7 +157,11 @@ def run(
     if use_containers:
         typer.echo("Starting tesseract Docker containers...")
         components = init_tesseract_containers(
-            mesh_dir=Path(mesh_path).parent, mesh_size=mesh_size, mode_index=mode_index
+            mesh_dir=Path(mesh_path).parent,
+            mesh_size=mesh_size,
+            mode_index=mode_index,
+            contact_offset=contact_offset,
+            domain_width=domain_width,
         )
     elif mode_index:
         # The shared in-process bundle targets the fundamental; a higher-order
@@ -113,6 +181,10 @@ def run(
             components=components,
             move_limit=move_limit,
             mode_index=mode_index,
+            loss_weight=loss_weight,
+            seed=seed,
+            contact_offset=contact_offset,
+            domain_width=domain_width,
         )
     finally:
         if use_containers and components is not None:
@@ -127,7 +199,7 @@ _DEFAULT_GRADIENT_TOLERANCE = 1e-2
 
 @app.command(name="validate-gradient")
 def validate_gradient(
-    r_min: float = typer.Option(0.05, help="Density filter radius [µm]"),
+    r_min: float = typer.Option(_DEFAULT_R_MIN, help="Density filter radius [µm]"),
     tolerance: float = typer.Option(
         _DEFAULT_GRADIENT_TOLERANCE,
         help="Acceptance bar on the worst per-direction relative error",
@@ -156,6 +228,16 @@ def validate_gradient(
         "evaluation so the FD reference carries no warm-start path dependence "
         "(default: warm)",
     ),
+    loss_weight: float = typer.Option(
+        0.0,
+        "--loss-weight",
+        min=0.0,
+        help="Validate the loss-penalized objective Δneff - w·alpha instead of "
+        "Δneff alone (ticket 25)",
+    ),
+    seed: str = _seed_option(),
+    contact_offset: float = _contact_offset_option(),
+    domain_width: float = _domain_width_option(),
 ) -> None:
     """Validate the composed ∂(Δneff)/∂θ gradient against central FD (ticket 06).
 
@@ -176,11 +258,16 @@ def validate_gradient(
     # central differences actually resolve the gradient before the CT state
     # readout's internal 1e-8 finite difference sets the floor.
     step_sizes = np.logspace(-4, -1, n_steps)
+    _check_geometry_knobs(seed, contact_offset, domain_width)
 
     components: PipelineComponents | None = None
     if use_containers:
         typer.echo("Starting tesseract Docker containers...")
-        components = init_tesseract_containers(mesh_dir=Path(mesh_path).parent)
+        components = init_tesseract_containers(
+            mesh_dir=Path(mesh_path).parent,
+            contact_offset=contact_offset,
+            domain_width=domain_width,
+        )
 
     try:
         result = _run_gradient_validation(
@@ -193,6 +280,10 @@ def validate_gradient(
             use_containers=use_containers,
             components=components,
             cold=cold,
+            loss_weight=loss_weight,
+            seed=seed,
+            contact_offset=contact_offset,
+            domain_width=domain_width,
         )
     finally:
         if use_containers and components is not None:
@@ -269,23 +360,48 @@ def _silicon_design_nodes(
     return DesignNodes(indices=indices, n_mesh_nodes=n_nodes), triangles
 
 
-def _local_geometry(geometry_cls: Any, mesh_size: float | None) -> Any:
-    """Rib geometry at the requested silicon element size (local mesh path).
+def _local_geometry(
+    geometry_cls: Any,
+    mesh_size: float | None,
+    contact_offset: float | None = None,
+    domain_width: float | None = None,
+) -> Any:
+    """Rib geometry at the requested size knobs (local mesh path).
 
     ``mesh_size`` is the core resolution, matching what the gyptis container
     reads from ``PRISMO_GYPTIS_MESH_SIZE``; the junction and bulk sizes follow
     it at the class defaults' own ratios (half the core at the junction, 2.5x it
     in the bulk), so one knob refines the whole local mesh proportionally.
+    ``contact_offset`` and ``domain_width`` (ticket 25) mirror the gyptis
+    ``PRISMO_GYPTIS_CONTACT_OFFSET`` / ``PRISMO_GYPTIS_WIDTH`` knobs; ``None``
+    keeps the class defaults.
     """
-    if mesh_size is None:
-        return geometry_cls()
-    if mesh_size <= 0.0:
-        raise typer.BadParameter("--mesh-size must be positive [µm]")
-    return geometry_cls(
-        mesh_res_junction=mesh_size / 2.0,
-        mesh_res_core=mesh_size,
-        mesh_res_bulk=mesh_size * 2.5,
-    )
+    kwargs: dict[str, float] = {}
+    if mesh_size is not None:
+        if mesh_size <= 0.0:
+            raise typer.BadParameter("--mesh-size must be positive [µm]")
+        kwargs.update(
+            mesh_res_junction=mesh_size / 2.0,
+            mesh_res_core=mesh_size,
+            mesh_res_bulk=mesh_size * 2.5,
+        )
+    if contact_offset is not None:
+        if contact_offset <= 0.0:
+            raise typer.BadParameter("--contact-offset must be positive [µm]")
+        kwargs["contact_offset"] = contact_offset
+    if domain_width is not None:
+        if domain_width <= 0.0:
+            raise typer.BadParameter("--domain-width must be positive [µm]")
+        kwargs["box_width"] = domain_width
+    geometry = geometry_cls(**kwargs)
+    # Same rule as the gyptis author: both contact footprints inside the box.
+    contact_outer = geometry.rib_right + geometry.contact_offset + geometry.contact_width
+    if contact_outer >= geometry.box_width / 2.0:
+        raise typer.BadParameter(
+            f"--contact-offset {geometry.contact_offset} µm puts the contact edge at "
+            f"{contact_outer} µm, outside the {geometry.box_width} µm wide domain"
+        )
+    return geometry
 
 
 def build_pipeline_inputs(
@@ -294,6 +410,9 @@ def build_pipeline_inputs(
     use_containers: bool,
     components: Any | None,
     mesh_size: float | None = None,
+    seed: str = "lateral",
+    contact_offset: float | None = None,
+    domain_width: float | None = None,
 ) -> PipelineInputs:
     """Author the shared mesh and assemble the fixed pipeline inputs.
 
@@ -308,13 +427,16 @@ def build_pipeline_inputs(
     ``mesh_size`` refines the silicon: on the container path the caller has
     already passed it to :func:`init_tesseract_containers`, which is where the
     mesh author lives, so here it only sizes the local rib mesh. ``None`` keeps
-    each author's default.
+    each author's default; likewise ``contact_offset`` / ``domain_width``
+    (ticket 25), which on the container path were already passed to the gyptis
+    author and here size the local mesh and the figure overlay. ``seed`` picks
+    the initial junction topology (``pipeline.SEED_KINDS``).
     """
     import jax.numpy as jnp
     from prismo_shared.schemas import MeshRef
 
     from prismo.density_filter import assemble_filter_matrix
-    from prismo.pipeline import build_design_transfer, seed_signed_junction
+    from prismo.pipeline import build_design_transfer, seed_design_field
     from prismo.waveguide_mesh import (
         RibWaveguideGeometry,
         build_rib_waveguide_mesh,
@@ -324,7 +446,12 @@ def build_pipeline_inputs(
     mesh_path_obj = Path(mesh_path)
 
     typer.echo("Generating waveguide mesh...")
-    geometry = _local_geometry(RibWaveguideGeometry, mesh_size)
+    geometry = _local_geometry(
+        RibWaveguideGeometry,
+        mesh_size,
+        contact_offset=contact_offset,
+        domain_width=domain_width,
+    )
     if use_containers:
         if components is None or components.write_mesh is None:
             raise RuntimeError("Container pipeline requires gyptis mesh authoring")
@@ -386,11 +513,12 @@ def build_pipeline_inputs(
     H_sparse = assemble_filter_matrix(design_coords, r_min=r_min)
     H_dense = jnp.asarray(H_sparse.toarray())
     H_sum = jnp.sum(H_dense, axis=1)
-    # Seed a signed lateral P/N junction in every run path (sign(theta) is a free
+    # Seed a signed P/N junction in every run path (sign(theta) is a free
     # design variable, so the optimizer can move or dissolve it). Seeded on the
     # design nodes, so the junction splits the silicon at its own median x
-    # rather than the whole domain's.
-    theta_init = seed_signed_junction(design_coords)
+    # rather than the whole domain's; ``seed`` picks the topology (ticket 25).
+    theta_init = seed_design_field(design_coords, seed)
+    typer.echo(f"      Seed: {seed} junction")
 
     design_transfer = None
     if use_containers:
@@ -540,6 +668,64 @@ def _clear_live_frames(output_dir: str | Path) -> int:
     return removed
 
 
+def _mode_overlap_weights(
+    inputs: PipelineInputs, components: Any | None, loss_weight: float
+) -> np.ndarray | None:
+    """The frozen mode-overlap weights the loss term needs (ticket 25).
+
+    One background eigensolve + adjoint through the bound gyptis component.
+    Always attempted so every run reports its modal loss; a backend that cannot
+    answer (no gyptis bound, an image predating the field VJP) costs the loss
+    *report* when the weight is zero and is a hard error when the loss is part
+    of the objective.
+    """
+    from prismo.pipeline import default_components, read_mode_overlap
+
+    bundle = components if components is not None else default_components()
+    n_cells = (
+        int(inputs.design_transfer.shape[0])
+        if inputs.design_transfer is not None
+        else int(inputs.n_nodes)
+    )
+    try:
+        weights = read_mode_overlap(bundle, n_cells)
+    except Exception as exc:
+        if loss_weight > 0.0:
+            raise RuntimeError(
+                "--loss-weight needs the mode-overlap weights from a live gyptis "
+                f"backend ({type(exc).__name__}: {exc})"
+            ) from exc
+        typer.echo(
+            "      Modal loss not reported: mode-overlap weights unavailable "
+            f"({type(exc).__name__})"
+        )
+        return None
+    typer.echo(
+        f"      Mode-overlap weights: {n_cells} design cells, "
+        f"sum d(neff²)/dε = {float(weights.sum()):.4f}"
+    )
+    return weights
+
+
+def _mode_overlap_if_weighted(
+    inputs: PipelineInputs, components: Any | None, loss_weight: float
+) -> np.ndarray | None:
+    """Overlap weights only when the loss is in the objective (diagnostic paths)."""
+    if loss_weight > 0.0:
+        return _mode_overlap_weights(inputs, components, loss_weight)
+    return None
+
+
+def _best_history_entry(history: list[dict[str, Any]]) -> dict[str, Any]:
+    """The accepted design's record: the best *objective* (Δneff when unweighted).
+
+    The optimizer only accepts improving steps, so the last entry may be a
+    rejected trial; histories predating ticket 25 carry no ``objective`` key
+    and fall back to Δneff.
+    """
+    return max(history, key=lambda e: e.get("objective", e["delta_n_eff"]))
+
+
 def _reset_chargetransport(components: Any | None) -> bool:
     """Drop the ChargeTransport worker's warm solutions; ``False`` if no seam."""
     from prismo.pipeline import default_components
@@ -553,7 +739,7 @@ def _reset_chargetransport(components: Any | None) -> bool:
 
 
 def _cold_reevaluation(
-    bound_pipeline: Any,
+    bound_terms: Any,
     rho_opt: np.ndarray,
     warm_delta_neff: float,
     components: Any | None,
@@ -566,7 +752,9 @@ def _cold_reevaluation(
     reported. Returns ``None`` (with a note) when no reset seam is bound, and
     ``None`` with a warning when the cold solve itself fails: a design that
     only solves from a warm start is a finding worth the headline figures, not
-    a crash after a finished optimization (ticket 23).
+    a crash after a finished optimization (ticket 23). ``bound_terms`` is the
+    ``pipeline_with_terms`` partial: the comparison is on Δneff itself, not on
+    a loss-penalized objective.
     """
     from prismo.outputs import ColdReevaluation
 
@@ -576,7 +764,9 @@ def _cold_reevaluation(
         )
         return None
     try:
-        cold_value = float(bound_pipeline(np.asarray(rho_opt, dtype=float)))
+        _objective, terms = bound_terms(np.asarray(rho_opt, dtype=float))
+        cold_value = float(terms.delta_neff)
+        cold_loss = float(terms.modal_loss_db_cm)
     except Exception as exc:
         typer.echo(
             "      WARNING: cold re-solve of the reported design FAILED "
@@ -590,6 +780,8 @@ def _cold_reevaluation(
     )
     typer.echo(f"      Delta_n_eff (warm, optimizer) = {result.warm_delta_neff:+.6e}")
     typer.echo(f"      Delta_n_eff (cold re-solve)   = {result.cold_delta_neff:+.6e}")
+    if np.isfinite(cold_loss):
+        typer.echo(f"      Modal loss (0 V, cold re-solve) = {cold_loss:.4g} dB/cm")
     if not result.passed:
         typer.echo(
             "      WARNING: warm/cold Delta_n_eff disagree by "
@@ -612,10 +804,19 @@ def _run_pipeline(
     components: Any | None = None,
     move_limit: float = _DEFAULT_MOVE_LIMIT,
     mode_index: int = 0,
+    loss_weight: float = 0.0,
+    seed: str = "lateral",
+    contact_offset: float | None = None,
+    domain_width: float | None = None,
 ) -> None:
     from prismo.optimizer import OptimizationCancelled, optimize_doping
     from prismo.outputs import generate_outputs, plot_live_doping_field
-    from prismo.pipeline import doping_from_theta, vpi_lpi_v_cm
+    from prismo.pipeline import (
+        doping_from_theta,
+        loss_figure_of_merit_v_db,
+        pipeline_with_terms,
+        vpi_lpi_v_cm,
+    )
     from prismo.pipeline import pipeline as pipeline_fn
 
     typer.echo("=== PRISMO Pipeline ===")
@@ -627,11 +828,25 @@ def _run_pipeline(
 
     typer.echo("[1/3] Preparing pipeline inputs...")
     inputs = build_pipeline_inputs(
-        r_min, mesh_path, use_containers, components, mesh_size=mesh_size
+        r_min,
+        mesh_path,
+        use_containers,
+        components,
+        mesh_size=mesh_size,
+        seed=seed,
+        contact_offset=contact_offset,
+        domain_width=domain_width,
     )
     typer.echo(
         "      Target mode: "
         + ("fundamental (index 0)" if mode_index == 0 else f"guided index {mode_index}")
+    )
+    # Loss-aware objective (ticket 25): Δneff - w·alpha with alpha the first-order modal
+    # free-carrier loss of the unbiased device; w = 0 reports the loss only.
+    mode_overlap = _mode_overlap_weights(inputs, components, loss_weight)
+    typer.echo(
+        f"      Loss weight: {loss_weight:g}"
+        + (" (Δneff alone is optimized)" if loss_weight == 0.0 else " [neff per dB/cm]")
     )
     # Container figures draw the gyptis frame, not the local author's
     # (ticket 16): the two meshes differ in vertical origin and substrate
@@ -689,6 +904,8 @@ def _run_pipeline(
             design_nodes=design_nodes,
             mesh_ref=mesh_ref,
             components=components,
+            loss_weight=loss_weight,
+            mode_overlap=mode_overlap,
         )
         typer.echo(f"      Optimization complete: {len(history)} iterations")
     except OptimizationCancelled:
@@ -700,15 +917,18 @@ def _run_pipeline(
     # differences. Omitting them made the figure probe an unfiltered pipeline
     # with ChargeTransport on its 1D fallback device, i.e. a different function
     # than the one that was optimized (ticket 15).
-    bound_pipeline = partial(
-        pipeline_fn,
+    bound_kwargs = dict(
         H=H_dense,
         H_sum=H_sum,
         mesh_ref=mesh_ref,
         design_transfer=design_transfer,
         design_nodes=design_nodes,
         components=components,
+        loss_weight=loss_weight,
+        mode_overlap=mode_overlap,
     )
+    bound_pipeline = partial(pipeline_fn, **bound_kwargs)
+    bound_terms = partial(pipeline_with_terms, **bound_kwargs)
 
     # The mode figure is a post-hoc query, so a backend that cannot answer it --
     # an image predating the ``mode_field`` operation, say -- must cost one
@@ -724,17 +944,31 @@ def _run_pipeline(
 
     cold = None
     if history:
-        # The reported design is the best one whose physics solved; its warm
-        # value is the best objective in the history (the optimizer only
-        # accepts improving steps, so the last entry may be a rejected trial).
-        warm_delta_neff = max(entry["delta_n_eff"] for entry in history)
+        # The reported design is the best one whose physics solved: the best
+        # objective in the history (the optimizer only accepts improving
+        # steps, so the last entry may be a rejected trial).
+        best = _best_history_entry(history)
+        warm_delta_neff = float(best["delta_n_eff"])
+        if loss_weight > 0.0:
+            typer.echo(
+                f"      Best objective (warm) = {float(best['objective']):+.6e}"
+            )
         typer.echo(f"      Best Delta_n_eff (warm) = {warm_delta_neff:+.6e}")
-        cold = _cold_reevaluation(bound_pipeline, rho_opt, warm_delta_neff, components)
+        cold = _cold_reevaluation(bound_terms, rho_opt, warm_delta_neff, components)
         headline = cold.cold_delta_neff if cold is not None else warm_delta_neff
         # VπLπ headline (V·cm): the field-standard modulation efficiency,
         # reported from Δneff at the fixed -5 V bias (smaller |VπLπ| better),
         # computed from the cold value when available (ticket 20).
         typer.echo(f"      VpiLpi = {vpi_lpi_v_cm(headline):+.4e} V·cm")
+        # Modal free-carrier loss of the reported design and the VπLπ·alpha figure
+        # of merit the literature compares on (ticket 25).
+        warm_loss = best.get("modal_loss_db_cm")
+        if warm_loss is not None:
+            typer.echo(f"      Modal loss (0 V, warm) = {float(warm_loss):.4g} dB/cm")
+            typer.echo(
+                "      VpiLpi x loss = "
+                f"{loss_figure_of_merit_v_db(headline, float(warm_loss)):+.4g} V·dB"
+            )
 
     if use_containers:
         # This audits that the containers produced a *live* signal, not that the
@@ -805,6 +1039,10 @@ def _run_gradient_validation(
     components: Any | None = None,
     step_sizes: np.ndarray | None = None,
     cold: bool = False,
+    loss_weight: float = 0.0,
+    seed: str = "lateral",
+    contact_offset: float | None = None,
+    domain_width: float | None = None,
 ) -> GradientValidationResult:
     """Check the composed gradient at the seeded design and write the figure.
 
@@ -813,7 +1051,8 @@ def _run_gradient_validation(
     fallback), and design transfer -- into the function the finite-difference
     sweep probes, so the CT adjoint is the thing being proven (audit #7).
     ``cold`` resets the ChargeTransport worker before every evaluation
-    (ticket 20).
+    (ticket 20). ``loss_weight > 0`` validates the loss-penalized objective
+    (ticket 25), i.e. the loss term's adjoint through the 0 V carriers too.
     """
     from prismo.outputs import validate_gradient as validate_gradient_fn
     from prismo.pipeline import pipeline as pipeline_fn
@@ -822,7 +1061,16 @@ def _run_gradient_validation(
     typer.echo()
 
     typer.echo("[1/2] Preparing pipeline inputs...")
-    inputs = build_pipeline_inputs(r_min, mesh_path, use_containers, components)
+    inputs = build_pipeline_inputs(
+        r_min,
+        mesh_path,
+        use_containers,
+        components,
+        seed=seed,
+        contact_offset=contact_offset,
+        domain_width=domain_width,
+    )
+    mode_overlap = _mode_overlap_if_weighted(inputs, components, loss_weight)
 
     typer.echo("[2/2] Checking adjoint against central finite differences...")
     before_evaluation = None
@@ -842,6 +1090,8 @@ def _run_gradient_validation(
         design_transfer=inputs.design_transfer,
         design_nodes=inputs.design_nodes,
         components=components,
+        loss_weight=loss_weight,
+        mode_overlap=mode_overlap,
     )
     result = validate_gradient_fn(
         bound_pipeline,
@@ -873,7 +1123,7 @@ _DEFAULT_PROBE_POINTS = 21
 
 @app.command(name="probe-objective")
 def probe_objective(
-    r_min: float = typer.Option(0.05, help="Density filter radius [µm]"),
+    r_min: float = typer.Option(_DEFAULT_R_MIN, help="Density filter radius [µm]"),
     design: str = typer.Option(
         None,
         "--design",
@@ -907,6 +1157,15 @@ def probe_objective(
         "--cold",
         help="Reset the ChargeTransport worker before every evaluation",
     ),
+    loss_weight: float = typer.Option(
+        0.0,
+        "--loss-weight",
+        min=0.0,
+        help="Scan the loss-penalized objective Δneff - w·alpha (ticket 25)",
+    ),
+    seed: str = _seed_option(),
+    contact_offset: float = _contact_offset_option(),
+    domain_width: float = _domain_width_option(),
 ) -> None:
     """Scan Δneff along one direction at fine spacing (ticket 23).
 
@@ -921,10 +1180,15 @@ def probe_objective(
         teardown_containers,
     )
 
+    _check_geometry_knobs(seed, contact_offset, domain_width)
     components: PipelineComponents | None = None
     if use_containers:
         typer.echo("Starting tesseract Docker containers...")
-        components = init_tesseract_containers(mesh_dir=Path(mesh_path).parent)
+        components = init_tesseract_containers(
+            mesh_dir=Path(mesh_path).parent,
+            contact_offset=contact_offset,
+            domain_width=domain_width,
+        )
     try:
         _run_objective_probe(
             r_min=r_min,
@@ -937,6 +1201,10 @@ def probe_objective(
             use_containers=use_containers,
             components=components,
             cold=cold,
+            loss_weight=loss_weight,
+            seed=seed,
+            contact_offset=contact_offset,
+            domain_width=domain_width,
         )
     finally:
         if use_containers and components is not None:
@@ -969,6 +1237,10 @@ def _run_objective_probe(
     use_containers: bool,
     components: Any | None = None,
     cold: bool = False,
+    loss_weight: float = 0.0,
+    seed: str = "lateral",
+    contact_offset: float | None = None,
+    domain_width: float | None = None,
 ) -> ObjectiveLineScan:
     """Line-scan the bound pipeline around a design (ticket 23)."""
     import jax.numpy as jnp
@@ -986,7 +1258,16 @@ def _run_objective_probe(
     typer.echo("=== PRISMO Objective Line Scan ===")
     typer.echo()
     typer.echo("[1/2] Preparing pipeline inputs...")
-    inputs = build_pipeline_inputs(r_min, mesh_path, use_containers, components)
+    inputs = build_pipeline_inputs(
+        r_min,
+        mesh_path,
+        use_containers,
+        components,
+        seed=seed,
+        contact_offset=contact_offset,
+        domain_width=domain_width,
+    )
+    mode_overlap = _mode_overlap_if_weighted(inputs, components, loss_weight)
 
     rho = jnp.asarray(inputs.theta_init, dtype=jnp.float64)
     if design_path is not None:
@@ -1013,6 +1294,8 @@ def _run_objective_probe(
         design_transfer=inputs.design_transfer,
         design_nodes=inputs.design_nodes,
         components=components,
+        loss_weight=loss_weight,
+        mode_overlap=mode_overlap,
     )
 
     typer.echo(f"[2/2] Scanning along the {direction} direction...")

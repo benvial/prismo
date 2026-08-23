@@ -15,11 +15,25 @@ import jax.numpy as jnp  # noqa: E402
 from _doubles import stub_components as _stub_components  # noqa: E402
 from prismo.density_filter import assemble_filter_matrix  # noqa: E402
 from prismo.optimizer import optimize_doping  # noqa: E402
+from prismo.pipeline import PipelineTerms  # noqa: E402
 
 RNG = np.random.default_rng(0)
 jax.config.update("jax_enable_x64", True)
 
 N_NODES = 16
+
+
+def _with_terms(objective_fn):
+    """Wrap a scalar objective mock into the ``(objective, terms)`` seam (ticket 25).
+
+    The mock's value doubles as Δneff.
+    """
+
+    def mock_pipeline_with_terms(rho, **kwargs):
+        value = objective_fn(rho, **kwargs)
+        return value, PipelineTerms(delta_neff=value, modal_loss_db_cm=jnp.nan)
+
+    return mock_pipeline_with_terms
 
 
 def _grid_coords(n: int = 4, spacing: float = 20e-9) -> np.ndarray:
@@ -123,8 +137,8 @@ class TestOptimizeDopingAnalytical:
             return -jnp.sum(diff**2)
 
         with mock.patch(
-            "prismo.optimizer.pipeline",
-            side_effect=mock_pipeline,
+            "prismo.optimizer.pipeline_with_terms",
+            side_effect=_with_terms(mock_pipeline),
         ) as mock_pipe:
             rho_opt, _ = optimize_doping(
                 initial_rho=rho_initial,
@@ -143,8 +157,8 @@ class TestOptimizeDopingAnalytical:
             return -jnp.sum((rho - target) ** 2)
 
         with mock.patch(
-            "prismo.optimizer.pipeline",
-            side_effect=mock_pipeline,
+            "prismo.optimizer.pipeline_with_terms",
+            side_effect=_with_terms(mock_pipeline),
         ) as mock_pipe:
             _, history = optimize_doping(
                 initial_rho=rho_initial,
@@ -162,8 +176,8 @@ class TestOptimizeDopingAnalytical:
             return -jnp.sum((rho - target) ** 2)
 
         with mock.patch(
-            "prismo.optimizer.pipeline",
-            side_effect=mock_pipeline,
+            "prismo.optimizer.pipeline_with_terms",
+            side_effect=_with_terms(mock_pipeline),
         ):
             _, history = optimize_doping(
                 initial_rho=rho_initial,
@@ -396,7 +410,7 @@ class TestOptimizeDopingSurvivesSolverFailure:
                 raise RuntimeError("Julia forward solve failed: ConvergenceError()")
             return -jnp.sum((rho - target_j) ** 2)
 
-        with mock.patch("prismo.optimizer.pipeline", side_effect=mock_pipeline):
+        with mock.patch("prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(mock_pipeline)):
             rho_opt, history = optimize_doping(
                 initial_rho=np.full(self.N_NODES, 0.25, dtype=float),
                 max_iter=60,
@@ -430,7 +444,7 @@ class TestOptimizeDopingSurvivesSolverFailure:
             return jnp.asarray(1.0, dtype=jnp.float64) - jnp.sum(rho**2) * 0.0
 
         seed = np.full(self.N_NODES, 0.25, dtype=float)
-        with mock.patch("prismo.optimizer.pipeline", side_effect=mock_pipeline):
+        with mock.patch("prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(mock_pipeline)):
             rho_opt, history = optimize_doping(
                 initial_rho=seed,
                 max_iter=100,
@@ -449,7 +463,7 @@ class TestOptimizeDopingSurvivesSolverFailure:
             raise RuntimeError("Julia forward solve failed: ConvergenceError()")
 
         with (
-            mock.patch("prismo.optimizer.pipeline", side_effect=mock_pipeline),
+            mock.patch("prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(mock_pipeline)),
             pytest.raises(RuntimeError, match="ConvergenceError"),
         ):
             optimize_doping(
@@ -468,7 +482,7 @@ class TestOptimizeDopingSurvivesSolverFailure:
             # is the degenerate loop observed against the real containers.
             return jnp.asarray(1.0, dtype=jnp.float64)
 
-        with mock.patch("prismo.optimizer.pipeline", side_effect=mock_pipeline):
+        with mock.patch("prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(mock_pipeline)):
             rho_opt, _ = optimize_doping(
                 initial_rho=np.full(self.N_NODES, 0.25, dtype=float),
                 max_iter=500,
@@ -500,7 +514,7 @@ class TestMoveLimit:
         move_limit = 0.07
 
         with mock.patch(
-            "prismo.optimizer.pipeline", side_effect=self._quadratic(target)
+            "prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(self._quadratic(target))
         ):
             rho_opt, history = optimize_doping(
                 initial_rho=np.zeros(self.N_NODES),
@@ -536,7 +550,7 @@ class TestMoveLimit:
     def test_bounds_still_hold_at_the_rails(self):
         target = np.full(self.N_NODES, 3.0)
         with mock.patch(
-            "prismo.optimizer.pipeline", side_effect=self._quadratic(target)
+            "prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(self._quadratic(target))
         ):
             rho_opt, _ = optimize_doping(
                 initial_rho=np.full(self.N_NODES, 0.9),
@@ -567,7 +581,7 @@ class TestCheckpoint:
                 len(json.loads(path.read_text())["history"]) if path.exists() else 0
             )
 
-        with mock.patch("prismo.optimizer.pipeline", side_effect=mock_pipeline):
+        with mock.patch("prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(mock_pipeline)):
             rho_opt, history = optimize_doping(
                 initial_rho=np.full(self.N_NODES, 0.25, dtype=float),
                 max_iter=6,
@@ -590,3 +604,81 @@ class TestCheckpoint:
             components=_stub_components(),
         )
         assert not (tmp_path / "outputs").exists()
+
+
+class TestLossAwareObjective:
+    """Ticket 25: the optimizer drives ``delta_neff - w * loss`` and records both."""
+
+    N = 6
+
+    @staticmethod
+    def _components():
+        def ct(doping, bias_voltage, mesh_ref=None):
+            # Carriers follow |doping|; reverse bias depletes a fixed fraction.
+            n = jnp.abs(doping) + 1e15
+            p = 0.1 * n
+            if bias_voltage != 0.0:
+                return 0.5 * n, 0.5 * p
+            return n, p
+
+        return _stub_components(chargetransport=ct)
+
+    def test_history_records_objective_delta_neff_and_loss(self, tmp_path):
+        rho0 = np.full(self.N, 0.3)
+        overlap = np.full(self.N, 1.0 / self.N)
+        w = 1e-6
+        _, history = optimize_doping(
+            rho0,
+            max_iter=3,
+            components=self._components(),
+            loss_weight=w,
+            mode_overlap=overlap,
+            checkpoint_path=tmp_path / "checkpoint.json",
+        )
+        for entry in history:
+            assert np.isfinite(entry["modal_loss_db_cm"])
+            assert entry["modal_loss_db_cm"] > 0.0
+            assert entry["objective"] == pytest.approx(
+                entry["delta_n_eff"] - w * entry["modal_loss_db_cm"]
+            )
+        # The checkpoint carries the same keys and stays valid JSON.
+        saved = json.loads((tmp_path / "checkpoint.json").read_text())
+        assert saved["history"][0]["modal_loss_db_cm"] == pytest.approx(
+            history[0]["modal_loss_db_cm"]
+        )
+
+    def test_without_overlap_the_loss_is_unreported_and_objective_is_delta_neff(
+        self, tmp_path
+    ):
+        rho0 = np.full(self.N, 0.3)
+        _, history = optimize_doping(
+            rho0,
+            max_iter=2,
+            components=self._components(),
+            checkpoint_path=tmp_path / "checkpoint.json",
+        )
+        for entry in history:
+            assert entry["modal_loss_db_cm"] is None
+            assert entry["objective"] == entry["delta_n_eff"]
+        saved = json.loads((tmp_path / "checkpoint.json").read_text())
+        assert saved["history"][0]["modal_loss_db_cm"] is None
+
+    def test_loss_penalty_changes_the_accepted_steps(self):
+        """A large loss weight must pull the design away from the pure-Δneff path."""
+        rho0 = np.full(self.N, 0.3)
+        overlap = np.full(self.N, 1.0 / self.N)
+        rho_free, _ = optimize_doping(
+            rho0, max_iter=4, components=self._components(), move_limit=0.1
+        )
+        rho_pen, history = optimize_doping(
+            rho0,
+            max_iter=4,
+            components=self._components(),
+            move_limit=0.1,
+            loss_weight=1.0,  # dominant: every step is judged on loss
+            mode_overlap=overlap,
+        )
+        assert not np.allclose(rho_free, rho_pen)
+        # Accepted steps improve the *objective*, i.e. lower the loss here.
+        objectives = [h["objective"] for h in history]
+        assert max(objectives) >= objectives[0]
