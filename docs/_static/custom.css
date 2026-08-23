@@ -81,3 +81,14 @@ html pre.mermaid [id$="-filled-head"] path {
 .logo-homepage img {
   height: 110px;
 }
+
+/* README badge row on the landing page */
+p.badges {
+    text-align: left;
+    line-height: 2.2;
+    margin: 0.5rem 0 1.5rem;
+}
+p.badges img {
+    vertical-align: middle;
+    margin: 0 2px;
+}
