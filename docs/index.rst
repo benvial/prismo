@@ -20,20 +20,6 @@
     :doc:`Results <results>`
     `GitHub <https://github.com/benvial/prismo>`_
 
-.. raw:: html
-
-    <p class="badges">
-      <a href="https://github.com/benvial/prismo/actions/workflows/test.yaml"><img alt="Tests" src="https://img.shields.io/github/actions/workflow/status/benvial/prismo/test.yaml?branch=main&style=for-the-badge&label=tests&logo=githubactions&logoColor=white&labelColor=1c2024"></a>
-      <a href="https://github.com/benvial/prismo/actions/workflows/pre_commit.yml"><img alt="Lint" src="https://img.shields.io/github/actions/workflow/status/benvial/prismo/pre_commit.yml?branch=main&style=for-the-badge&label=lint&logo=ruff&logoColor=white&labelColor=1c2024"></a>
-      <a href="https://benvial.github.io/prismo/"><img alt="Docs" src="https://img.shields.io/github/actions/workflow/status/benvial/prismo/docs.yaml?branch=main&style=for-the-badge&label=docs&logo=sphinx&logoColor=white&labelColor=1c2024"></a>
-      <a href="https://mybinder.org/v2/gh/benvial/prismo/main?urlpath=lab/tree/notebooks/prismo.ipynb"><img alt="Launch on Binder" src="https://img.shields.io/badge/binder-launch-00a2c7?style=for-the-badge&logo=jupyter&logoColor=white&labelColor=1c2024"></a>
-      <br>
-      <a href="https://pasteurlabs.ai/tesseract-hackathon-2026/"><img alt="Tesseract Hackathon 2026" src="https://img.shields.io/badge/Tesseract_Hackathon-2026-00a2c7?style=for-the-badge&labelColor=1c2024"></a>
-      <a href="https://github.com/pasteurlabs/tesseract-core"><img alt="tesseract-core 1.11" src="https://img.shields.io/badge/tesseract--core-1.11-00a2c7?style=for-the-badge&labelColor=1c2024"></a>
-      <a href="https://github.com/benvial/prismo/blob/main/app/pyproject.toml"><img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10+-00a2c7?style=for-the-badge&logo=python&logoColor=white&labelColor=1c2024"></a>
-      <a href="https://github.com/benvial/prismo/blob/main/LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache_2.0-00a2c7?style=for-the-badge&labelColor=1c2024"></a>
-    </p>
-
 .. grid:: 1 1 2 3
    :gutter: 2
    :padding: 0
