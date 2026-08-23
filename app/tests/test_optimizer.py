@@ -682,3 +682,53 @@ class TestLossAwareObjective:
         # Accepted steps improve the *objective*, i.e. lower the loss here.
         objectives = [h["objective"] for h in history]
         assert max(objectives) >= objectives[0]
+
+
+class TestDesignHistoryCheckpoint:
+    """Every history record carries the design it evaluated (replayable run)."""
+
+    N = 4
+
+    def test_each_record_carries_its_design(self, tmp_path):
+        target = jnp.full(self.N, 0.8)
+
+        def mock_pipeline(rho, **kwargs):
+            return -jnp.sum((rho - target) ** 2)
+
+        with mock.patch(
+            "prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(mock_pipeline)
+        ):
+            _, history = optimize_doping(
+                initial_rho=np.full(self.N, 0.25),
+                max_iter=4,
+                use_jit=False,
+                checkpoint_path=tmp_path / "checkpoint.json",
+            )
+        np.testing.assert_allclose(history[0]["design"], np.full(self.N, 0.25))
+        saved = json.loads((tmp_path / "checkpoint.json").read_text())
+        for entry, saved_entry in zip(history, saved["history"], strict=True):
+            assert len(saved_entry["design"]) == self.N
+            np.testing.assert_allclose(saved_entry["design"], entry["design"])
+
+    def test_failed_evaluations_write_no_record(self, tmp_path):
+        target = jnp.full(self.N, 0.8)
+        calls = {"n": 0}
+
+        def mock_pipeline(rho, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise RuntimeError("Julia forward solve failed")
+            return -jnp.sum((rho - target) ** 2)
+
+        with mock.patch(
+            "prismo.optimizer.pipeline_with_terms", side_effect=_with_terms(mock_pipeline)
+        ):
+            _, history = optimize_doping(
+                initial_rho=np.full(self.N, 0.25),
+                max_iter=5,
+                use_jit=False,
+                checkpoint_path=tmp_path / "checkpoint.json",
+            )
+        assert calls["n"] > 3
+        assert len(history) == calls["n"] - 1
+        assert all("design" in entry for entry in history)

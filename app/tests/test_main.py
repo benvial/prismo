@@ -1474,3 +1474,204 @@ def test_local_geometry_rejects_contacts_outside_the_box() -> None:
         main_module._local_geometry(
             RibWaveguideGeometry, None, contact_offset=1.5, domain_width=3.0
         )
+
+
+# ---------------------------------------------------------------------------
+# Doping animation: from the run, and replayed from a checkpoint
+# ---------------------------------------------------------------------------
+
+
+def test_run_hands_per_iteration_doping_frames_to_the_outputs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Each record's design is filtered, scattered and mapped, one frame each."""
+    import prismo.main as main_module
+    import prismo.optimizer as optimizer_module
+    import prismo.outputs as outputs_module
+    import prismo.waveguide_mesh as mesh_module
+    from prismo.pipeline import doping_from_theta
+
+    coords = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+    output_captured: dict[str, object] = {}
+    designs = [[0.3, 0.3, -0.3], [0.35, 0.25, -0.3], [0.4, 0.2, -0.3]]
+    history = [
+        {"iteration": i + 1, "delta_n_eff": 1e-3 * (i + 1), "objective": 1e-3 * (i + 1),
+         "design": d, "delta_rho": 0.0, "grad_norm": 1e-4, "wall_time": 0.1}
+        for i, d in enumerate(designs)
+    ]
+    # One legacy record without a design: skipped, not fatal.
+    history.insert(1, {"iteration": 99, "delta_n_eff": 5e-4, "delta_rho": 0.0,
+                       "grad_norm": 1e-4, "wall_time": 0.1})
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        optimizer_module,
+        "optimize_doping",
+        lambda **kwargs: (np.asarray(designs[-1]), history),
+    )
+    monkeypatch.setattr(
+        outputs_module,
+        "generate_outputs",
+        lambda **kwargs: (output_captured.update(kwargs) or []),
+    )
+    _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
+
+    main_module._run_pipeline(
+        r_min=50e-9,
+        max_iter=3,
+        ftol_rel=1e-5,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        no_jit=True,
+        use_containers=True,
+        components=_container_components([[0.5, 0.0], [1.5, 0.0]]),
+    )
+
+    frames = output_captured["design_history"]
+    assert len(frames) == 3
+    assert [h["iteration"] for h in output_captured["animation_history"]] == [1, 2, 3]
+    # r_min = 50e-9 µm on a 1 µm pitch: the filter is the identity, so the
+    # frame is the doping map of the design itself.
+    np.testing.assert_allclose(frames[0], np.asarray(doping_from_theta(np.asarray(designs[0]))))
+
+
+def test_animate_replays_a_checkpoint_without_any_solver(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import json
+
+    import prismo.main as main_module
+    import prismo.waveguide_mesh as mesh_module
+
+    coords = _rib_coords()
+    n = coords.shape[0]
+    rng = np.random.default_rng(1)
+    history = [
+        {"iteration": i + 1, "delta_n_eff": 1e-4 * (i + 1), "objective": 1e-4 * (i + 1),
+         "modal_loss_db_cm": 10.0 + i, "design": rng.uniform(-1, 1, n).tolist(),
+         "delta_rho": 0.0, "grad_norm": 1e-4, "wall_time": 0.1}
+        for i in range(3)
+    ]
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(json.dumps({"rho_opt": history[-1]["design"], "history": history}))
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        mesh_module,
+        "read_mesh_silicon_triangulation",
+        lambda _: np.empty((0, 3), dtype=np.intp),
+    )
+
+    paths = main_module._run_animate(
+        checkpoint_path=str(checkpoint),
+        mesh_path=str(tmp_path / "mesh.msh"),
+        r_min=0.1,
+        output_dir=str(tmp_path),
+        fps=4,
+        formats=("gif",),
+    )
+    assert [p.name for p in paths] == ["doping_evolution.gif"]
+    assert paths[0].stat().st_size > 0
+
+
+def test_animate_rejects_a_checkpoint_from_another_mesh(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import json
+
+    import prismo.main as main_module
+    import prismo.waveguide_mesh as mesh_module
+
+    coords = _rib_coords()
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(json.dumps({
+        "rho_opt": [0.0] * 5,
+        "history": [{"iteration": 1, "delta_n_eff": 0.0, "design": [0.0] * 5}],
+    }))
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        mesh_module,
+        "read_mesh_silicon_triangulation",
+        lambda _: np.empty((0, 3), dtype=np.intp),
+    )
+    with pytest.raises(ValueError, match="design variables"):
+        main_module._run_animate(
+            checkpoint_path=str(checkpoint),
+            mesh_path=str(tmp_path / "mesh.msh"),
+            r_min=0.1,
+            output_dir=str(tmp_path),
+            formats=("gif",),
+        )
+
+
+def test_animate_reports_a_legacy_checkpoint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    import prismo.main as main_module
+
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(json.dumps({
+        "rho_opt": [0.0], "history": [{"iteration": 1, "delta_n_eff": 0.0}],
+    }))
+    assert main_module._run_animate(
+        checkpoint_path=str(checkpoint),
+        mesh_path=str(tmp_path / "mesh.msh"),
+        r_min=0.1,
+        output_dir=str(tmp_path),
+    ) == []
+    assert "no per-iteration designs" in capsys.readouterr().out
+
+
+def test_cli_animate_help() -> None:
+    main_module = import_module("prismo.main")
+    result = runner.invoke(main_module.app, ["animate", "--help"])
+    assert result.exit_code == 0, result.output
+    for flag in ("--checkpoint", "--fps", "--format"):
+        assert flag in result.stdout
+
+
+def test_run_hands_the_swept_carriers_to_the_outputs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The depletion figure gets (n+p)(V) - (n+p)(0) at the reported design."""
+    import prismo.main as main_module
+    import prismo.optimizer as optimizer_module
+    import prismo.outputs as outputs_module
+    import prismo.waveguide_mesh as mesh_module
+    from prismo.pipeline import doping_from_theta
+
+    coords = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+    output_captured: dict[str, object] = {}
+    history = [{"iteration": 1, "delta_n_eff": 1e-3, "objective": 1e-3,
+                "design": [0.3, 0.3, -0.3], "delta_rho": 0.0, "grad_norm": 1e-4,
+                "wall_time": 0.1}]
+    components = _solve_components_with_reset(
+        _container_components([[0.5, 0.0], [1.5, 0.0]]), []
+    )
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        optimizer_module, "optimize_doping",
+        lambda **kwargs: (np.asarray([0.3, 0.3, -0.3]), history),
+    )
+    monkeypatch.setattr(
+        outputs_module, "generate_outputs",
+        lambda **kwargs: (output_captured.update(kwargs) or []),
+    )
+    _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
+
+    main_module._run_pipeline(
+        r_min=50e-9, max_iter=1, ftol_rel=1e-5,
+        mesh_path=str(tmp_path / "mesh.msh"), output_dir=str(tmp_path),
+        no_jit=True, use_containers=True, components=components,
+    )
+    # Identity-carrier doubles: n = p = doping at both biases, so nothing is swept.
+    swept = output_captured["swept_carriers"]
+    assert swept is not None and swept.shape == (3,)
+    np.testing.assert_allclose(swept, 0.0)
+    assert np.any(np.asarray(doping_from_theta(np.asarray([0.3, 0.3, -0.3]))) != 0.0)

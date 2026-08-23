@@ -1,4 +1,4 @@
-.PHONY: help new build julia-base images test gen-tests data run run-containers validate-gradient validate-gradient-containers probe-objective probe-objective-containers benchmark clean
+.PHONY: help new build julia-base images test gen-tests data run run-containers validate-gradient validate-gradient-containers probe-objective probe-objective-containers animate benchmark clean
 
 PYTHON ?= python
 
@@ -17,6 +17,7 @@ help:
 	@echo "  validate-gradient-containers  - Validate the gradient across the real CT + gyptis boundary"
 	@echo "  probe-objective               - Line-scan the objective along one direction (smoothness probe)"
 	@echo "  probe-objective-containers    - Same, across the real CT + gyptis boundary"
+	@echo "  animate                       - Replay outputs/checkpoint.json as a doping-field animation (no solver)"
 	@echo "  benchmark                     - Record cold/warm multiphysics callback timings"
 	@echo "  clean                         - Remove build artifacts, caches, and temp files"
 
@@ -215,6 +216,10 @@ probe-objective:
 probe-objective-containers:
 	@echo "Scanning the objective across the real CT + gyptis boundary..."
 	@PYTHONPATH=app:components/shared_code:$${PYTHONPATH} $(PYTHON) -m prismo.main probe-objective --use-containers $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
+
+animate:
+	@echo "Animating the doping field from the checkpoint..."
+	@PYTHONPATH=app:components/shared_code:$${PYTHONPATH} $(PYTHON) -m prismo.main animate $(if $(RUN_ARGS),$(RUN_ARGS),$(filter-out $@,$(MAKECMDGOALS)))
 
 benchmark:
 	@echo "Benchmarking multiphysics optimization callbacks..."

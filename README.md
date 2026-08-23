@@ -133,6 +133,9 @@ $ make probe-objective-containers RUN_ARGS="--design outputs/checkpoint.json"
 # start from a U-shaped junction, and move the contacts 0.5 µm from the rib
 $ make run-containers RUN_ARGS="--loss-weight 1e-6 --seed u --contact-offset 0.5"
 
+# Replay a finished (or killed) run's doping field as an animation, from its checkpoint alone
+$ make animate
+
 # Clean build artifacts and caches
 $ make clean
 ```
@@ -145,6 +148,16 @@ Every run reports the modal free-carrier loss of the reported design (dB/cm,
 first-order overlap-weighted Soref–Bennett absorption at 0 V) and the
 literature's `VπLπ × α` figure of merit (V·dB) next to VπLπ; `--loss-weight`
 puts the loss into the objective. See *Modal loss* in [CONTEXT.md](CONTEXT.md).
+
+**Figures** (`outputs/`): `convergence.pdf` (Δneff + VπLπ), `doping_field.pdf`
+(initial vs optimized θ), `gradient_validation.pdf`, `mode_field.pdf`,
+`depletion_field.pdf` (the carriers swept out between 0 V and −5 V at the
+optimum, under the mode's |E| contours — where the modulation happens); a
+loss-aware run adds `loss_convergence.pdf` (α + VπLπ·α vs iteration) and
+`tradeoff.pdf` (the optimizer's path in the (α, Δneff) plane against iso-V·dB
+curves); every run writes `doping_evolution.{gif,mp4}` — the net doping at
+every evaluation, rejected trials labelled — and the per-iteration designs
+live in `checkpoint.json`, so `prismo animate` can rebuild it later.
 
 ## Adding regression test cases
 

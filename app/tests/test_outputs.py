@@ -102,29 +102,116 @@ class TestConvergencePlot:
             assert plot_convergence(history, output_dir=tmp).exists()
 
 
-    def test_draws_a_loss_panel_when_the_history_carries_a_loss(self):
-        """Ticket 25: modal loss [dB/cm] and VπLπ·alpha [V·dB] get their own panel."""
-        history = _make_history()
-        for i, entry in enumerate(history):
-            entry["modal_loss_db_cm"] = 300.0 - 10.0 * i
-            entry["objective"] = entry["delta_n_eff"] - 1e-6 * entry["modal_loss_db_cm"]
-        with tempfile.TemporaryDirectory() as tmp:
-            path = plot_convergence(history, output_dir=tmp)
-            assert path.exists()
-        # The panel reads the loss series through the same helper the figure uses.
+    def test_loss_series_reads_only_evaluated_losses(self):
         from prismo.outputs import history_loss_series
 
+        history = _make_loss_history()
         iters, losses = history_loss_series(history)
         assert iters == list(range(1, 11))
         assert losses[0] == pytest.approx(300.0)
-
-    def test_no_loss_panel_without_loss_entries(self):
-        from prismo.outputs import history_loss_series
-
         assert history_loss_series(_make_history()) == ([], [])
-        history = _make_history()
         history[0]["modal_loss_db_cm"] = None
-        assert history_loss_series(history) == ([], [])
+        assert history_loss_series(history)[0] == list(range(2, 11))
+
+
+def _make_loss_history() -> list[dict]:
+    """A history whose loss falls while Δneff rises (ticket 25)."""
+    history = _make_history()
+    for i, entry in enumerate(history):
+        entry["modal_loss_db_cm"] = 300.0 - 10.0 * i
+        entry["objective"] = entry["delta_n_eff"] - 1e-6 * entry["modal_loss_db_cm"]
+    return history
+
+
+class TestLossFigures:
+    """Loss history and the Δneff-vs-loss trade-off get their own figures."""
+
+    def test_loss_convergence_pdf(self):
+        from prismo.outputs import plot_loss_convergence
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = plot_loss_convergence(_make_loss_history(), output_dir=tmp)
+            assert path.exists() and path.name == "loss_convergence.pdf"
+
+    def test_loss_convergence_without_loss_returns_none(self):
+        from prismo.outputs import plot_loss_convergence
+
+        with tempfile.TemporaryDirectory() as tmp:
+            assert plot_loss_convergence(_make_history(), output_dir=tmp) is None
+
+    def test_tradeoff_pdf_and_its_iso_fom_curves(self):
+        from prismo.outputs import iso_fom_delta_neff, plot_tradeoff
+
+        # VπLπ·alpha = const: Δneff = |V|·λ·alpha / (2·FOM).
+        dneff = iso_fom_delta_neff(np.asarray([100.0]), fom_v_db=20.0)
+        assert dneff[0] == pytest.approx(5.0 * 1.55e-4 * 100.0 / (2.0 * 20.0))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = plot_tradeoff(_make_loss_history(), output_dir=tmp)
+            assert path.exists() and path.name == "tradeoff.pdf"
+            assert plot_tradeoff(_make_history(), output_dir=tmp) is None
+
+    def test_tradeoff_survives_a_zero_or_negative_delta_neff(self):
+        from prismo.outputs import plot_tradeoff
+
+        history = _make_loss_history()
+        history[0]["delta_n_eff"] = 0.0
+        history[1]["delta_n_eff"] = -1e-5
+        with tempfile.TemporaryDirectory() as tmp:
+            assert plot_tradeoff(history, output_dir=tmp).exists()
+
+
+class TestDepletionFigure:
+    def test_writes_swept_carriers_with_mode_contours(self):
+        from prismo.outputs import plot_depletion_field
+
+        coords = _make_coords()
+        swept = -RNG.uniform(0.0, 1e17, N_NODES)
+        mode = ModeField(abs_e=np.linspace(0.0, 1.0, N_NODES), coords_um=coords)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = plot_depletion_field(swept, coords, mode_field=mode, output_dir=tmp)
+            assert path.exists() and path.name == "depletion_field.pdf"
+            # Without a mode the figure still draws the swept carriers.
+            assert plot_depletion_field(swept, coords, output_dir=tmp).exists()
+
+
+class TestDopingAnimation:
+    def test_writes_a_gif_one_frame_per_design(self):
+        from prismo.outputs import animate_doping_evolution
+
+        coords = _make_coords()
+        n = coords.shape[0]
+        rng = np.random.default_rng(0)
+        designs = [rng.uniform(-1, 1, n) for _ in range(4)]
+        history = _make_history()[:4]
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = animate_doping_evolution(
+                designs,
+                history,
+                coords,
+                output_dir=tmp,
+                fps=4,
+                formats=("gif",),
+            )
+            assert [p.name for p in paths] == ["doping_evolution.gif"]
+            assert paths[0].stat().st_size > 0
+
+    def test_requires_one_history_entry_per_design(self):
+        from prismo.outputs import animate_doping_evolution
+
+        coords = _make_coords()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            pytest.raises(ValueError, match="history"),
+        ):
+            animate_doping_evolution(
+                [np.zeros(coords.shape[0])], _make_history()[:2], coords, output_dir=tmp
+            )
+
+    def test_empty_designs_write_nothing(self):
+        from prismo.outputs import animate_doping_evolution
+
+        with tempfile.TemporaryDirectory() as tmp:
+            assert animate_doping_evolution([], [], _make_coords(), output_dir=tmp) == []
 
 
 class TestDopingFieldPlot:
@@ -412,6 +499,36 @@ class TestGenerateOutputs:
                 "convergence.pdf",
                 "doping_field.pdf",
             }
+
+    def test_emits_loss_figures_and_animation_when_available(self):
+        """With a loss in the history and per-iteration designs, the set grows."""
+        coords = _make_coords()
+        history = _make_loss_history()[:3]
+        designs = [RNG.uniform(-1, 1, N_NODES) for _ in range(3)]
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = generate_outputs(
+                np.full(N_NODES, 0.25), RNG.random(N_NODES), history,
+                coords, output_dir=tmp,
+                design_history=designs,
+                animation_formats=("gif",),
+            )
+            assert {path.name for path in paths} == {
+                "convergence.pdf",
+                "loss_convergence.pdf",
+                "tradeoff.pdf",
+                "doping_field.pdf",
+                "doping_evolution.gif",
+            }
+
+    def test_emits_the_depletion_figure_when_carriers_are_given(self):
+        coords = _make_coords()
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = generate_outputs(
+                np.full(N_NODES, 0.25), RNG.random(N_NODES), _make_history(),
+                coords, output_dir=tmp,
+                swept_carriers=-RNG.uniform(0.0, 1e17, N_NODES),
+            )
+            assert "depletion_field.pdf" in {path.name for path in paths}
 
     def test_custom_directions(self):
         import jax.numpy as jnp

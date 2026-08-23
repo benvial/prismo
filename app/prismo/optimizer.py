@@ -267,12 +267,16 @@ def optimize_doping(
         # weight is zero); the two physical terms ride alongside so the
         # trade-off is visible per iteration. A loss that was not evaluated
         # (no mode-overlap weights) is ``None``, which JSON can carry.
+        # ``design`` is the evaluated design vector itself, so the checkpoint
+        # can replay the run (``prismo animate``) without re-solving anything;
+        # a failed solve writes no record, so every record has its design.
         history.append(
             {
                 "iteration": iter_count,
                 "objective": f_val,
                 "delta_n_eff": delta_neff,
                 "modal_loss_db_cm": loss_db_cm if np.isfinite(loss_db_cm) else None,
+                "design": np.asarray(rho_np, dtype=float).tolist(),
                 "delta_rho": delta_rho,
                 "max_step": max_step,
                 "move_limit": delta,
@@ -438,7 +442,9 @@ def _save_checkpoint(
     """Save optimization progress (best design + history) to ``path``.
 
     Written after every evaluation (ticket 19), so a killed run still yields a
-    convergence figure and a design to plot.
+    convergence figure and a design to plot; each history record carries its
+    evaluated ``design``, so ``prismo animate`` can replay the run from the
+    checkpoint alone.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

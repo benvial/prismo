@@ -17,6 +17,7 @@ from prismo.pipeline import (  # noqa: E402
     NEPER_TO_DB,
     SEED_KINDS,
     PipelineTerms,
+    doping_from_theta,
     free_carrier_absorption_cm,
     loss_figure_of_merit_v_db,
     modal_loss_db_cm,
@@ -286,3 +287,25 @@ class TestReadModeOverlap:
         )
         np.testing.assert_allclose(weights, [0.1, 0.2, 0.7])
         assert backgrounds == [12.0]
+
+
+class TestCarrierFields:
+    def test_returns_both_bias_states_in_cm3_full_node_order(self):
+        from prismo.pipeline import REVERSE_BIAS_V, carrier_fields
+
+        biases = []
+
+        def ct(doping, bias_voltage, mesh_ref=None):
+            biases.append(bias_voltage)
+            scale = 1.0 if bias_voltage == 0.0 else 0.5
+            return scale * jnp.abs(doping), 2.0 * scale * jnp.abs(doping)
+
+        components = stub_components(chargetransport=ct)
+        theta = jnp.asarray([0.3, -0.3])
+        n0, p0, n1, p1 = carrier_fields(theta, components=components)
+        assert sorted(biases) == [REVERSE_BIAS_V, 0.0]
+        doping = np.abs(np.asarray(doping_from_theta(theta)))
+        np.testing.assert_allclose(np.asarray(n0), doping)
+        np.testing.assert_allclose(np.asarray(p0), 2.0 * doping)
+        np.testing.assert_allclose(np.asarray(n1), 0.5 * doping)
+        np.testing.assert_allclose(np.asarray(p1), doping)

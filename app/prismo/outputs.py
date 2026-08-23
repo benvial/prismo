@@ -4,13 +4,15 @@ Ref: rethink ticket 07 — the headline figure set. ``generate_outputs`` emits
 four: the MMA convergence curve carrying both the optimized signed Δneff and
 the reported VπLπ, the adjoint-vs-finite-difference gradient validation
 (ticket 06), the initial-vs-optimized signed θ field, and the optical mode |E|
-on the rib cross-section. Panels that serve none of those were dropped.
+on the rib cross-section. Panels that serve none of those were dropped. A
+loss-aware run (ticket 25) adds the loss history, the Δneff-vs-loss trade-off
+plane, and an animation of the doping field over the optimizer's evaluations.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -154,24 +156,43 @@ def history_loss_series(history: list[dict]) -> tuple[list[int], list[float]]:
     return iters, losses
 
 
-def _plot_loss_panel(ax: plt.Axes, history: list[dict]) -> None:
-    """Modal loss [dB/cm] and the VπLπ·alpha figure of merit [V·dB] vs iteration."""
+def _history_fom_series(history: list[dict]) -> list[tuple[int, float]]:
+    """``(iteration, VπLπ·alpha)`` for every entry with a finite figure of merit."""
     from prismo.pipeline import loss_figure_of_merit_v_db
 
-    iters, losses = history_loss_series(history)
     by_iter = {int(h["iteration"]): h for h in history}
+    iters, losses = history_loss_series(history)
+    fom = [
+        (i, loss_figure_of_merit_v_db(by_iter[i]["delta_n_eff"], loss))
+        for i, loss in zip(iters, losses, strict=True)
+    ]
+    return [(i, v) for i, v in fom if np.isfinite(v)]
+
+
+def plot_loss_convergence(
+    history: list[dict],
+    output_dir: str | Path | None = None,
+) -> Path | None:
+    """Modal loss [dB/cm] and the VπLπ·alpha figure of merit [V·dB] vs iteration.
+
+    The companion of :func:`plot_convergence` for the loss axis of ticket 25:
+    the free-carrier loss of the unbiased device at every evaluation, and the
+    literature's efficiency-loss figure of merit on a twin axis. Returns
+    ``None`` (writes nothing) when the history carries no evaluated loss.
+    """
+    iters, losses = history_loss_series(history)
+    if not iters:
+        return None
+    out = _ensure_output_dir(output_dir)
+    fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot(
         iters, losses, "o-", markersize=3, color="#d7191c",
         label=r"modal loss $\alpha$ (0 V)",
     )
     ax.set_ylabel(r"$\alpha$ [dB/cm]", color="#d7191c")
     ax.tick_params(axis="y", labelcolor="#d7191c")
-    fom = [
-        (i, loss_figure_of_merit_v_db(by_iter[i]["delta_n_eff"], loss))
-        for i, loss in zip(iters, losses, strict=True)
-    ]
-    finite = [(i, v) for i, v in fom if np.isfinite(v)]
     handles, labels = ax.get_legend_handles_labels()
+    finite = _history_fom_series(history)
     if finite:
         ax_fom = ax.twinx()
         ax_fom.plot(
@@ -188,7 +209,84 @@ def _plot_loss_panel(ax: plt.Axes, history: list[dict]) -> None:
         handles, labels = handles + extra_handles, labels + extra_labels
     ax.legend(handles, labels, loc="best")
     ax.set_xlabel("Iteration")
+    ax.set_title("Modal loss and figure of merit")
     ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    path = out / "loss_convergence.pdf"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+# Iso-figure-of-merit guide curves on the trade-off figure, V·dB. The
+# literature's good depletion modulators sit at 10-30 V·dB.
+_TRADEOFF_ISO_FOM_V_DB: tuple[float, ...] = (10.0, 30.0, 100.0, 300.0)
+
+
+def iso_fom_delta_neff(loss_db_cm: np.ndarray, fom_v_db: float) -> np.ndarray:
+    """Δneff along the curve ``VπLπ·alpha = fom``: ``|V|·λ·alpha / (2·fom)``."""
+    from prismo.pipeline import _WAVELENGTH_CM, REVERSE_BIAS_V
+
+    return abs(REVERSE_BIAS_V) * _WAVELENGTH_CM * np.asarray(loss_db_cm) / (2.0 * fom_v_db)
+
+
+def plot_tradeoff(
+    history: list[dict],
+    output_dir: str | Path | None = None,
+) -> Path | None:
+    """The optimizer's path in the (modal loss, Δneff) plane (ticket 25).
+
+    Every evaluated design is a point, coloured by iteration and joined in
+    order, against iso-``VπLπ·alpha`` hyperbolae: a design moving up-left
+    trades loss for efficiency, and crossing below the 30 V·dB curve puts it
+    in the literature's band. Returns ``None`` when no loss was evaluated.
+    """
+    iters, losses = history_loss_series(history)
+    if not iters:
+        return None
+    by_iter = {int(h["iteration"]): h for h in history}
+    dneff = np.asarray([float(by_iter[i]["delta_n_eff"]) for i in iters])
+    loss = np.asarray(losses)
+    out = _ensure_output_dir(output_dir)
+
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+    loss_max = float(loss.max()) * 1.15 if loss.max() > 0 else 1.0
+    loss_grid = np.linspace(0.0, loss_max, 200)
+    # The frame is set by the trajectory; the guide curves are clipped to it
+    # and each label sits where its curve leaves the frame.
+    y_top = float(dneff.max()) * 1.15 if dneff.max() > 0 else 1.0
+    y_bottom = min(0.0, float(dneff.min()) * 1.15)
+    for fom in _TRADEOFF_ISO_FOM_V_DB:
+        curve = iso_fom_delta_neff(loss_grid, fom)
+        inside = curve <= y_top
+        if not np.any(inside):
+            continue
+        ax.plot(loss_grid, curve, color="0.6", linestyle=":", linewidth=1)
+        last = int(np.flatnonzero(inside)[-1])
+        ax.annotate(
+            f"{fom:g} V·dB", xy=(loss_grid[last], curve[last]), xytext=(-2, -2),
+            textcoords="offset points", ha="right", va="top", fontsize=8, color="0.4",
+        )
+    ax.plot(loss, dneff, "-", color="0.3", linewidth=1, alpha=0.6, zorder=2)
+    sc = ax.scatter(loss, dneff, c=iters, cmap="viridis", s=22, zorder=3)
+    ax.plot([loss[0]], [dneff[0]], marker="o", markersize=9, markerfacecolor="none",
+            markeredgecolor="#1a9641", linestyle="none", label="seed", zorder=4)
+    ax.plot([loss[-1]], [dneff[-1]], marker="*", markersize=13, color="#d7191c",
+            linestyle="none", label="last evaluation", zorder=4)
+    fig.colorbar(sc, ax=ax, label="Iteration")
+    ax.set_xlim(0.0, loss_max)
+    if y_top > y_bottom:
+        ax.set_ylim(y_bottom, y_top)
+    ax.set_xlabel(r"modal loss $\alpha$ (0 V) [dB/cm]")
+    ax.set_ylabel(r"$\Delta n_{\mathrm{eff}}$")
+    ax.set_title("Efficiency-loss trade-off")
+    ax.legend(loc="lower right")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    path = out / "tradeoff.pdf"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
 
 
 def plot_convergence(
@@ -199,8 +297,8 @@ def plot_convergence(
 ) -> Path:
     """Convergence plot: signed delta_n_eff and reported VpiLpi vs iteration.
 
-    When the history carries a modal loss (ticket 25) a second panel draws the
-    loss in dB/cm and the VπLπ·alpha figure of merit in V·dB.
+    The loss axis of a loss-aware run (ticket 25) is its own figure,
+    :func:`plot_loss_convergence`.
 
     Args:
         history: Per-iteration records from ``optimize_doping``.
@@ -214,14 +312,7 @@ def plot_convergence(
         Path to the saved figure.
     """
     out = _ensure_output_dir(output_dir)
-    with_loss = bool(history_loss_series(history)[0])
-    if with_loss:
-        fig, (ax, ax_loss) = plt.subplots(
-            2, 1, figsize=(6, 7), sharex=True, gridspec_kw={"height_ratios": [3, 2]}
-        )
-    else:
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax_loss = None
+    fig, ax = plt.subplots(figsize=(6, 4))
     ax_vpi = None
 
     if not history:
@@ -305,8 +396,6 @@ def plot_convergence(
         handles, labels = handles + extra_handles, labels + extra_labels
     ax.legend(handles, labels, loc="best")
     ax.grid(True, alpha=0.3)
-    if ax_loss is not None:
-        _plot_loss_panel(ax_loss, history)
     fig.tight_layout()
 
     path = out / "convergence.pdf"
@@ -432,6 +521,145 @@ def plot_live_doping_field(
     fig.savefig(path)
     plt.close(fig)
     return path
+
+
+def _zoom_to_silicon(
+    ax: plt.Axes, x: np.ndarray, y: np.ndarray, triangles: np.ndarray | None, pad: float = 0.15
+) -> None:
+    """Crop the vertical axis to the painted silicon (plus ``pad`` µm).
+
+    The shared mesh is mostly oxide and PML; the device is a thin strip, so a
+    full-domain frame spends most of its pixels on blank surroundings.
+    """
+    if triangles is None or not len(triangles):
+        return
+    nodes = np.unique(np.asarray(triangles).ravel())
+    ax.set_xlim(float(x[nodes].min()) - pad, float(x[nodes].max()) + pad)
+    ax.set_ylim(float(y[nodes].min()) - pad, float(y[nodes].max()) + pad)
+
+
+# Animation writers tried per requested format; a missing encoder skips that
+# format rather than failing the run (ffmpeg is a system tool, Pillow a dep).
+_ANIMATION_WRITERS: dict[str, str] = {"gif": "pillow", "mp4": "ffmpeg"}
+_DOPING_SYMLOG_LINTHRESH = 1e14
+
+
+def animate_doping_evolution(
+    doping_frames: Sequence[np.ndarray],
+    history: list[dict],
+    mesh_coords: np.ndarray,
+    geometry: object | None = None,
+    output_dir: str | Path | None = None,
+    triangles: np.ndarray | None = None,
+    fps: int = 6,
+    formats: Sequence[str] = ("gif", "mp4"),
+    name: str = "doping_evolution",
+) -> list[Path]:
+    """Animate the net doping the solvers saw at every optimizer evaluation.
+
+    One frame per evaluated design, on a colour scale fixed across the whole
+    run (symlog, like the live frames), titled with the iteration, its Δneff
+    and -- when evaluated -- its modal loss; a trial the optimizer rejected
+    (objective below the running best) is labelled as such, so the move-limit
+    halvings of ticket 19 read as what they are rather than as progress.
+
+    Args:
+        doping_frames: Full-node net doping ``(n_nodes,)`` [cm^-3] per
+            evaluation, in history order -- the filtered, scattered, mapped
+            field, i.e. what ChargeTransport solved on.
+        history: The matching per-evaluation records (same length).
+        mesh_coords: ``(n_nodes, 2)`` node coordinates in micrometres.
+        geometry: Overlay frame (see :func:`_overlay_geometry`); optional.
+        output_dir: Directory for ``<name>.gif`` / ``<name>.mp4``.
+        triangles: Silicon triangulation, as in :func:`plot_doping_field`.
+        fps: Frames per second.
+        formats: Which of ``gif`` (Pillow) and ``mp4`` (ffmpeg) to write;
+            a format whose encoder is unavailable is skipped with a note.
+        name: Output file stem.
+
+    Returns:
+        Paths written (empty when there are no frames or no usable writer).
+    """
+    from matplotlib import animation
+
+    frames = [np.asarray(f, dtype=float) for f in doping_frames]
+    if not frames:
+        return []
+    if len(frames) != len(history):
+        raise ValueError(
+            f"{len(frames)} doping frames but {len(history)} history entries; "
+            "the animation needs one record per evaluated design"
+        )
+    out = _ensure_output_dir(output_dir)
+    x, y = mesh_coords[:, 0], mesh_coords[:, 1]
+    limit = max(float(max(np.max(np.abs(f)) for f in frames)), _DOPING_SYMLOG_LINTHRESH)
+    norm = SymLogNorm(
+        linthresh=_DOPING_SYMLOG_LINTHRESH, vmin=-limit, vmax=limit, base=10
+    )
+
+    # Running best of what the optimizer maximized: a frame below it is a
+    # rejected trial (the optimizer only accepts improving steps).
+    objectives = [float(h.get("objective", h["delta_n_eff"])) for h in history]
+    best_so_far = -np.inf
+    rejected: list[bool] = []
+    for value in objectives:
+        rejected.append(value < best_so_far)
+        best_so_far = max(best_so_far, value)
+
+    fig, ax = plt.subplots(figsize=(8.0, 3.6), layout="constrained")
+    mesh = _pcolormesh_field(ax, x, y, frames[0], triangles=triangles, cmap="RdBu_r", norm=norm)
+    fig.colorbar(mesh, ax=ax, label=r"Net doping [cm$^{-3}$]", shrink=0.9)
+    ax.set_facecolor("0.92")
+    ax.set_xlabel("x [µm]")
+    ax.set_ylabel("y [µm]")
+    ax.set_aspect("equal")
+    if geometry is not None:
+        _overlay_geometry(ax, geometry)
+    _zoom_to_silicon(ax, x, y, triangles)
+    title = ax.set_title("", fontsize=11)
+    # Axis limits are fixed by the first draw so the overlay and frame sizes
+    # stay put; later frames only swap the painted field.
+    xlim, ylim = ax.get_xlim(), ax.get_ylim()
+
+    def _caption(k: int) -> str:
+        h = history[k]
+        head = f"iteration {int(h['iteration'])}"
+        if rejected[k]:
+            head += "  (rejected trial)"
+        detail = f"Δneff = {float(h['delta_n_eff']):+.3e}"
+        loss = h.get("modal_loss_db_cm")
+        if loss is not None and np.isfinite(loss):
+            detail += f"   loss = {float(loss):.3g} dB/cm"
+        return f"{head}\n{detail}"
+
+    def _draw(k: int) -> tuple:
+        nonlocal mesh
+        mesh.remove()
+        mesh = _pcolormesh_field(ax, x, y, frames[k], triangles=triangles, cmap="RdBu_r", norm=norm)
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        title.set_text(_caption(k))
+        title.set_color("#d7191c" if rejected[k] else "black")
+        return (mesh, title)
+
+    _draw(0)
+    anim = animation.FuncAnimation(fig, _draw, frames=len(frames), blit=False)
+    written: list[Path] = []
+    for fmt in formats:
+        writer_name = _ANIMATION_WRITERS.get(fmt)
+        if writer_name is None:
+            raise ValueError(f"unknown animation format {fmt!r}; expected gif or mp4")
+        if not animation.writers.is_available(writer_name):
+            print(
+                f"      Animation {fmt} skipped: {writer_name} writer unavailable",
+                flush=True,
+            )
+            continue
+        path = out / f"{name}.{fmt}"
+        anim.save(path, writer=animation.writers[writer_name](fps=fps), dpi=110)
+        written.append(path)
+    plt.close(fig)
+    return written
 
 
 @dataclass(frozen=True)
@@ -591,6 +819,71 @@ def plot_mode_field(
     fig.tight_layout()
 
     path = out / "mode_field.pdf"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def plot_depletion_field(
+    swept_carriers: np.ndarray,
+    mesh_coords: np.ndarray,
+    mode_field: ModeField | None = None,
+    geometry: object | None = None,
+    output_dir: str | Path | None = None,
+    triangles: np.ndarray | None = None,
+) -> Path:
+    """Where the modulation happens: swept carriers under the optical mode.
+
+    ``swept_carriers`` is ``(n + p)(V_bias) - (n + p)(0 V)`` per node [cm^-3]
+    -- negative where reverse bias depletes the junction, which is the only
+    place the design changes the index. Drawn on the silicon elements with the
+    tracked mode's ``|E|`` contours on top, so the figure shows at a glance
+    how much of the depleted region the mode actually sees (and how much
+    doping sits in the mode for nothing but loss).
+
+    Args:
+        swept_carriers: ``(n_nodes,)`` change in total carrier density.
+        mesh_coords: ``(n_nodes, 2)`` node coordinates in micrometres.
+        mode_field: The tracked mode for the contour overlay; ``None`` draws
+            the carriers alone.
+        geometry: Overlay frame (see :func:`_overlay_geometry`); optional.
+        output_dir: Directory to write ``depletion_field.pdf``.
+        triangles: Silicon triangulation, as in :func:`plot_doping_field`.
+
+    Returns:
+        Path to the saved figure.
+    """
+    out = _ensure_output_dir(output_dir)
+    swept = np.asarray(swept_carriers, dtype=float)
+    x, y = mesh_coords[:, 0], mesh_coords[:, 1]
+    limit = max(float(np.max(np.abs(swept))) if swept.size else 0.0, _DOPING_SYMLOG_LINTHRESH)
+
+    fig, ax = plt.subplots(figsize=(8.0, 3.6), layout="constrained")
+    mesh = _pcolormesh_field(
+        ax, x, y, swept, triangles=triangles, cmap="PuOr",
+        norm=SymLogNorm(linthresh=_DOPING_SYMLOG_LINTHRESH, vmin=-limit, vmax=limit, base=10),
+    )
+    ax.set_facecolor("0.92")
+    if mode_field is not None:
+        mx, my = mode_field.coords_um[:, 0], mode_field.coords_um[:, 1]
+        contours = ax.tricontour(
+            mtri.Triangulation(mx, my), mode_field.abs_e,
+            levels=[0.2, 0.4, 0.6, 0.8], colors="k", linewidths=0.8, alpha=0.8,
+        )
+        ax.clabel(contours, fmt="%.1f", fontsize=7)
+    if geometry is not None:
+        _overlay_geometry(ax, geometry)
+    _zoom_to_silicon(ax, x, y, triangles, pad=0.3)
+    ax.set_title(r"Swept carriers $\Delta(n+p)$ under the mode $|E|$")
+    ax.set_xlabel("x [µm]")
+    ax.set_ylabel("y [µm]")
+    ax.set_aspect("equal")
+    fig.colorbar(
+        mesh, ax=ax, shrink=0.9,
+        label=r"$(n+p)(V_{bias}) - (n+p)(0\,\mathrm{V})$ [cm$^{-3}$]",
+    )
+
+    path = out / "depletion_field.pdf"
     fig.savefig(path)
     plt.close(fig)
     return path
@@ -1131,6 +1424,10 @@ def generate_outputs(
     output_dir: str | Path | None = None,
     mesh_triangles: np.ndarray | None = None,
     cold_reevaluation: ColdReevaluation | None = None,
+    design_history: Sequence[np.ndarray] | None = None,
+    animation_history: list[dict] | None = None,
+    animation_formats: Sequence[str] = ("gif", "mp4"),
+    swept_carriers: np.ndarray | None = None,
 ) -> list[Path]:
     """Generate the headline output figures (ticket 07).
 
@@ -1155,6 +1452,16 @@ def generate_outputs(
         output_dir: Output directory (default: ``outputs/``).
         cold_reevaluation: Warm/cold Δneff of the reported design, annotated
             on the convergence figure (ticket 20). ``None`` draws nothing.
+        design_history: Full-node net doping [cm^-3] per evaluated design, in
+            history order; animated into ``doping_evolution.{gif,mp4}`` (see
+            :func:`animate_doping_evolution`). ``None`` skips the animation.
+        animation_history: The records matching ``design_history`` one-to-one;
+            defaults to ``history`` (use it when only some records carry a
+            design).
+        animation_formats: Encoders to try for the animation.
+        swept_carriers: ``(n + p)(V_bias) - (n + p)(0 V)`` per node at the
+            optimized design, for :func:`plot_depletion_field`; ``None``
+            skips that figure.
 
     Returns:
         List of paths to the generated plot files.
@@ -1169,6 +1476,11 @@ def generate_outputs(
         cold_reevaluation=cold_reevaluation,
     )
     paths.append(conv)
+    # Loss-aware run (ticket 25): the loss history and the trade-off plane.
+    for loss_figure in (plot_loss_convergence, plot_tradeoff):
+        loss_path = loss_figure(history, output_dir=out)
+        if loss_path is not None:
+            paths.append(loss_path)
 
     doping = plot_doping_field(
         rho_initial,
@@ -1202,5 +1514,33 @@ def generate_outputs(
 
     if mode_field is not None:
         paths.append(plot_mode_field(mode_field, output_dir=out))
+
+    if swept_carriers is not None:
+        paths.append(
+            plot_depletion_field(
+                swept_carriers,
+                mesh_coords,
+                mode_field=mode_field,
+                geometry=geometry,
+                output_dir=out,
+                triangles=mesh_triangles,
+            )
+        )
+
+    if design_history:
+        try:
+            paths.extend(
+                animate_doping_evolution(
+                    design_history,
+                    history if animation_history is None else animation_history,
+                    mesh_coords,
+                    geometry=geometry,
+                    output_dir=out,
+                    triangles=mesh_triangles,
+                    formats=animation_formats,
+                )
+            )
+        except Exception as exc:
+            print(f"WARNING: doping animation skipped ({exc})", flush=True)
 
     return paths

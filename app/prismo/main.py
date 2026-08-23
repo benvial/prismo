@@ -649,6 +649,30 @@ def _optimized_mode_field(
     )
 
 
+def _optimized_swept_carriers(
+    inputs: PipelineInputs, rho_opt: np.ndarray, components: Any | None
+) -> np.ndarray:
+    """``(n+p)(V_bias) - (n+p)(0 V)`` per node at the optimized design.
+
+    Two warm ChargeTransport solves through the bound pipeline's own filter
+    and doping map; feeds the swept-carriers-under-the-mode figure.
+    """
+    import jax.numpy as jnp
+
+    from prismo.pipeline import carrier_fields, default_components
+
+    bundle = components if components is not None else default_components()
+    n0, p0, n1, p1 = carrier_fields(
+        jnp.asarray(rho_opt, dtype=jnp.float64),
+        H=inputs.H_dense,
+        H_sum=inputs.H_sum,
+        mesh_ref=inputs.mesh_ref,
+        design_nodes=inputs.design_nodes,
+        components=bundle,
+    )
+    return np.asarray(n1 + p1 - n0 - p0, dtype=float)
+
+
 def _clear_live_frames(output_dir: str | Path) -> int:
     """Delete ``doping_field_<n>.png`` frames a previous run left behind.
 
@@ -714,6 +738,40 @@ def _mode_overlap_if_weighted(
     if loss_weight > 0.0:
         return _mode_overlap_weights(inputs, components, loss_weight)
     return None
+
+
+def _doping_frames(
+    history: list[dict[str, Any]],
+    H_dense: Any,
+    H_sum: Any,
+    design_nodes: Any,
+) -> tuple[list[np.ndarray], list[dict[str, Any]]]:
+    """Full-node net doping per evaluated design, for the doping animation.
+
+    Each history record carries the raw design vector it evaluated; the
+    solvers saw the *filtered* field, so filter, scatter to full node order
+    and map to doping here -- the same three steps the pipeline takes.
+    Returns the frames and the matching records (entries predating the
+    ``design`` key are skipped, so an old checkpoint still animates what it
+    has).
+    """
+    from prismo.pipeline import doping_from_theta
+
+    H_np = np.asarray(H_dense)
+    H_sum_np = np.asarray(H_sum)
+    frames: list[np.ndarray] = []
+    kept: list[dict[str, Any]] = []
+    for entry in history:
+        design = entry.get("design")
+        if design is None:
+            continue
+        theta = np.asarray(design, dtype=float)
+        theta_tilde = H_np @ theta / H_sum_np
+        frames.append(
+            np.asarray(doping_from_theta(design_nodes.scatter_numpy(theta_tilde)))
+        )
+        kept.append(entry)
+    return frames, kept
 
 
 def _best_history_entry(history: list[dict[str, Any]]) -> dict[str, Any]:
@@ -941,6 +999,13 @@ def _run_pipeline(
     except Exception as exc:
         typer.echo(f"      WARNING: mode figure skipped ({exc})")
         mode_field = None
+    # Same warm-state window and the same soft failure for the swept-carriers
+    # figure (two ChargeTransport solves at the reported design).
+    try:
+        swept_carriers = _optimized_swept_carriers(inputs, rho_opt, components)
+    except Exception as exc:
+        typer.echo(f"      WARNING: depletion figure skipped ({exc})")
+        swept_carriers = None
 
     cold = None
     if history:
@@ -998,6 +1063,7 @@ def _run_pipeline(
     # which is what oxide means anyway.
     plot_initial = design_nodes.scatter_numpy(rho_initial)
     plot_opt = design_nodes.scatter_numpy(rho_opt)
+    doping_frames, animated_history = _doping_frames(history, H_dense, H_sum, design_nodes)
     plot_paths = generate_outputs(
         rho_initial=plot_initial,
         rho_opt=plot_opt,
@@ -1021,6 +1087,9 @@ def _run_pipeline(
         # the design field across it.
         mesh_triangles=inputs.silicon_triangles,
         cold_reevaluation=cold,
+        design_history=doping_frames,
+        animation_history=animated_history,
+        swept_carriers=swept_carriers,
     )
     for p in plot_paths:
         typer.echo(f"      {p}")
@@ -1339,6 +1408,147 @@ def _run_objective_probe(
     typer.echo()
     typer.echo("=== Done ===")
     return scan
+
+
+_DEFAULT_ANIMATION_FPS = 6
+
+
+@app.command()
+def animate(
+    checkpoint: str = typer.Option(
+        str(_DEFAULT_OUTPUT_DIR / _CHECKPOINT_NAME),
+        "--checkpoint",
+        help="checkpoint.json of the run to replay (every record carries its design)",
+    ),
+    mesh_path: str = typer.Option(
+        str(_DEFAULT_MESH), help="The run's shared .msh (read, not re-authored)"
+    ),
+    r_min: float = typer.Option(
+        _DEFAULT_R_MIN, help="Density filter radius the run used [µm]"
+    ),
+    output_dir: str = typer.Option(
+        str(_DEFAULT_OUTPUT_DIR), help="Directory for doping_evolution.{gif,mp4}"
+    ),
+    fps: int = typer.Option(_DEFAULT_ANIMATION_FPS, min=1, help="Frames per second"),
+    fmt: str = typer.Option(
+        "gif,mp4", "--format", help="Comma-separated encoders: gif (Pillow), mp4 (ffmpeg)"
+    ),
+    contact_offset: float = typer.Option(
+        0.2, "--contact-offset", help="Contact gap the run used, for the overlay [µm]"
+    ),
+) -> None:
+    """Replay a run's doping field as an animation, from its checkpoint alone.
+
+    No solver is touched: each history record carries the design it
+    evaluated, which is filtered, scattered and mapped to net doping exactly
+    as the run did, and drawn on the run's own mesh with a colour scale fixed
+    across the whole run. Rejected trials are labelled.
+    """
+    formats = tuple(part.strip() for part in fmt.split(",") if part.strip())
+    paths = _run_animate(
+        checkpoint_path=checkpoint,
+        mesh_path=mesh_path,
+        r_min=r_min,
+        output_dir=output_dir,
+        fps=fps,
+        formats=formats,
+        contact_offset=contact_offset,
+    )
+    if not paths:
+        raise typer.Exit(code=1)
+
+
+def _overlay_from_mesh(
+    coords: np.ndarray, design_nodes: Any, contact_offset: float
+) -> Any:
+    """An overlay frame read off the mesh itself (no geometry object at hand).
+
+    The rib box comes from the design nodes the same way the seeds find it
+    (``pipeline._seed_rib_box``); the contact footprint is the one knob the
+    mesh does not reveal, so the caller passes it.
+    """
+    from prismo.outputs import OverlayGeometry
+    from prismo.pipeline import _seed_rib_box
+    from prismo.waveguide_mesh import RibWaveguideGeometry
+
+    design_coords = coords[design_nodes.indices]
+    x_left, x_right, slab_top, rib_top, _x_centre = _seed_rib_box(design_coords)
+    return OverlayGeometry(
+        rib_left=x_left,
+        rib_right=x_right,
+        slab_top=slab_top,
+        rib_top=rib_top,
+        substrate_top=float(design_coords[:, 1].min()),
+        half_width=float(np.abs(coords[:, 0]).max()),
+        contact_offset=contact_offset,
+        contact_width=RibWaveguideGeometry().contact_width,
+    )
+
+
+def _run_animate(
+    checkpoint_path: str,
+    mesh_path: str,
+    r_min: float,
+    output_dir: str,
+    fps: int = _DEFAULT_ANIMATION_FPS,
+    formats: tuple[str, ...] = ("gif", "mp4"),
+    contact_offset: float = 0.2,
+) -> list[Path]:
+    """Build the doping animation for a finished (or killed) run."""
+    import json
+
+    import jax.numpy as jnp
+
+    from prismo.density_filter import assemble_filter_matrix
+    from prismo.outputs import animate_doping_evolution
+    from prismo.waveguide_mesh import read_mesh_node_coordinates
+
+    typer.echo("=== PRISMO Doping Animation ===")
+    payload = json.loads(Path(checkpoint_path).read_text())
+    history = list(payload.get("history", []))
+    with_design = [entry for entry in history if entry.get("design") is not None]
+    if not with_design:
+        typer.echo(
+            f"      {checkpoint_path} carries no per-iteration designs "
+            "(written by runs predating the animation); nothing to replay."
+        )
+        return []
+    typer.echo(f"      {len(with_design)} evaluated designs in {checkpoint_path}")
+
+    coords = read_mesh_node_coordinates(mesh_path)
+    if coords.shape[0] == 0:
+        raise RuntimeError(f"could not read node coordinates from {mesh_path}")
+    n_nodes = coords.shape[0]
+    design_nodes, silicon_triangles = _silicon_design_nodes(
+        Path(mesh_path), n_nodes, real_mesh=True
+    )
+    n_design = len(design_nodes)
+    if len(with_design[0]["design"]) != n_design:
+        raise ValueError(
+            f"{checkpoint_path} holds {len(with_design[0]['design'])} design "
+            f"variables but {mesh_path} has {n_design} silicon nodes; replay the "
+            "checkpoint on the mesh that produced it"
+        )
+    H_sparse = assemble_filter_matrix(coords[design_nodes.indices], r_min=r_min)
+    H_dense = jnp.asarray(H_sparse.toarray())
+    H_sum = jnp.sum(H_dense, axis=1)
+    frames, kept = _doping_frames(history, H_dense, H_sum, design_nodes)
+    geometry = _overlay_from_mesh(coords, design_nodes, contact_offset)
+
+    paths = animate_doping_evolution(
+        frames,
+        kept,
+        coords,
+        geometry=geometry,
+        output_dir=output_dir,
+        triangles=silicon_triangles,
+        fps=fps,
+        formats=formats,
+    )
+    for path in paths:
+        typer.echo(f"      {path}")
+    typer.echo("=== Done ===")
+    return paths
 
 
 def entrypoint() -> None:

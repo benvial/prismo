@@ -1380,6 +1380,36 @@ def _pre_eigensolve(
     return epsilon_bg, epsilon_pert, n0 * _M3_TO_CM3, p0 * _M3_TO_CM3
 
 
+def carrier_fields(
+    theta: jax.Array,
+    H: jax.Array | None = None,
+    H_sum: jax.Array | None = None,
+    mesh_ref: MeshRef | None = None,
+    design_nodes: DesignNodes | None = None,
+    components: PipelineComponents | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """The carrier densities behind one design: ``(n0, p0, n1, p1)`` [cm^-3].
+
+    Filter -> doping -> ChargeTransport at 0 V and at the reverse bias, in
+    full node order, for the headline depletion figure (swept carriers under
+    the mode). Not differentiated; the same two solves the pipeline runs.
+    """
+    if components is None:
+        components = _DEFAULT_COMPONENTS
+    if H is not None:
+        if H_sum is None:
+            H_sum = jnp.sum(H, axis=1)
+        theta_tilde = _filter_jax(theta, H, H_sum)
+    else:
+        theta_tilde = theta
+    if design_nodes is not None:
+        theta_tilde = design_nodes.scatter(theta_tilde)
+    doping = doping_from_theta(theta_tilde)
+    n0, p0 = components.chargetransport(doping, 0.0, mesh_ref)
+    n1, p1 = components.chargetransport(doping, REVERSE_BIAS_V, mesh_ref)
+    return n0, p0, n1, p1
+
+
 def design_epsilon_from_theta(
     theta: jax.Array,
     H: jax.Array | None = None,
