@@ -161,12 +161,3 @@ a single sign crossing a single junction. Every run seeds a junction
 (`--seed lateral|vertical|u` at $|\theta| = 0.3$, n-type on the left slab edge,
 p-type on the right so both carrier populations reach a contact and the seed is
 reverse-biased); a uniform start has no junction at all.
-
-## No stub solvers
-
-`prismo run` / `validate-gradient` without the containers raise instead of
-substituting an identity or a mean for a solve. Earlier fallbacks that
-fabricated carrier densities or a uniform optical gradient made a default run
-produce numbers with zero physics. Unit tests inject explicit JAX-native
-doubles through the pipeline's `components=` seam; the component regression
-cases (`make test <component>`) run against the built images.

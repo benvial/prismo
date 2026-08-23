@@ -10,14 +10,14 @@
 
 .. rst-class:: lead
 
-    Free-form doping design of a silicon PN-junction phase shifter:
+    Free-form doping inverse design of a silicon PN-junction phase shifter:
     ChargeTransport.jl (Julia, discrete adjoint) and gyptis/FEniCS
     (eigen-adjoint) composed as Tesseracts into one ``jax.grad``.
 
 .. container:: buttons
 
     :doc:`Install <install>`
-    :doc:`The problem <problem>`
+    :doc:`Guide <problem>`
     :doc:`Results <results>`
     `GitHub <https://github.com/benvial/prismo>`_
 

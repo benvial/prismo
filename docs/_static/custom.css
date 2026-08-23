@@ -10,3 +10,70 @@ html pre.mermaid > svg {
 html pre.mermaid {
     text-align: center;
 }
+
+/* Mermaid palette from the theme's own variables, so light and dark follow the site.
+   Mermaid's injected styles are id-scoped, hence !important. */
+html pre.mermaid .node rect,
+html pre.mermaid .node polygon,
+html pre.mermaid .node circle,
+html pre.mermaid .node path,
+html pre.mermaid .actor {
+    fill: var(--cyan-2) !important;
+    stroke: var(--cyan-9) !important;
+    stroke-width: 1.25px !important;
+}
+html pre.mermaid .cluster rect {
+    fill: var(--slate-2) !important;
+    stroke: var(--sy-c-border) !important;
+}
+html pre.mermaid .nodeLabel,
+html pre.mermaid .edgeLabel,
+html pre.mermaid .cluster-label,
+html pre.mermaid .label,
+html pre.mermaid text.actor,
+html pre.mermaid .messageText,
+html pre.mermaid .loopText,
+html pre.mermaid .labelText,
+html pre.mermaid .labelText > tspan,
+html pre.mermaid text.actor > tspan {
+    color: var(--sy-c-text) !important;
+    fill: var(--sy-c-text) !important;
+    font-family: var(--sy-f-text) !important;
+}
+html pre.mermaid .nodeLabel b,
+html pre.mermaid .nodeLabel strong {
+    color: var(--cyan-11) !important;
+}
+html pre.mermaid .edgeLabel,
+html pre.mermaid .edgeLabel p,
+html pre.mermaid .edgeLabel span,
+html pre.mermaid .labelBox {
+    background-color: var(--sy-c-background) !important;
+    fill: var(--sy-c-background) !important;
+    stroke: var(--sy-c-border) !important;
+}
+html pre.mermaid .edgePath .path,
+html pre.mermaid .flowchart-link,
+html pre.mermaid .messageLine0,
+html pre.mermaid .messageLine1,
+html pre.mermaid .actor-line,
+html pre.mermaid .loopLine {
+    stroke: var(--slate-11) !important;
+}
+html pre.mermaid .marker,
+html pre.mermaid .arrowheadPath {
+    fill: var(--slate-11) !important;
+    stroke: var(--slate-11) !important;
+}
+html pre.mermaid [id$="-sequencenumber"],
+html pre.mermaid marker circle {
+    fill: var(--cyan-9) !important;
+}
+html pre.mermaid text.sequenceNumber {
+    fill: white !important;
+}
+html pre.mermaid [id$="-arrowhead"] path,
+html pre.mermaid [id$="-filled-head"] path {
+    fill: var(--slate-11) !important;
+    stroke: var(--slate-11) !important;
+}

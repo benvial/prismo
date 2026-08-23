@@ -70,9 +70,15 @@ myst_fence_as_directive = ["mermaid"]
 
 # Mermaid: bigger type, natural height, diagrams scale to the content column.
 mermaid_height = "auto"
+mermaid_light_theme = "neutral"
+mermaid_dark_theme = "neutral"
 mermaid_init_config = {
     "startOnLoad": False,
-    "themeVariables": {"fontSize": "18px"},
+    "themeVariables": {
+        "fontSize": "17px",
+        # The site's text face, so label boxes are measured in the font they render in.
+        "fontFamily": "Inter, ui-sans-serif, system-ui, sans-serif",
+    },
     "flowchart": {
         "useMaxWidth": False,
         "htmlLabels": True,
@@ -83,6 +89,9 @@ mermaid_init_config = {
     },
     "sequence": {
         "useMaxWidth": False,
+        "actorFontFamily": "Inter, ui-sans-serif, system-ui, sans-serif",
+        "messageFontFamily": "Inter, ui-sans-serif, system-ui, sans-serif",
+        "noteFontFamily": "Inter, ui-sans-serif, system-ui, sans-serif",
         "messageFontSize": 16,
         "actorFontSize": 16,
         "noteFontSize": 16,
