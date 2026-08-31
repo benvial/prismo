@@ -66,12 +66,14 @@ conda-forge and Julia 1.10 with the ChargeTransport.jl environment pinned to the
 same ``Manifest.toml`` as the container image. Binder has no Docker, so that
 session uses the ``make run`` path (the tesseract apis called in-process, same
 gyptis-authored mesh, no containers) with about one CPU and 2 GB of RAM: a
-minute of JIT warm-up, then a few seconds per evaluation, so the 200-iteration
-runs in :doc:`results` take about a quarter of an hour. The image is described
-by ``binder/``:
+minute of Julia JIT warm-up on the first evaluation, then a few seconds per
+evaluation, so the 200-iteration runs in :doc:`results` take about a quarter of
+an hour. The FEniCS form cache is compiled into the image, so the eigensolve
+does not pay form compilation. The image is described by ``binder/``:
 ``environment.yml`` (conda), ``Project.toml`` + ``Manifest.toml`` (Julia, kept
-identical to the component's by a unit test) and ``postBuild`` (pip-installs the
-app, warms the FEniCS and Julia caches).
+identical to the component's by a unit test), ``postBuild`` (pip-installs the
+app, warms the FEniCS and Julia caches) and ``start`` (points FEniCS at that
+warmed cache at session start).
 
 .. |binder| image:: https://mybinder.org/badge_logo.svg
    :target: https://mybinder.org/v2/gh/benvial/prismo/main?urlpath=lab/tree/notebooks/prismo.ipynb

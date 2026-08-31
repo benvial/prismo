@@ -249,9 +249,10 @@ solvers installed in-process (conda gyptis/FEniCS + Julia 1.10 with the same
 pinned ChargeTransport.jl environment as the container, from `binder/`). No
 Docker there, so it is the `make run` path: the same gyptis-authored mesh,
 physics, adjoint and optimizer, with the solvers called in-process instead of
-over HTTP. Binder gives ~1 CPU and 2 GB: a minute of JIT warm-up, then a few
-seconds per evaluation (a 200-iteration run is ~15 min); a terminal in the same
-session takes any `prismo ...` / `make run` command.
+over HTTP. Binder gives ~1 CPU and 2 GB: about a minute of Julia JIT warm-up
+(the FEniCS form cache ships compiled in the image), then a few seconds per
+evaluation (a 200-iteration run is ~15 min); a terminal in the same session
+takes any `prismo ...` / `make run` command.
 
 Developer loop: `PRISMO_DEV_MOUNTS=1 make run-containers` bind-mounts the host
 `tesseract_api.py` / shared schemas into the running images (no rebuild);
