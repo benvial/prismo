@@ -165,6 +165,32 @@ confinement-weighted loss $\Gamma\,\alpha\, n_\mathrm{Si}/n_\mathrm{eff}$.
 The weights are evaluated once at the uniform background and frozen (the
 carrier-induced $\Delta\varepsilon \sim 10^{-3}$ does not reshape the mode).
 
+### Limits of the loss model
+
+Three caveats travel with $\alpha_\mathrm{mode}$, and all three make it an
+*underestimate* of what a fabricated device would measure.
+
+It is counted on the design cells — the rib interior — only. The slab is
+background silicon to the eigensolver, so doping that sits in the mode's
+evanescent tail costs the objective nothing; the optimizer is free to place
+loss there and not be charged for it. Reading the reported figure alongside the
+doping map is the practical guard until the weights are carried onto the slab
+cells too.
+
+The frozen weights hold only while the mode stays where it was computed. A
+design whose permittivity is strongly asymmetric across the rib, or a run
+targeting a higher-order mode with `--mode-index`, moves the field enough that
+weights taken at the uniform background mis-weight it — the first-order
+estimate degrades before the formula does. Solving the complex eigenproblem
+directly, with $\mathrm{Im}\,\varepsilon$ from the same Soref–Bennett
+absorption, is the exact route and needs no change to the objective.
+
+Finally, $\alpha_\mathrm{mode}$ is free-carrier absorption and nothing else.
+Sidewall-roughness scattering, contact and metal absorption, and any loss
+outside the rib are absent, so the number is a floor on the propagation loss of
+the real cross-section rather than a prediction of it.
+
+
 The literature's efficiency–loss **figure of merit** is
 $V_\pi L_\pi \times \alpha_\mathrm{mode}$ in V·dB (10–30 V·dB for good
 depletion modulators). It is reported, not optimized: minimized alone it
