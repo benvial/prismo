@@ -17,9 +17,15 @@ seed comparison and the mesh study below give the evidence.
 ```
 
 Composed adjoint vs central finite differences through filter → doping →
-ChargeTransport (Julia, warm) → Soref–Bennett → gyptis: relative error
-$\approx 2\times10^{-7}$ at $h = 10^{-3}$, following the $O(h^2)$ slope until
-finite-difference round-off takes over (`make validate-gradient-containers`).
+ChargeTransport (Julia, warm) → Soref–Bennett → gyptis, over nine steps from
+$10^{-1}$ down to $10^{-5}$ (`make validate-gradient-containers`). The two
+error branches of a difference quotient are both sampled, which is what makes
+the curve a convergence test rather than a single number: above the minimum,
+truncation dominates and the measured log-log slope is **1.94**, the second
+order a central difference should show; below it, the objective's own
+evaluation noise divided by the step takes over and the error climbs back as
+$\sim 1/h$. The best agreement is $5.3\times10^{-7}$ at $h \approx 3\times10^{-3}$,
+four orders inside the $10^{-2}$ gate.
 
 ## The gradients do the work
 

@@ -261,8 +261,10 @@ def validate_gradient(
     n_directions: int = typer.Option(3, help="Number of sampled θ directions"),
     n_steps: int = typer.Option(
         12,
-        help="Central-difference steps, log-spaced over 1e-4..1e-1 "
-        "(below 1e-4 the CT readout's own 1e-8 FD floor dominates)",
+        help="Central-difference steps, log-spaced over 1e-5..1e-1. The window "
+        "spans both branches on purpose: truncation error rises as h^2 at large "
+        "steps, and below ~1e-4 the evaluation noise floor divided by the step "
+        "takes over and the error rises again as 1/h",
     ),
     mesh_path: str = typer.Option(
         str(_DEFAULT_MESH), help="Path to waveguide .msh file"
@@ -281,6 +283,13 @@ def validate_gradient(
         help="Reset the ChargeTransport worker before every finite-difference "
         "evaluation so the FD reference carries no warm-start path dependence "
         "(default: warm)",
+    ),
+    mesh_size: float = typer.Option(
+        None,
+        "--mesh-size",
+        help="Silicon element size [µm]; smaller refines the shared mesh "
+        "(default: the mesh author's own, 0.04 µm in containers). Match it to "
+        "the run whose design is being checked",
     ),
     loss_weight: float = typer.Option(
         0.0,
@@ -311,7 +320,7 @@ def validate_gradient(
     # solves per pipeline evaluation), so restrict the sweep to the band where
     # central differences actually resolve the gradient before the CT state
     # readout's internal 1e-8 finite difference sets the floor.
-    step_sizes = np.logspace(-4, -1, n_steps)
+    step_sizes = np.logspace(-5, -1, n_steps)
     _check_geometry_knobs(seed, contact_offset, domain_width)
 
     components: PipelineComponents | None = None
@@ -319,12 +328,15 @@ def validate_gradient(
         typer.echo("Starting tesseract Docker containers...")
         components = init_tesseract_containers(
             mesh_dir=Path(mesh_path).parent,
+            mesh_size=mesh_size,
             contact_offset=contact_offset,
             domain_width=domain_width,
         )
     else:
         components = _in_process_components(
-            contact_offset=contact_offset, domain_width=domain_width
+            mesh_size=mesh_size,
+            contact_offset=contact_offset,
+            domain_width=domain_width,
         )
 
     try:
@@ -1209,7 +1221,12 @@ def _run_pipeline(
         pipeline_fn=bound_pipeline,
         ftol_rel=optimization_ftol_rel,
         gradient_validation_directions=1 if live_solvers else 3,
-        gradient_validation_steps=(np.logspace(-4, -2, 3) if live_solvers else None),
+        # Both branches of the V must be sampled for the figure to be a
+        # convergence test: truncation (rising as h^2) at large steps, and the
+        # evaluation noise floor divided by the step (falling as 1/h) at small
+        # ones. The earlier 1e-4..1e-2 window sat entirely on the noise branch
+        # on a fine mesh, so no second-order slope was visible.
+        gradient_validation_steps=(np.logspace(-5, -1, 9) if live_solvers else None),
         # Explicit on both paths: the figure's finite differences probe the
         # bound pipeline, which takes a design-node vector, while ``rho_opt``
         # above has already been scattered to full node order for plotting.

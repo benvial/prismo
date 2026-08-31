@@ -113,9 +113,14 @@ study below give the evidence. The gradient is validated before it is trusted:
 <p align="center"><img src="docs/figures/gradient_validation.png" width="520"></p>
 
 **Composed adjoint vs central finite differences** through filter → doping →
-ChargeTransport (Julia, warm) → Soref–Bennett → gyptis: relative error
-≈ 2 × 10⁻⁷ at h = 10⁻³, following the O(h²) slope until finite-difference
-round-off takes over. (`make validate-gradient-containers`)
+ChargeTransport (Julia, warm) → Soref–Bennett → gyptis, over nine steps from
+10⁻¹ down to 10⁻⁵. Both error branches of a difference quotient are sampled,
+which is what makes the curve a convergence test rather than a single number:
+above the minimum, truncation dominates and the measured log-log slope is
+**1.94**, the second order a central difference should show; below it, the
+objective's own evaluation noise divided by the step takes over and the error
+climbs back as ~1/h. Best agreement 5.3 × 10⁻⁷ at h ≈ 3 × 10⁻³, four orders
+inside the 10⁻² gate. (`make validate-gradient-containers`)
 
 <p align="center"><img src="docs/figures/convergence.png" width="520"></p>
 

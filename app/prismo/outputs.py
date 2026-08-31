@@ -13,6 +13,7 @@ against reverse bias.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -1261,6 +1262,45 @@ def _gradient_validation_curves(
     return curves
 
 
+def _observed_orders(
+    feasible_steps: np.ndarray, errors: list[float]
+) -> list[tuple[float, float]]:
+    """Local log-log slopes of a relative-error curve, one per adjacent pair.
+
+    Each entry is ``(h_right, slope)`` for the interval ending at ``h_right``.
+    On the truncation branch of a central difference the slope approaches +2;
+    on the cancellation branch, where the evaluation noise floor divided by the
+    step dominates, it approaches −1. Reporting the measured slope is what makes
+    the figure a convergence test rather than an eyeball comparison against a
+    guide line drawn with an arbitrary constant.
+    """
+    orders: list[tuple[float, float]] = []
+    for left in range(len(feasible_steps) - 1):
+        h0, h1 = float(feasible_steps[left]), float(feasible_steps[left + 1])
+        e0, e1 = errors[left], errors[left + 1]
+        if h0 <= 0.0 or h1 <= 0.0 or e0 <= 0.0 or e1 <= 0.0:
+            continue
+        orders.append((h1, math.log(e1 / e0) / math.log(h1 / h0)))
+    return orders
+
+
+def _steepest_observed_order(
+    curves: list[tuple[int, np.ndarray, list[float]]],
+) -> float | None:
+    """The largest local slope seen on any direction's curve.
+
+    The truncation branch is the steep, rising part of the V; its slope is the
+    observed order of the finite difference. ``None`` when no curve has two
+    usable points.
+    """
+    slopes = [
+        slope
+        for _, feasible_steps, errors in curves
+        for _, slope in _observed_orders(feasible_steps, errors)
+    ]
+    return max(slopes) if slopes else None
+
+
 def _render_gradient_validation(
     curves: list[tuple[int, np.ndarray, list[float]]],
     step_sizes: np.ndarray,
@@ -1269,13 +1309,37 @@ def _render_gradient_validation(
     out: Path,
 ) -> Path:
     fig, ax = plt.subplots(figsize=(6, 4))
+    anchors: list[tuple[float, float]] = []
     for i, feasible_steps, errors in curves:
         label = f"direction {i + 1}" if n_directions > 1 else "FD"
         ax.loglog(feasible_steps, errors, "o-", markersize=3, label=label)
+        best = int(np.argmin(errors))
+        anchors.append((float(feasible_steps[best]), errors[best]))
 
     # Central differences of a smooth pipeline converge at second order (see
-    # GRADIENT_VALIDATION_TOLERANCE above), so the guide line is h^2, not h.
-    ax.plot(step_sizes, step_sizes**2, "k--", alpha=0.4, label=r"$O(h^2)$")
+    # GRADIENT_VALIDATION_TOLERANCE above), so the guide line is h^2, not h. It
+    # is anchored to the best point of the first curve rather than drawn with a
+    # unit constant: only its slope carries meaning, and an arbitrary offset
+    # invites the reader to compare the wrong thing.
+    if anchors:
+        h_anchor, e_anchor = anchors[0]
+        ax.plot(
+            step_sizes,
+            e_anchor * (step_sizes / h_anchor) ** 2,
+            "k--",
+            alpha=0.4,
+            label=r"$O(h^2)$",
+        )
+    order = _steepest_observed_order(curves)
+    if order is not None:
+        ax.text(
+            0.03,
+            0.03,
+            f"steepest observed order: {order:.2f}",
+            transform=ax.transAxes,
+            fontsize=8,
+            alpha=0.75,
+        )
     if tolerance is not None:
         ax.axhline(
             tolerance, color="crimson", ls=":", lw=1.5, label=f"tol = {tolerance:g}"

@@ -248,7 +248,7 @@ def test_container_run_seeds_signed_junction_for_optimization(
     assert output_captured["gradient_validation_directions"] == 1
     np.testing.assert_allclose(
         output_captured["gradient_validation_steps"],
-        [1e-4, 1e-3, 1e-2],
+        np.logspace(-5, -1, 9),
     )
     np.testing.assert_allclose(
         output_captured["gradient_validation_rho"],
