@@ -222,3 +222,6 @@ docs/agents
 docs/research
 .scratch
 .kilo
+
+# FEniCS/FFC JIT cache warmed into the Binder image by binder/postBuild
+.gyptis-cache/

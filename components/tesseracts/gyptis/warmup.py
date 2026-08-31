@@ -6,42 +6,11 @@ The Binder image runs the same script from the source tree (``binder/postBuild``
 """
 
 import importlib.util
-from collections import OrderedDict
 from pathlib import Path
-
-import dolfin
-import gyptis
 
 
 def main() -> None:
-    """Run one small eigenproblem so FEniCS JIT-compiles its forms at build time."""
-    dolfin.parameters["form_compiler"]["cpp_optimize"] = True
-    epsilon = [12.0, 11.0, 1.0, 1.0]
-    thickness = 1.0 / len(epsilon)
-    thicknesses = OrderedDict(
-        (f"domain_{index}", thickness) for index in range(1, len(epsilon) + 1)
-    )
-    geometry = gyptis.geometry.LayeredBoxPML2D(
-        2.0,
-        thicknesses=thicknesses,
-        pml_width=(0.5, 0.5),
-    )
-    geometry.build()
-    epsilon_by_domain = {
-        f"domain_{index}": value for index, value in enumerate(epsilon, start=1)
-    }
-    simulation = gyptis.Waveguide(
-        geometry,
-        epsilon=epsilon_by_domain,
-        wavenumber=2.0 * 3.141592653589793 / 1.55,
-    )
-
-    # Compile weak forms, boundary conditions, matrix assembly, and eigensolver
-    # setup. Runtime VJP reuses these same formulation structures.
-    simulation.eigensolve(n_eig=4, target=2.0 * 3.141592653589793 / 1.55)
-
-    # Exercise the public runtime VJP path so image builds fail when gradient
-    # evaluation regresses.
+    """Run the served endpoints once so FEniCS JIT-compiles their forms here."""
     # Tesseract copies this script to /tmp and the API to /tesseract/; run from
     # the source tree (Binder), the API is the sibling file.
     api_path = Path(__file__).with_name("tesseract_api.py")
@@ -52,6 +21,13 @@ def main() -> None:
         raise RuntimeError("Unable to load gyptis tesseract API for warmup")
     api = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(api)
+
+    # The public forward and adjoint between them compile every weak form,
+    # boundary condition, assembly kernel and eigensolver setup the endpoints
+    # use, with the production geometry, element degree and domain structure.
+    # Warming through the API rather than a hand-built problem also fails the
+    # image build when either endpoint regresses. Changes to topology, element
+    # degree or formulation should be checked against this coverage.
     design_epsilon = [api.DEFAULT_CORE_EPSILON for _ in api.design_cell_centroids()]
     inputs = api.InputSchema(design_epsilon=design_epsilon)
     api.apply(inputs)

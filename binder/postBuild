@@ -12,7 +12,16 @@ python -m pip install --no-cache-dir "tesseract-core[runtime]==1.12.0"
 
 # Warm the FEniCS/FFC JIT cache (same workload the gyptis image runs at build
 # time) so the first eigensolve in a session does not pay form compilation.
+# Pin the cache to a fixed path inside the image, the way the gyptis Tesseract
+# image does, instead of letting dolfin default to $HOME/.cache: the warmed
+# cache is then found again whatever HOME the session runs with. binder/start
+# re-exports the same paths at container start.
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export DIJITSO_CACHE_DIR="${repo_root}/.gyptis-cache/dijitso"
+export INSTANT_CACHE_DIR="${repo_root}/.gyptis-cache/instant"
+mkdir -p "${DIJITSO_CACHE_DIR}" "${INSTANT_CACHE_DIR}"
 python components/tesseracts/gyptis/warmup.py
+chmod -R a+rwX "${repo_root}/.gyptis-cache"
 
 # Make sure every Julia package the worker loads is precompiled into the
 # image; Pkg.instantiate already did most of this, this is the backstop.
