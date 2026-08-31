@@ -32,20 +32,6 @@ their eigenvalue far outside the guided window. Without containers
 µm units and the same silicon group names — a second author, not a second
 contract.
 
-## The permittivity is a field on the design cells
-
-gyptis consumes a true 2D permittivity field: a DG0 function over the rib
-interior (the **design cells**), written into the formulation after the
-property dictionary has been rebuilt from the scalar background so the PMLs
-stay matched; oxide, slab and everything outside the rib stay constant. The
-eigen-adjoint returns a sensitivity per design cell in a single assembly pass.
-
-*Why.* An earlier coupling collapsed the carrier-induced $\Delta\varepsilon(x)$
-to one scalar per material. Its gradient with respect to the nodal field was
-then **uniform**: any doping topology that redistributed carriers without
-changing the *mean* produced zero optical gradient, which defeats topology
-optimization. The design region is inset from the PML by construction, so a
-varying $\varepsilon$ never touches one.
 
 ## A pivoting direct solver behind the eigensolve
 
