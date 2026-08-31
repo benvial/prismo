@@ -27,8 +27,9 @@ Knobs are passed through ``RUN_ARGS`` (``prismo run --help`` lists them all):
      - Meaning
    * - ``--loss-weight w``
      - Optimize ``Δneff − w·α_mode`` (``w`` in n_eff per dB/cm). Default 0: loss is reported, not penalized.
-   * - ``--seed lateral|vertical|u``
-     - Initial junction topology.
+   * - ``--seed u|lateral|vertical``
+     - Initial junction topology. Default ``u``, the seed of the headline run;
+       the MMA optimum is local, so this picks the basin.
    * - ``--contact-offset``, ``--domain-width``
      - Geometry of the shared mesh [µm].
    * - ``--mesh-size``

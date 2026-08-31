@@ -51,10 +51,11 @@ _LIVE_FRAME_PREFIX = "doping_field_"
 
 def _seed_option() -> Any:
     return typer.Option(
-        "lateral",
+        "u",
         "--seed",
-        help="Initial junction: lateral (n left / p right), vertical (p over n "
-        "in the rib), or u (n wrapped under and beside a p core)",
+        help="Initial junction: u (n wrapped under and beside a p core, the "
+        "default and the best of the three on the container mesh), lateral "
+        "(n left / p right), or vertical (p over n in the rib)",
     )
 
 
@@ -469,7 +470,7 @@ def build_pipeline_inputs(
     live_solvers: bool,
     components: Any | None,
     mesh_size: float | None = None,
-    seed: str = "lateral",
+    seed: str = "u",
     contact_offset: float | None = None,
     domain_width: float | None = None,
 ) -> PipelineInputs:
@@ -956,7 +957,7 @@ def _run_pipeline(
     move_limit: float = _DEFAULT_MOVE_LIMIT,
     mode_index: int = 0,
     loss_weight: float = 0.0,
-    seed: str = "lateral",
+    seed: str = "u",
     contact_offset: float | None = None,
     domain_width: float | None = None,
     bias_sweep_points: int = _DEFAULT_BIAS_SWEEP_POINTS,
@@ -1244,7 +1245,7 @@ def _run_gradient_validation(
     step_sizes: np.ndarray | None = None,
     cold: bool = False,
     loss_weight: float = 0.0,
-    seed: str = "lateral",
+    seed: str = "u",
     contact_offset: float | None = None,
     domain_width: float | None = None,
 ) -> GradientValidationResult:
@@ -1448,7 +1449,7 @@ def _run_objective_probe(
     components: Any | None = None,
     cold: bool = False,
     loss_weight: float = 0.0,
-    seed: str = "lateral",
+    seed: str = "u",
     contact_offset: float | None = None,
     domain_width: float | None = None,
 ) -> ObjectiveLineScan:

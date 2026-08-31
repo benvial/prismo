@@ -42,7 +42,7 @@ html_favicon = "_static/prismo.svg"
 html_static_path = ["_static"]
 html_css_files = ["custom.css"]
 html_js_files = ["custom.js"]
-html_baseurl = "https://benvial.github.io/prismo/"
+html_baseurl = "https://bvial.info/prismo/"
 html_copy_source = False
 html_show_sourcelink = False
 
