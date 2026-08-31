@@ -5,14 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "prismo"
 dynamic = ["version"]
-description = "Differentiable PN-junction photonic phase shifter: ChargeTransport.jl + gyptis composed as Tesseracts"
+description = "Differentiable PN-junction photonic phase shifter"
 authors = [{ name = "Benjamin Vial" }]
 license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = [
     # Host-side pipeline: talks to the two solver containers over HTTP and
     # composes their adjoints in JAX. The solvers themselves live in the images.
-    "tesseract-core==1.11.0",
+    "tesseract-core==1.12.0",
     "prismo_shared",
     "jax>=0.4.30",
     "numpy>=1.26",
@@ -28,7 +28,7 @@ dependencies = [
 dev = [
     # In-process runs and the test-suite load the components' tesseract_api
     # modules, which import tesseract_core.runtime (not in the bare wheel).
-    "tesseract-core[runtime]==1.11.0",
+    "tesseract-core[runtime]==1.12.0",
     "pytest>=7.0",
     "tomli>=2.0; python_version < '3.11'",
     "pre-commit",
