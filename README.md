@@ -103,13 +103,12 @@ mode order; a different TCAD backend would only need the same `apply`/VJP).
 ## Results
 
 All figures are from one run on the container mesh —
-`prismo run --use-containers --seed u --loss-weight 1e-5 --mesh-size 0.05 --r-min 0.1 --bias-sweep-points 6`
-(0.05 µm silicon elements, 0.1 µm filter radius), 192 MMA iterations in
-~49 min on a laptop; `outputs/` holds the PDFs of your own runs and
+`prismo run --use-containers --seed u --loss-weight 1e-5 --mesh-size 0.03 --r-min 0.1 --bias-sweep-points 6`
+(0.03 µm silicon elements, 0.1 µm filter radius, 556 design variables on
+324 design cells), 192 MMA iterations in ~34 min on a laptop; `outputs/` holds the PDFs of your own runs and
 `make figures` refreshes `docs/figures/` from them. The U-shaped seed is the
-best of the three (`lateral`, `vertical`, `u`) under identical settings —
-VπLπ 0.62 V·cm against 1.10 and 1.04 — because the MMA optimum is local and the
-seed picks the basin. The gradient is validated before it is trusted:
+best of the three (`lateral`, `vertical`, `u`); the seed comparison and the mesh
+study below give the evidence. The gradient is validated before it is trusted:
 
 <p align="center"><img src="docs/figures/gradient_validation.png" width="520"></p>
 
@@ -121,8 +120,8 @@ round-off takes over. (`make validate-gradient-containers`)
 <p align="center"><img src="docs/figures/convergence.png" width="520"></p>
 
 **The gradients do the work.** From the seeded U-shaped junction, MMA raises
-Δn_eff at −5 V from 1.24 × 10⁻⁴ to 6.21 × 10⁻⁴ (×5), i.e. **VπLπ from 3.11 to
-0.62 V·cm**. Dips are rejected trials of the move-limited MMA, kept in the
+Δn_eff at −5 V from 1.13 × 10⁻⁴ to 6.47 × 10⁻⁴ (×5.7), i.e. **VπLπ from 3.42 to
+0.60 V·cm**. Dips are rejected trials of the move-limited MMA, kept in the
 record on purpose. (`prismo run` also re-solves the reported design cold —
 worker reset, equilibrium from near-intrinsic, bias ramp — and flags any
 warm/cold discrepancy, so the headline is a property of the design, not of
@@ -131,29 +130,30 @@ the solve path.)
 <p align="center"><img src="docs/figures/doping_field.png" width="760"></p>
 
 **Before / after.** Left: the seed, a U-shaped junction at |N| ≈ 3 × 10¹⁷ cm⁻³
-— n wrapped under and beside a p core. Right: the optimum — a p cap at the
-doping ceiling over an n body, the junction running horizontally across the
-whole rib width at the mode centre and curling down into the slab on the right,
-while the outer slab stays at the seed where the mode does not reach. Trading
-the seed's vertical junction walls for one wide horizontal interface is what
-buys the fivefold Δn_eff: junction area inside the mode is the currency.
+— n wrapped under and beside a p core. Right: the optimum — the U has closed
+into a ring, a p core at the doping ceiling enclosed by n above, below and on
+both sides, with the junction on the mode centre and the outer slab left at the
+seed where the mode does not reach. Closing the U is what buys the ×5.7 in
+Δn_eff: junction perimeter inside the mode is the currency, and a ring
+maximises it.
 
 <p align="center"><img src="docs/figures/depletion_field.png" width="760"></p>
 
 **Where the modulation happens.** Carriers swept out between 0 V and −5 V at
-the optimum (orange, log scale), under the mode's |E| contours. The depleted
-region fills the rib cross-section and the slab beneath it, covering the mode
-peak almost entirely — against the seed, that overlap is the whole of the ×5.
-Doping the mode cannot see would be loss for nothing, and the objective knows
-it: the outer slab is left alone.
+the optimum (orange, log scale), under the mode's |E| contours. Depletion wraps
+the ring junction and fills the rib cross-section, covering the mode peak almost
+entirely — that overlap is the whole of the ×5.7. The pale band through the
+middle is the p core's interior, too far from any junction to deplete; doping
+the mode cannot see would be loss for nothing, and the objective knows it: the
+outer slab is left alone.
 
 <p align="center"><img src="docs/figures/loss_convergence.png" width="520"></p>
 
 **The loss is watched, not ignored.** Modal free-carrier loss α of the unbiased
 device (first-order, overlap-weighted Soref–Bennett absorption) and the
 literature's efficiency–loss figure of merit VπLπ·α at every iteration. The
-optimizer spends loss — 2.67 to 11.9 dB/cm — wherever it pays in Δn_eff, which
-rises faster, so the figure of merit still improves from 8.3 to **7.4 V·dB**
+optimizer spends loss — 2.64 to 13.2 dB/cm — wherever it pays in Δn_eff, which
+rises faster, so the figure of merit still improves from 9.0 to **7.9 V·dB**
 (good depletion modulators sit at 10–30 V·dB). At w = 10⁻⁵ the run travels along
 a near-constant VπLπ·α line while VπLπ falls fivefold: the weight, not the
 iteration count, is what moves the design across the trade-off.
@@ -165,7 +165,8 @@ iteration count, is what moves the design across the trade-off.
 curves outwards. `--loss-weight` is what moves the optimum between them.
 
 **The seed picks the basin.** MMA finds a local optimum, so the starting
-topology matters. All three seeds under identical settings, 192 iterations each:
+topology matters. All three seeds under identical settings on the 0.05 µm mesh,
+192 iterations each:
 
 | seed | Δn_eff | α [dB/cm] | VπLπ [V·cm] | VπLπ·α [V·dB] |
 |---|---|---|---|---|
@@ -174,27 +175,48 @@ topology matters. All three seeds under identical settings, 192 iterations each:
 | `vertical` | 3.74 × 10⁻⁴ | 8.84 | 1.04 | 9.16 |
 
 The U seed wins by 1.8× on efficiency at a figure of merit within 6% of the
-best, which is why it is the default and the run shown above. The spread across
+best, which is why it is the default. The spread across
 seeds is larger than anything the optimizer's own settings move, so a
 multi-start is worth more than tuning the solver. The `lateral` run is also the
 one whose cold re-solve failed, leaving its number warm-path-dependent; `u` and
 `vertical` re-solved cold to the digit.
+
+**Mesh refinement.** The same U-seed run at three silicon element sizes,
+everything else identical (the filter radius is a physical length, so the
+minimum feature size is fixed at 0.1 µm across all three):
+
+| element size [µm] | design cells | Δn_eff | α [dB/cm] | VπLπ [V·cm] | VπLπ·α [V·dB] |
+|---|---|---|---|---|---|
+| 0.05 | 116 | 6.21 × 10⁻⁴ | 11.9 | 0.62 | 7.40 |
+| 0.04 | 196 | 6.78 × 10⁻⁴ | 14.2 | 0.57 | 8.10 |
+| 0.03 | 324 | 6.47 × 10⁻⁴ | 13.2 | 0.60 | 7.87 |
+
+All three cold-re-solve to the digit and find the same ring topology, so the
+design is not a discretization artefact. The numbers, though, do not order with
+element size: VπLπ spans 0.57–0.62 V·cm non-monotonically. That spread is not
+discretization error — it is which local optimum MMA settles into, and it is the
+honest uncertainty on the headline. The mode-overlap weights sum to 0.5717 /
+0.5719 / 0.5718 across the three, so the optical side is converged; what changes
+is the design freedom and the path the optimizer takes through it. The figures
+here are the 0.03 µm run — the finest mesh, and the smoothest picture of the
+same design.
 
 <p align="center"><img src="docs/figures/bias_sweep.png" width="760"></p>
 
 **Across the operating range.** The reported figures of merit against reverse
 bias, seed and optimized design side by side — a post-run characterization
 (`--bias-sweep-points`), not part of the objective, which sees only the −5 V
-operating point. Δn_eff rises almost linearly to 6.21 × 10⁻⁴ and stays about ×5
-the seed at every bias, so the gain is not an artefact of the one voltage it was
-optimized at. The loss panel reads α from the carriers **at each bias** rather
-than the objective's fixed 0 V value, so it falls as the junction empties —
-11.9 dB/cm unbiased to 1.6 dB/cm at −5 V — while the lightly doped seed, already
-mostly depleted, barely moves. The product follows: VπLπ·α improves from
-4.10 V·dB at −1 V to **0.98 V·dB at −5 V**, crossing below the seed near −2 V;
-above that the seed's lighter doping still wins on the product — the design was
-optimized at −5 V and it shows. (These are bias-resolved α values; the 7.4 V·dB
-headline above uses the objective's 0 V loss, the pessimistic reading.)
+operating point. Δn_eff rises almost linearly to 6.47 × 10⁻⁴ and stays 4.5–5.7×
+the seed across the whole range, so the gain is not an artefact of the one
+voltage it was optimized at. The loss panel reads α from the carriers **at each
+bias** rather than the objective's fixed 0 V value, so it falls as the junction
+empties — 13.2 dB/cm unbiased to 2.6 dB/cm at −5 V — while the lightly doped
+seed, already mostly depleted, barely moves. The product follows: VπLπ·α
+improves from 3.92 V·dB at −1 V to **1.56 V·dB at −5 V**, crossing below the
+seed just past −2 V; above that the seed's lighter doping still wins on the
+product — the design was optimized at −5 V and it shows. (These are
+bias-resolved α values; the 7.9 V·dB headline above uses the objective's 0 V
+loss, the pessimistic reading.)
 
 <p align="center"><img src="docs/figures/mode_field.png" width="420"></p>
 
