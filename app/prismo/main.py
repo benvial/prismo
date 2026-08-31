@@ -40,6 +40,11 @@ _DEFAULT_R_MIN = 0.10
 # ``--help`` never eagerly imports jax.
 _SEED_CHOICES = ("lateral", "vertical", "u")
 _CHECKPOINT_NAME = "checkpoint.json"
+# Bias points of the post-run figure-of-merit sweep: 0 V to the objective's
+# operating point in 1 V steps (mirrors ``pipeline.REVERSE_BIAS_V`` as a
+# literal so ``--help`` never eagerly imports jax).
+_DEFAULT_BIAS_SWEEP_POINTS = 6
+_BIAS_SWEEP_MIN_V = -5.0
 # Live per-iteration doping frames: ``<prefix><iteration>.png`` in the output dir.
 _LIVE_FRAME_PREFIX = "doping_field_"
 
@@ -170,6 +175,16 @@ def run(
         "reports the loss. ~4e-6 trades 1e-4 of Δneff against "
         "25 dB/cm",
     ),
+    bias_sweep_points: int = typer.Option(
+        _DEFAULT_BIAS_SWEEP_POINTS,
+        "--bias-sweep-points",
+        min=0,
+        help=f"Bias points of the post-run figure-of-merit sweep, spread from "
+        f"0 V to {_BIAS_SWEEP_MIN_V:g} V: Δneff, modal loss and VπLπ·alpha of "
+        "the seed and of the optimized design against reverse bias. Costs one "
+        "ChargeTransport solve and one eigensolve per point per design; 0 or 1 "
+        "skips the sweep",
+    ),
     seed: str = _seed_option(),
     contact_offset: float = _contact_offset_option(),
     domain_width: float = _domain_width_option(),
@@ -180,7 +195,8 @@ def run(
     1. Generate waveguide mesh (gmsh required, falls back to empty mesh)
     2. Build density filter matrix from mesh node coordinates
     3. Run NLopt MMA optimization (maximize delta_n_eff - loss_weight·alpha)
-    4. Generate paper-ready plots
+    4. Sweep the figures of merit over reverse bias, seed vs optimized
+    5. Generate paper-ready plots
     """
     _check_geometry_knobs(seed, contact_offset, domain_width)
     from prismo.pipeline import (
@@ -221,6 +237,7 @@ def run(
             seed=seed,
             contact_offset=contact_offset,
             domain_width=domain_width,
+            bias_sweep_points=bias_sweep_points,
         )
     finally:
         if use_containers and components is not None:
@@ -716,6 +733,39 @@ def _optimized_swept_carriers(
     return np.asarray(n1 + p1 - n0 - p0, dtype=float)
 
 
+def _bias_sweep_curves(
+    inputs: PipelineInputs,
+    rho: np.ndarray,
+    components: Any | None,
+    mode_overlap: np.ndarray | None,
+    n_points: int,
+) -> list[Any]:
+    """The figures of merit of one design from 0 V to the operating bias.
+
+    One ChargeTransport solve and one eigensolve per bias through the same
+    bound pipeline the optimizer drove. The ChargeTransport worker is reset
+    first so each design's sweep starts from its own equilibrium rather than
+    continuing the previous design's warm state.
+    """
+    import jax.numpy as jnp
+
+    from prismo.pipeline import bias_sweep, default_components
+
+    bundle = components if components is not None else default_components()
+    _reset_chargetransport(bundle)
+    return bias_sweep(
+        jnp.asarray(rho, dtype=jnp.float64),
+        np.linspace(0.0, _BIAS_SWEEP_MIN_V, n_points),
+        H=inputs.H_dense,
+        H_sum=inputs.H_sum,
+        mesh_ref=inputs.mesh_ref,
+        design_transfer=inputs.design_transfer,
+        design_nodes=inputs.design_nodes,
+        components=bundle,
+        mode_overlap=mode_overlap,
+    )
+
+
 def _clear_live_frames(output_dir: str | Path) -> int:
     """Delete ``doping_field_<n>.png`` frames a previous run left behind.
 
@@ -909,6 +959,7 @@ def _run_pipeline(
     seed: str = "lateral",
     contact_offset: float | None = None,
     domain_width: float | None = None,
+    bias_sweep_points: int = _DEFAULT_BIAS_SWEEP_POINTS,
 ) -> None:
     from prismo.optimizer import OptimizationCancelled, optimize_doping
     from prismo.outputs import generate_outputs, plot_live_doping_field
@@ -1028,6 +1079,9 @@ def _run_pipeline(
     )
     bound_pipeline = partial(pipeline_fn, **bound_kwargs)
     bound_terms = partial(pipeline_with_terms, **bound_kwargs)
+    # The seed, as a design-node vector: what the bias sweep compares the
+    # reported design against, and what the figures scatter to full node order.
+    rho_initial_design = np.asarray(theta_init, dtype=float)
 
     # The mode figure is a post-hoc query, so a backend that cannot answer it --
     # an image predating the ``mode_field`` operation, say -- must cost one
@@ -1074,6 +1128,44 @@ def _run_pipeline(
                 f"{loss_figure_of_merit_v_db(headline, float(warm_loss)):+.4g} V·dB"
             )
 
+    # The bias sweep is the last physics of the run: it leaves the
+    # ChargeTransport worker warm at whichever design it swept last, so it goes
+    # after the cold re-evaluation, whose whole point is a cold start. Both
+    # designs or neither -- a half-drawn comparison would invite reading one
+    # curve as the other's baseline.
+    sweep_initial: list[Any] = []
+    sweep_optimized: list[Any] = []
+    if bias_sweep_points > 1:
+        typer.echo(
+            f"      Sweeping the figures of merit over {bias_sweep_points} bias "
+            f"points (0 to {_BIAS_SWEEP_MIN_V:g} V), initial and optimized..."
+        )
+        try:
+            sweep_initial = _bias_sweep_curves(
+                inputs, rho_initial_design, components, mode_overlap, bias_sweep_points
+            )
+            sweep_optimized = _bias_sweep_curves(
+                inputs, rho_opt, components, mode_overlap, bias_sweep_points
+            )
+        except Exception as exc:
+            typer.echo(f"      WARNING: bias sweep figure skipped ({exc})")
+            sweep_initial, sweep_optimized = [], []
+        else:
+            for point in sweep_optimized:
+                # The 0 V point has no Δneff by construction, so its VπLπ·alpha
+                # is infinite rather than large: report it as undefined.
+                fom = (
+                    f"{point.fom_v_db:+.4g} V·dB"
+                    if np.isfinite(point.fom_v_db)
+                    else "n/a"
+                )
+                typer.echo(
+                    f"      V = {point.bias_v:+.2f} V: "
+                    f"Delta_n_eff = {point.delta_neff:+.4e}, "
+                    f"alpha = {point.modal_loss_db_cm:.4g} dB/cm, "
+                    f"VpiLpi x alpha = {fom}"
+                )
+
     if live_solvers:
         # This audits that the containers produced a *live* signal, not that the
         # optimizer liked it. The magnitude is what carries that: a dead or
@@ -1096,7 +1188,7 @@ def _run_pipeline(
             )
 
     typer.echo("[3/3] Generating outputs...")
-    rho_initial = np.asarray(theta_init, dtype=float)
+    rho_initial = rho_initial_design
     # The figures are drawn on the full mesh, so the design field goes back into
     # full node order first; non-design nodes read theta = 0 (net-intrinsic),
     # which is what oxide means anyway.
@@ -1131,6 +1223,8 @@ def _run_pipeline(
         design_history=doping_frames,
         animation_history=animated_history,
         swept_carriers=swept_carriers,
+        bias_sweep_initial=sweep_initial,
+        bias_sweep_optimized=sweep_optimized,
     )
     for p in plot_paths:
         typer.echo(f"      {p}")

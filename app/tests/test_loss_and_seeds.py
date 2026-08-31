@@ -311,3 +311,86 @@ class TestCarrierFields:
         np.testing.assert_allclose(np.asarray(p0), 2.0 * doping)
         np.testing.assert_allclose(np.asarray(n1), 0.5 * doping)
         np.testing.assert_allclose(np.asarray(p1), doping)
+
+
+def _depleting_stub(n_cm3: float, p_cm3: float):
+    """ChargeTransport double whose carriers deplete linearly with reverse bias."""
+
+    def ct(doping, bias_voltage, mesh_ref=None):
+        depletion = 1.0 - 0.1 * abs(float(bias_voltage))
+        return (
+            jnp.full_like(doping, depletion * n_cm3),
+            jnp.full_like(doping, depletion * p_cm3),
+        )
+
+    return ct
+
+
+class TestBiasSweep:
+    N = 4
+    BIASES = (0.0, -2.5, -5.0)
+
+    def _sweep(self, **kwargs):
+        from prismo.pipeline import bias_sweep
+
+        return bias_sweep(
+            jnp.full(self.N, 0.3),
+            self.BIASES,
+            components=stub_components(chargetransport=_depleting_stub(1e18, 1e16)),
+            **kwargs,
+        )
+
+    def test_one_point_per_bias_in_order(self):
+        points = self._sweep()
+        assert [p.bias_v for p in points] == list(self.BIASES)
+
+    def test_zero_bias_has_no_shift_and_no_finite_efficiency(self):
+        """Δneff is measured against 0 V, so the 0 V point is exactly zero."""
+        zero = self._sweep()[0]
+        assert zero.delta_neff == 0.0
+        assert not np.isfinite(zero.vpi_lpi_v_cm)
+
+    def test_delta_neff_grows_with_reverse_bias(self):
+        dneff = [p.delta_neff for p in self._sweep()]
+        assert dneff[0] < dneff[1] < dneff[2]
+
+    def test_vpi_lpi_uses_each_point_own_bias(self):
+        overlap = jnp.full(self.N, 1.0 / self.N)
+        for point in self._sweep(mode_overlap=overlap)[1:]:
+            assert point.vpi_lpi_v_cm == pytest.approx(
+                vpi_lpi_v_cm(point.delta_neff, point.bias_v)
+            )
+            assert point.fom_v_db == pytest.approx(
+                point.vpi_lpi_v_cm * point.modal_loss_db_cm
+            )
+
+    def test_loss_is_read_at_each_bias_not_at_equilibrium(self):
+        """Depletion removes carriers, so alpha falls as the bias deepens."""
+        overlap = jnp.full(self.N, 1.0 / self.N)
+        losses = [p.modal_loss_db_cm for p in self._sweep(mode_overlap=overlap)]
+        assert losses[0] > losses[1] > losses[2] > 0.0
+        # The 0 V point is the same loss the objective reports.
+        alpha = 8.5e-18 * 1e18 + 6.0e-18 * 1e16
+        neff0 = np.sqrt(DEFAULT_BACKGROUND_EPSILON)
+        assert losses[0] == pytest.approx((3.4757 / neff0) * alpha * NEPER_TO_DB)
+
+    def test_without_overlap_the_loss_and_figure_of_merit_are_nan(self):
+        for point in self._sweep():
+            assert np.isnan(point.modal_loss_db_cm)
+            assert np.isnan(point.fom_v_db)
+
+    def test_the_equilibrium_is_solved_once_and_reused(self):
+        from prismo.pipeline import bias_sweep
+
+        biases = []
+
+        def ct(doping, bias_voltage, mesh_ref=None):
+            biases.append(float(bias_voltage))
+            return _depleting_stub(1e18, 1e16)(doping, bias_voltage)
+
+        bias_sweep(
+            jnp.full(self.N, 0.3),
+            self.BIASES,
+            components=stub_components(chargetransport=ct),
+        )
+        assert biases == [0.0, -2.5, -5.0]

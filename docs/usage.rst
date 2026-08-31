@@ -48,6 +48,7 @@ VπLπ·α, and writes to ``outputs/``:
 - ``doping_field.pdf`` — initial vs optimized signed design field
 - ``mode_field.pdf`` — ``|E|`` of the tracked mode
 - ``depletion_field.pdf`` — carriers swept out between 0 V and −5 V under the mode
+- ``bias_sweep.pdf`` — Δn_eff, α and VπLπ·α vs bias, seed vs optimized (``--bias-sweep-points 0`` skips it)
 - ``gradient_validation.pdf`` — relative error of the adjoint vs step size
 - ``loss_convergence.pdf``, ``tradeoff.pdf`` — loss-aware runs
 - ``doping_evolution.{gif,mp4}`` — net doping at every evaluation

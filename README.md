@@ -194,12 +194,13 @@ make probe-objective-containers RUN_ARGS="--design outputs/checkpoint.json"   # 
 
 Every run prints Δn_eff (warm and cold), VπLπ, modal loss and VπLπ·α, and
 writes `convergence.pdf`, `doping_field.pdf`, `mode_field.pdf`,
-`depletion_field.pdf`, `gradient_validation.pdf`, `loss_convergence.pdf`,
-`tradeoff.pdf`, `doping_evolution.{gif,mp4}` and `checkpoint.json` (best design
-+ full history, resumable by `prismo animate`). There is no stub path: without
-the containers `make run` needs both solvers importable (gyptis/FEniCS and
-`julia`, as on Binder) and raises otherwise instead of inventing a gradient;
-unit tests inject explicit doubles through the `components=` seam.
+`depletion_field.pdf`, `bias_sweep.pdf`, `gradient_validation.pdf`,
+`loss_convergence.pdf`, `tradeoff.pdf`, `doping_evolution.{gif,mp4}` and
+`checkpoint.json` (best design + full history, resumable by `prismo animate`).
+There is no stub path: without the containers `make run` needs both solvers
+importable (gyptis/FEniCS and `julia`, as on Binder) and raises otherwise
+instead of inventing a gradient; unit tests inject explicit doubles through
+the `components=` seam.
 
 **In the browser.** The Binder badge above opens
 [`notebooks/prismo.ipynb`](notebooks/prismo.ipynb) in a JupyterLab with both

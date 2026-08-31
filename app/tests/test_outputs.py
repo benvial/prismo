@@ -546,6 +546,20 @@ class TestGenerateOutputs:
             )
             assert "depletion_field.pdf" in {path.name for path in paths}
 
+    def test_emits_the_bias_sweep_when_both_designs_swept(self):
+        coords = _make_coords()
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = generate_outputs(
+                np.full(N_NODES, 0.25),
+                RNG.random(N_NODES),
+                _make_history(),
+                coords,
+                output_dir=tmp,
+                bias_sweep_initial=_make_bias_sweep(2e-4),
+                bias_sweep_optimized=_make_bias_sweep(5e-4),
+            )
+            assert "bias_sweep.pdf" in {path.name for path in paths}
+
     def test_custom_directions(self):
         import jax.numpy as jnp
 
@@ -758,3 +772,73 @@ class TestObjectiveLineScan:
         assert float(jnp.linalg.norm(d_random)) == pytest.approx(1.0)
         with pytest.raises(ValueError, match="gradient"):
             probe_direction(f, rho, "sideways")
+
+
+def _make_bias_sweep(delta_neff_at_5v: float, loss_db_cm: float = 200.0) -> list:
+    """A synthetic 0 to -5 V sweep: Δneff linear in bias, loss falling with it."""
+    from prismo.pipeline import BiasPoint, loss_figure_of_merit_v_db, vpi_lpi_v_cm
+
+    points = []
+    for bias in np.linspace(0.0, -5.0, 6):
+        dneff = delta_neff_at_5v * abs(bias) / 5.0
+        loss = loss_db_cm * (1.0 - 0.05 * abs(bias))
+        points.append(
+            BiasPoint(
+                bias_v=float(bias),
+                delta_neff=float(dneff),
+                modal_loss_db_cm=float(loss),
+                vpi_lpi_v_cm=vpi_lpi_v_cm(dneff, bias),
+                fom_v_db=loss_figure_of_merit_v_db(dneff, loss, bias),
+            )
+        )
+    return points
+
+
+class TestBiasSweepPlot:
+    """The initial-vs-optimized figures of merit against reverse bias."""
+
+    def test_writes_three_panels_with_one_curve_per_design(self, tmp_path):
+        from prismo.outputs import plot_bias_sweep
+
+        path = plot_bias_sweep(
+            _make_bias_sweep(2e-4), _make_bias_sweep(5e-4), output_dir=tmp_path
+        )
+        assert path is not None
+        assert path.name == "bias_sweep.pdf"
+        assert path.exists()
+
+    def test_draws_one_design_alone(self, tmp_path):
+        from prismo.outputs import plot_bias_sweep
+
+        assert plot_bias_sweep(None, _make_bias_sweep(5e-4), output_dir=tmp_path)
+
+    def test_no_sweep_writes_nothing(self, tmp_path):
+        from prismo.outputs import plot_bias_sweep
+
+        assert plot_bias_sweep(None, [], output_dir=tmp_path) is None
+        assert not list(tmp_path.glob("*.pdf"))
+
+    def test_drops_the_infinite_zero_bias_figure_of_merit(self, tmp_path):
+        """The 0 V point has no Δneff, so its VπLπ·alpha must not set the scale."""
+        from prismo.outputs import plot_bias_sweep
+
+        sweep = _make_bias_sweep(5e-4)
+        assert not np.isfinite(sweep[0].fom_v_db)
+        path = plot_bias_sweep(sweep, sweep, output_dir=tmp_path)
+        assert path is not None and path.exists()
+
+    def test_a_sweep_without_a_loss_still_draws_the_other_panels(self, tmp_path):
+        from prismo.outputs import plot_bias_sweep
+        from prismo.pipeline import BiasPoint
+
+        sweep = [
+            BiasPoint(
+                bias_v=float(bias),
+                delta_neff=1e-4 * abs(bias),
+                modal_loss_db_cm=float("nan"),
+                vpi_lpi_v_cm=1.0,
+                fom_v_db=float("nan"),
+            )
+            for bias in np.linspace(0.0, -5.0, 6)
+        ]
+        assert plot_bias_sweep(sweep, sweep, output_dir=tmp_path) is not None

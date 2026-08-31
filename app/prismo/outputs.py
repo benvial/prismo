@@ -6,6 +6,8 @@ adjoint-vs-finite-difference gradient validation, the initial-vs-optimized
 signed θ field, and the optical mode ``|E|`` on the rib cross-section. Panels that serve none of those were dropped. A
 loss-aware run adds the loss history, the Δneff-vs-loss trade-off
 plane, and an animation of the doping field over the optimizer's evaluations.
+A run that swept the bias adds the initial-vs-optimized figures of merit
+against reverse bias.
 """
 
 from __future__ import annotations
@@ -340,6 +342,107 @@ def plot_tradeoff(
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     path = out / "tradeoff.pdf"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+# The two designs the bias sweep compares, and their colours: the seed the run
+# started from and the design MMA reported.
+_SWEEP_STYLE: dict[str, dict] = {
+    "initial": {
+        "color": "#2c7bb6",
+        "marker": "o",
+        "linestyle": "--",
+        "label": "initial",
+    },
+    "optimized": {
+        "color": "#d7191c",
+        "marker": "s",
+        "linestyle": "-",
+        "label": "optimized",
+    },
+}
+
+
+def _sweep_arrays(points: Sequence[Any]) -> dict[str, np.ndarray]:
+    """The four series of one bias sweep as arrays, keyed by quantity."""
+    return {
+        "bias_v": np.asarray([float(pt.bias_v) for pt in points]),
+        "delta_neff": np.asarray([float(pt.delta_neff) for pt in points]),
+        "modal_loss_db_cm": np.asarray([float(pt.modal_loss_db_cm) for pt in points]),
+        "fom_v_db": np.asarray([float(pt.fom_v_db) for pt in points]),
+    }
+
+
+def plot_bias_sweep(
+    initial: Sequence[Any] | None,
+    optimized: Sequence[Any] | None,
+    output_dir: str | Path | None = None,
+) -> Path | None:
+    """The three reported figures of merit vs reverse bias, initial vs optimized.
+
+    Three panels sharing the bias axis -- Δneff, the modal free-carrier loss
+    alpha, and the VπLπ·alpha efficiency-loss figure of merit -- each carrying
+    one curve per design, so what the optimizer bought is visible across the
+    whole operating range rather than only at the single bias it optimized. The
+    bias axis runs left to right from 0 V into reverse bias.
+
+    Δneff is zero at 0 V by construction (it is measured against that
+    equilibrium), so VπLπ·alpha is infinite there and that point is dropped
+    from the third panel rather than drawn off-scale.
+
+    Args:
+        initial: :class:`~prismo.pipeline.BiasPoint` sequence for the seed
+            design; ``None`` or empty draws no initial curve.
+        optimized: The same for the reported design.
+        output_dir: Directory to write ``bias_sweep.pdf``.
+
+    Returns:
+        Path to the saved figure, or ``None`` when neither design swept.
+    """
+    sweeps = [
+        (key, _sweep_arrays(points))
+        for key, points in (("initial", initial), ("optimized", optimized))
+        if points
+    ]
+    if not sweeps:
+        return None
+    out = _ensure_output_dir(output_dir)
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4), sharex=True)
+    panels = (
+        ("delta_neff", r"$\Delta n_{\mathrm{eff}}$", "Index shift"),
+        ("modal_loss_db_cm", r"$\alpha$ [dB/cm]", "Modal free-carrier loss"),
+        ("fom_v_db", r"$V_\pi L_\pi \cdot \alpha$ [V$\cdot$dB]", "Figure of merit"),
+    )
+    for ax, (key, ylabel, title) in zip(axes, panels, strict=True):
+        for name, series in sweeps:
+            values = series[key]
+            # A design whose physics never reported a loss carries nan across
+            # the panel; the finite mask also drops the infinite 0 V figure of
+            # merit, which would otherwise set the whole panel's scale.
+            finite = np.isfinite(values)
+            if not np.any(finite):
+                continue
+            ax.plot(
+                series["bias_v"][finite],
+                values[finite],
+                markersize=4,
+                **_SWEEP_STYLE[name],
+            )
+        ax.set_xlabel("Bias [V]")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+    # Reverse bias is negative: invert the axis so deepening bias reads left to
+    # right, the way the sweep is run.
+    axes[0].invert_xaxis()
+    handles, labels = axes[0].get_legend_handles_labels()
+    if labels:
+        axes[0].legend(handles, labels, loc="best")
+    fig.tight_layout()
+    path = out / "bias_sweep.pdf"
     fig.savefig(path)
     plt.close(fig)
     return path
@@ -1552,6 +1655,8 @@ def generate_outputs(
     animation_history: list[dict] | None = None,
     animation_formats: Sequence[str] = ("gif", "mp4"),
     swept_carriers: np.ndarray | None = None,
+    bias_sweep_initial: Sequence[Any] | None = None,
+    bias_sweep_optimized: Sequence[Any] | None = None,
 ) -> list[Path]:
     """Generate the headline output figures.
 
@@ -1586,6 +1691,11 @@ def generate_outputs(
         swept_carriers: ``(n + p)(V_bias) - (n + p)(0 V)`` per node at the
             optimized design, for :func:`plot_depletion_field`; ``None``
             skips that figure.
+        bias_sweep_initial: ``BiasPoint`` sequence from
+            :func:`~prismo.pipeline.bias_sweep` for the seed design, for
+            :func:`plot_bias_sweep`.
+        bias_sweep_optimized: The same for the reported design. The figure is
+            skipped when both are empty.
 
     Returns:
         List of paths to the generated plot files.
@@ -1605,6 +1715,10 @@ def generate_outputs(
         loss_path = loss_figure(history, output_dir=out)
         if loss_path is not None:
             paths.append(loss_path)
+
+    sweep = plot_bias_sweep(bias_sweep_initial, bias_sweep_optimized, output_dir=out)
+    if sweep is not None:
+        paths.append(sweep)
 
     doping = plot_doping_field(
         rho_initial,

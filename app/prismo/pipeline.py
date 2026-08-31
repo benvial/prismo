@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -1168,7 +1168,9 @@ REVERSE_BIAS_V = -5.0
 _WAVELENGTH_CM = 1.55e-4  # 1.55 µm in cm
 
 
-def vpi_lpi_v_cm(delta_neff: float | jax.Array) -> float:
+def vpi_lpi_v_cm(
+    delta_neff: float | jax.Array, bias_v: float = REVERSE_BIAS_V
+) -> float:
     """Half-wave voltage-length product VπLπ [V·cm] from signed Δneff.
 
     A carrier-depletion phase modulator accrues ``φ = (2π/λ)·Δneff·L``, so the
@@ -1177,11 +1179,14 @@ def vpi_lpi_v_cm(delta_neff: float | jax.Array) -> float:
     efficiency headline (smaller ``|VπLπ|`` is better); it is *reported*, not
     optimized -- signed Δneff is the optimized proxy. VπLπ carries Δneff's sign
     (a wrong-polarity optimum reads negative) and diverges as Δneff → 0.
+
+    ``bias_v`` is the bias Δneff was measured at; it defaults to the operating
+    point the objective uses, and the bias sweep passes its own.
     """
     dneff = float(delta_neff)
     if dneff == 0.0:
         return float("inf")
-    return abs(REVERSE_BIAS_V) * _WAVELENGTH_CM / (2.0 * dneff)
+    return abs(bias_v) * _WAVELENGTH_CM / (2.0 * dneff)
 
 
 # -- Free-carrier loss ------------------------------------------------
@@ -1235,14 +1240,16 @@ def modal_loss_db_cm(
 
 
 def loss_figure_of_merit_v_db(
-    delta_neff: float | jax.Array, modal_loss_db_cm_value: float | jax.Array
+    delta_neff: float | jax.Array,
+    modal_loss_db_cm_value: float | jax.Array,
+    bias_v: float = REVERSE_BIAS_V,
 ) -> float:
     """``VπLπ x alpha`` [V·dB]: the literature's efficiency-loss figure of merit.
 
     Smaller is better; good depletion modulators reach ~10-30 V·dB. Like
     VπLπ it is *reported*, not optimized, and inherits VπLπ's sign.
     """
-    return vpi_lpi_v_cm(delta_neff) * float(modal_loss_db_cm_value)
+    return vpi_lpi_v_cm(delta_neff, bias_v) * float(modal_loss_db_cm_value)
 
 
 def read_mode_overlap(
@@ -1345,6 +1352,54 @@ class PipelineTerms(NamedTuple):
     modal_loss_db_cm: jax.Array
 
 
+def _theta_to_doping(
+    theta: jax.Array,
+    H: jax.Array | None,
+    H_sum: jax.Array | None,
+    design_nodes: DesignNodes | None,
+) -> jax.Array:
+    """Filter -> full node order -> signed doping map [cm^-3].
+
+    The three steps every path into the solvers takes before ChargeTransport
+    sees a design. Filtering happens on the design nodes, so the filter never
+    averages a silicon node against an oxide variable that carries no physics;
+    the filtered field then goes back to full gmsh node order with theta = 0
+    (net-intrinsic) off the design set, which is what oxide means anyway.
+    """
+    if H is not None:
+        if H_sum is None:
+            H_sum = jnp.sum(H, axis=1)
+        theta_tilde = _filter_jax(theta, H, H_sum)
+    else:
+        theta_tilde = theta
+    if design_nodes is not None:
+        theta_tilde = design_nodes.scatter(theta_tilde)
+    return doping_from_theta(theta_tilde)
+
+
+def _modal_loss_from_carriers(
+    electrons_cm3: jax.Array,
+    holes_cm3: jax.Array,
+    mode_overlap: jax.Array,
+    design_transfer: jax.Array | None,
+    neff_background: jax.Array | float,
+) -> jax.Array:
+    """Modal free-carrier loss [dB/cm] of one carrier state.
+
+    Soref-Bennett absorption from the *absolute* carrier densities, carried
+    onto the design cells by the same transfer as the permittivity and summed
+    against the background mode's sensitivity weights.
+    """
+    alpha_nodes = free_carrier_absorption_cm(electrons_cm3, holes_cm3)
+    if design_transfer is None:
+        alpha_cells = alpha_nodes
+    else:
+        alpha_cells = (
+            jnp.asarray(design_transfer, dtype=alpha_nodes.dtype) @ alpha_nodes
+        )
+    return modal_loss_db_cm(alpha_cells, mode_overlap, neff_background)
+
+
 def _pre_eigensolve(
     theta: jax.Array,
     H: jax.Array | None,
@@ -1361,24 +1416,8 @@ def _pre_eigensolve(
     permittivity fields the eigensolves consume and the equilibrium carriers
     (cm^-3, full node order) the loss term reads.
     """
-    # 1. Density filter: theta -> theta_tilde (linear; regularizes junction width).
-    # Filtering happens on the design nodes, so the filter never averages a
-    # silicon node against an oxide variable that carries no physics.
-    if H is not None:
-        if H_sum is None:
-            H_sum = jnp.sum(H, axis=1)
-        theta_tilde = _filter_jax(theta, H, H_sum)
-    else:
-        theta_tilde = theta
-
-    # 1b. Back to full gmsh node order for the solvers, which key off the shared
-    # mesh's node set. Non-design nodes take theta = 0 (net-intrinsic): they are
-    # oxide, and ChargeTransport reads doping on the silicon subgrid only.
-    if design_nodes is not None:
-        theta_tilde = design_nodes.scatter(theta_tilde)
-
-    # 2. Signed doping mapping: theta_tilde -> N(theta) [cm^-3]
-    doping = doping_from_theta(theta_tilde)
+    # 1-2. Density filter, full node order, signed doping map [cm^-3].
+    doping = _theta_to_doping(theta, H, H_sum, design_nodes)
 
     # 3. ChargeTransport at equilibrium (0 V)
     n0, p0 = components.chargetransport(doping, 0.0, mesh_ref)
@@ -1421,18 +1460,112 @@ def carrier_fields(
     """
     if components is None:
         components = default_components()
-    if H is not None:
-        if H_sum is None:
-            H_sum = jnp.sum(H, axis=1)
-        theta_tilde = _filter_jax(theta, H, H_sum)
-    else:
-        theta_tilde = theta
-    if design_nodes is not None:
-        theta_tilde = design_nodes.scatter(theta_tilde)
-    doping = doping_from_theta(theta_tilde)
+    doping = _theta_to_doping(theta, H, H_sum, design_nodes)
     n0, p0 = components.chargetransport(doping, 0.0, mesh_ref)
     n1, p1 = components.chargetransport(doping, REVERSE_BIAS_V, mesh_ref)
     return n0, p0, n1, p1
+
+
+class BiasPoint(NamedTuple):
+    """One operating point of the reported figures of merit.
+
+    ``delta_neff`` is measured against the same 0 V reference as the objective;
+    ``modal_loss_db_cm`` is the modal free-carrier loss of the device *at this
+    bias* (depletion removes carriers, so it falls as the bias deepens, unlike
+    the fixed 0 V loss the objective reports). ``vpi_lpi_v_cm`` and ``fom_v_db``
+    are ``inf`` where Δneff is zero, which the 0 V point always is.
+    """
+
+    bias_v: float
+    delta_neff: float
+    modal_loss_db_cm: float
+    vpi_lpi_v_cm: float
+    fom_v_db: float
+
+
+def bias_sweep(
+    theta: jax.Array,
+    bias_voltages: Sequence[float],
+    H: jax.Array | None = None,
+    H_sum: jax.Array | None = None,
+    mesh_ref: MeshRef | None = None,
+    background_epsilon: float | None = None,
+    design_transfer: jax.Array | None = None,
+    design_nodes: DesignNodes | None = None,
+    components: PipelineComponents | None = None,
+    mode_overlap: jax.Array | np.ndarray | None = None,
+) -> list[BiasPoint]:
+    """The reported figures of merit of one design over a range of biases.
+
+    A post-hoc characterization, not part of the objective: the optimizer works
+    at the single operating point ``REVERSE_BIAS_V``, and this reruns the same
+    physics -- one ChargeTransport solve and one eigensolve per bias, against
+    the shared 0 V equilibrium -- to show how Δneff, the modal loss and
+    VπLπ·alpha develop as the reverse bias deepens. Not differentiated.
+
+    The 0 V equilibrium is solved once and reused as both the Soref-Bennett
+    reference and, where ``0.0`` is in ``bias_voltages``, that point's own
+    carrier state: at zero bias Δneff is exactly zero and VπLπ is infinite,
+    which is the honest reading of "no bias, no phase shift".
+
+    ``bias_voltages`` are the biases to characterize [V], e.g. ``0`` to ``-5``,
+    and ``mode_overlap`` the frozen weights from :func:`read_mode_overlap`
+    (without them the loss and the figure of merit read ``nan``). The remaining
+    arguments match :func:`pipeline`. Returns one :class:`BiasPoint` per bias,
+    in the order given.
+    """
+    if background_epsilon is None:
+        background_epsilon = DEFAULT_BACKGROUND_EPSILON
+    if components is None:
+        components = default_components()
+
+    doping = _theta_to_doping(theta, H, H_sum, design_nodes)
+    n0_cm3, p0_cm3 = components.chargetransport(doping, 0.0, mesh_ref)
+    n0, p0 = n0_cm3 * _CM3_TO_M3, p0_cm3 * _CM3_TO_M3
+    bg = jnp.asarray(background_epsilon)
+    weights = None if mode_overlap is None else jnp.asarray(mode_overlap)
+
+    points: list[BiasPoint] = []
+    for bias in bias_voltages:
+        bias = float(bias)
+        if bias == 0.0:
+            n1_cm3, p1_cm3 = n0_cm3, p0_cm3
+        else:
+            n1_cm3, p1_cm3 = components.chargetransport(doping, bias, mesh_ref)
+        n1, p1 = n1_cm3 * _CM3_TO_M3, p1_cm3 * _CM3_TO_M3
+
+        delta_eps, _ = _sb_jax(n1, p1, n0, p0)
+        epsilon_bg, epsilon_pert = _build_design_epsilon(delta_eps, bg, design_transfer)
+        # The background solve is rho- and bias-independent; the bundle caches
+        # its eigenmode, so re-asking per bias costs one lookup.
+        neff_0 = jnp.sqrt(
+            jnp.maximum(
+                components.gyptis_background(epsilon_bg, background_epsilon), 0.0
+            )
+        )
+        neff_1 = jnp.sqrt(
+            jnp.maximum(components.gyptis(epsilon_pert, background_epsilon), 0.0)
+        )
+        delta_neff = float(neff_1 - neff_0)
+
+        if weights is None:
+            loss = float("nan")
+        else:
+            loss = float(
+                _modal_loss_from_carriers(
+                    n1_cm3, p1_cm3, weights, design_transfer, neff_0
+                )
+            )
+        points.append(
+            BiasPoint(
+                bias_v=bias,
+                delta_neff=delta_neff,
+                modal_loss_db_cm=loss,
+                vpi_lpi_v_cm=vpi_lpi_v_cm(delta_neff, bias),
+                fom_v_db=loss_figure_of_merit_v_db(delta_neff, loss, bias),
+            )
+        )
+    return points
 
 
 def design_epsilon_from_theta(
@@ -1538,17 +1671,10 @@ def pipeline_with_terms(
                 f"mode_overlap has shape {weights.shape}; expected one weight per "
                 f"design cell {epsilon_bg.shape}"
             )
-        # Loss of the unbiased device: the absolute 0 V carriers, carried onto
-        # the design cells by the same transfer as the permittivity, summed
-        # against the background mode's sensitivity weights.
-        alpha_nodes = free_carrier_absorption_cm(n0_cm3, p0_cm3)
-        if design_transfer is None:
-            alpha_cells = alpha_nodes
-        else:
-            alpha_cells = (
-                jnp.asarray(design_transfer, dtype=alpha_nodes.dtype) @ alpha_nodes
-            )
-        loss = modal_loss_db_cm(alpha_cells, weights, neff_0)
+        # Loss of the unbiased device: the absolute 0 V carriers.
+        loss = _modal_loss_from_carriers(
+            n0_cm3, p0_cm3, weights, design_transfer, neff_0
+        )
 
     objective = delta_neff if loss_weight == 0.0 else delta_neff - loss_weight * loss
     return objective, PipelineTerms(delta_neff=delta_neff, modal_loss_db_cm=loss)

@@ -567,8 +567,9 @@ def test_container_run_reports_warm_and_cold_objective(
         components=components,
     )
 
-    # Reset happens after the optimization and before the cold solve.
-    assert calls == ["optimize", "reset"]
+    # Reset happens after the optimization and before the cold solve; the bias
+    # sweep that follows resets once more per design it characterizes.
+    assert calls == ["optimize", "reset", "reset", "reset"]
     cold = output_captured["cold_reevaluation"]
     assert cold is not None
     assert cold.warm_delta_neff == pytest.approx(1e-3)
@@ -581,6 +582,13 @@ def test_container_run_reports_warm_and_cold_objective(
     assert "Delta_n_eff (cold re-solve)" in out
     assert "WARNING: warm/cold Delta_n_eff disagree" in out
     assert f"VpiLpi = {vpi_lpi_v_cm(expected_cold):+.4e}" in out
+    # Both designs are characterized from 0 V to the operating bias.
+    for key in ("bias_sweep_initial", "bias_sweep_optimized"):
+        sweep = output_captured[key]
+        assert [point.bias_v for point in sweep] == pytest.approx(
+            list(np.linspace(0.0, main_module._BIAS_SWEEP_MIN_V, 6))
+        )
+        assert sweep[0].delta_neff == 0.0
 
 
 def test_container_run_without_reset_seam_skips_cold_reevaluation(
@@ -1222,10 +1230,14 @@ def test_container_run_survives_a_failing_cold_resolve(
         components=components,
     )
 
-    assert calls == ["reset"]
+    # One reset for the cold re-solve, one for the bias sweep, which the same
+    # failing ChargeTransport double stops at its first design.
+    assert calls == ["reset", "reset"]
     assert output_captured["cold_reevaluation"] is None
+    assert output_captured["bias_sweep_optimized"] == []
     out = capsys.readouterr().out
     assert "WARNING: cold re-solve of the reported design FAILED" in out
+    assert "WARNING: bias sweep figure skipped" in out
     assert "Best Delta_n_eff (warm) = +1.000000e-03" in out
 
 
@@ -1403,6 +1415,75 @@ def test_cli_run_exposes_the_ticket_25_knobs() -> None:
         assert flag in result.stdout
     # The default filter radius spans 3-4 elements of the 0.04 µm container mesh.
     assert main_module._DEFAULT_R_MIN == pytest.approx(0.10)
+
+
+def test_cli_run_exposes_the_bias_sweep_knob() -> None:
+    main_module = import_module("prismo.main")
+    result = runner.invoke(main_module.app, ["run", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "--bias-sweep-points" in result.stdout
+    # 0 V to the operating bias in 1 V steps.
+    assert main_module._DEFAULT_BIAS_SWEEP_POINTS == 6
+    assert main_module._BIAS_SWEEP_MIN_V == pytest.approx(-5.0)
+
+
+def test_run_pipeline_skips_the_sweep_when_asked(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``--bias-sweep-points 0`` costs no solve and draws no sweep."""
+    import prismo.main as main_module
+    import prismo.optimizer as optimizer_module
+    import prismo.outputs as outputs_module
+    import prismo.waveguide_mesh as mesh_module
+
+    coords = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+    output_captured: dict[str, object] = {}
+    calls: list[str] = []
+    history = [
+        {
+            "iteration": 1,
+            "delta_n_eff": 1e-3,
+            "delta_rho": 0.0,
+            "grad_norm": 1e-4,
+            "wall_time": 0.1,
+        },
+    ]
+    components = _solve_components_with_reset(
+        _container_components([[0.5, 0.0], [1.5, 0.0]]), calls
+    )
+    monkeypatch.setattr(
+        mesh_module, "build_rib_waveguide_mesh", lambda **_: tmp_path / "mesh.msh"
+    )
+    monkeypatch.setattr(mesh_module, "read_mesh_node_coordinates", lambda _: coords)
+    monkeypatch.setattr(
+        optimizer_module,
+        "optimize_doping",
+        lambda **kwargs: (np.asarray([0.2, 0.3, 0.4]), history),
+    )
+    monkeypatch.setattr(
+        outputs_module,
+        "generate_outputs",
+        lambda **kwargs: output_captured.update(kwargs) or [],
+    )
+    _stub_mesh_transfer(monkeypatch, n_nodes=coords.shape[0], n_design=2)
+
+    main_module._run_pipeline(
+        r_min=50e-9,
+        max_iter=5,
+        ftol_rel=1e-5,
+        mesh_path=str(tmp_path / "mesh.msh"),
+        output_dir=str(tmp_path),
+        no_jit=True,
+        live_solvers=True,
+        components=components,
+        bias_sweep_points=0,
+    )
+
+    assert output_captured["bias_sweep_initial"] == []
+    assert output_captured["bias_sweep_optimized"] == []
+    # Only the cold re-evaluation's reset, none of the sweep's.
+    assert calls == ["reset"]
 
 
 def test_container_run_forwards_the_geometry_knobs(

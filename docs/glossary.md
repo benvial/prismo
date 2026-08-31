@@ -146,6 +146,14 @@ Computed as `α_mode = (n_si/neff) · Σ_cell w_cell · α_cell`, with `α_cell`
 
 `depletion_field.pdf` — `(n+p)(V_bias) − (n+p)(0 V)` per node at the reported design, drawn on the silicon elements with the tracked mode's |E| contours on top (`pipeline.carrier_fields`, `outputs.plot_depletion_field`). Negative where reverse bias depletes the junction — the only place the design changes the index — so the figure shows how much of the depleted region the mode sees, and how much doping sits in the mode for nothing but loss. Two warm ChargeTransport solves at the optimum, taken before the cold re-evaluation like the mode figure.
 
+## Bias sweep (figure-of-merit curves)
+
+`bias_sweep.pdf` — the three reported figures of merit against reverse bias, one curve per design: Δneff, the modal free-carrier loss α, and VπLπ·α, for the seed and for the reported design side by side (`pipeline.bias_sweep`, `outputs.plot_bias_sweep`). A post-run characterization, not part of the objective: the optimizer works at the single −5 V operating point, and this reruns the same physics — one ChargeTransport solve and one eigensolve per bias, against the shared 0 V equilibrium — so what the optimization bought is visible across the whole operating range rather than only at the bias it optimized.
+
+Two readings differ from the optimizer's own numbers. Δneff is measured against 0 V, so the 0 V point is exactly zero and its VπLπ is infinite — that point is dropped from the figure-of-merit panel rather than drawn off-scale. And α is read from the carriers **at each bias**, not the objective's fixed 0 V loss, so it falls as depletion sweeps carriers out of the mode; VπLπ at each point uses that point's own bias.
+
+`prismo run --bias-sweep-points n` spreads `n` points from 0 V to −5 V (default 6, i.e. 1 V steps); `0` or `1` skips the sweep and its 2·n solves. The sweep is the last physics of a run — it leaves the ChargeTransport worker warm at the design it swept last, so it runs after the cold re-evaluation, and resets the worker before each design so neither curve continues the other's warm state.
+
 ## Doping evolution (animation / replay)
 
 `doping_evolution.{gif,mp4}` — the net doping the solvers saw at every optimizer evaluation, one frame per history record, on a colour scale fixed across the run, captioned with iteration, Δneff and modal loss; a trial the optimizer rejected (objective below the running best, see *Move limit*) is labelled as such. Every history record carries the raw design vector it evaluated (`design` in `checkpoint.json`), so `prismo animate` / `make animate` rebuilds the animation from the checkpoint and the run's `.msh` alone — filter, scatter and doping map, no solver. Checkpoints predating the key have nothing to replay.
