@@ -1270,7 +1270,7 @@ def _observed_orders(
     Each entry is ``(h_right, slope)`` for the interval ending at ``h_right``.
     On the truncation branch of a central difference the slope approaches +2;
     on the cancellation branch, where the evaluation noise floor divided by the
-    step dominates, it approaches −1. Reporting the measured slope is what makes
+    step dominates, it approaches -1. Reporting the measured slope is what makes
     the figure a convergence test rather than an eyeball comparison against a
     guide line drawn with an arbitrary constant.
     """
