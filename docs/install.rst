@@ -17,7 +17,7 @@ Prerequisites
 
 - Linux or macOS (Windows via WSL2), ``make``
 - Docker (Tesseract builds and runs the solvers as containers)
-- Python ≥ 3.10 in an active virtual environment
+- Python ≥ 3.12 in an active virtual environment
 - ~10 GB of disk for the two images
 
 Host app

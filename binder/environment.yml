@@ -7,7 +7,8 @@ name: prismo
 channels:
   - conda-forge
 dependencies:
-  - python=3.10
+  # tesseract-jax>=0.4.1 (pinned in app/pyproject.toml) needs Python>=3.12.
+  - python=3.12
   - gyptis
   # Unconstrained, the solver pairs fenics with a 2022 jax; the app needs >=0.4.30.
   - jax>=0.4.30
