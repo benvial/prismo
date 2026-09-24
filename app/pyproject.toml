@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Differentiable PN-junction photonic phase shifter"
 authors = [{ name = "Benjamin Vial" }]
 license = "Apache-2.0"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     # Host-side pipeline: talks to the two solver containers over HTTP and
     # composes their adjoints in JAX via tesseract-jax's apply_tesseract. The
@@ -38,6 +38,9 @@ dev = [
     "ruff",
 ]
 docs = [
+    # autosummary imports tesseract_core.runtime (for the pipeline's
+    # docstrings), which needs the runtime extra's lz4 dependency.
+    "tesseract-core[runtime]>=1.13.0",
     "sphinx",
     "shibuya",
     "sphinx-copybutton",
