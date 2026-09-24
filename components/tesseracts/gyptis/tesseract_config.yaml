@@ -2,7 +2,7 @@
 
 name: "prismo_gyptis"
 version: "0.1.0"
-description: "gyptis electromagnetic eigenmode solver with Hellmann-Feynman eigen-adjoint VJP (stub)"
+description: "gyptis electromagnetic eigenmode solver with Hellmann-Feynman eigen-adjoint VJP"
 
 # Environment variables to set in the container
 # env:
@@ -22,11 +22,10 @@ build_config:
   requirements:
     provider: conda
 
-  # Python version to use inside the container (e.g. "3.12"). When set, the given
-  # version is installed via `uv python install`, decoupling it from the base
-  # image. When unset, the base image's system Python is used. Cannot be combined
-  # with conda requirements; set the version in tesseract_environment.yaml instead.
-  # python_version: "3.12"
+  # A uv-pip Tesseract pins its interpreter with
+  # `requirements: {provider: uv-pip, python_version: "3.12"}`. That option does
+  # not exist for the conda provider: the version comes from
+  # tesseract_environment.yaml instead.
 
   # If true, create the Python virtual environment with --system-site-packages so
   # it inherits packages pre-installed in the base image. Cannot be combined with

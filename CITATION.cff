@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use PRISMO, please cite it as below."
+title: "PRISMO: free-form doping inverse design of a silicon PN-junction phase shifter"
+type: software
+authors:
+  - family-names: Vial
+    given-names: Benjamin
+repository-code: "https://github.com/benvial/prismo"
+url: "https://bvial.info/prismo/"
+license: Apache-2.0
+date-released: 2026-09-29

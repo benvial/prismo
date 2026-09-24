@@ -7,8 +7,11 @@ version: "0.1.0"
 description: "ChargeTransport.jl drift-diffusion solver with persistent-worker discrete-adjoint VJP"
 
 build_config:
-  # Python version installed via uv
-  python_version: "3.12"
+  # Python version installed via uv. Since tesseract-core 1.13 this lives under
+  # `requirements` rather than directly on `build_config`.
+  requirements:
+    provider: uv-pip
+    python_version: "3.12"
 
   # Project-built base image (see Dockerfile.julia-base in this directory):
   # Julia 1.10 LTS + all pinned packages installed and PRECOMPILED, depot at
