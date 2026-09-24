@@ -33,7 +33,7 @@ import numpy as np
 import numpy.typing as npt
 from prismo_shared.session import SolveSessionRegistry, array_identity
 from pydantic import BaseModel, Field
-from tesseract_core.runtime import Array, Differentiable, Float64
+from tesseract_core.runtime import Array, Differentiable, Float64, ShapeDType
 
 #
 # Geometry / physics constants
@@ -1140,6 +1140,24 @@ def apply(inputs: InputSchema) -> OutputSchema:
 
     neff = state["neff"]
     return OutputSchema(neff_sq=neff * neff)
+
+
+def abstract_eval(abstract_inputs: InputSchema) -> dict[str, ShapeDType]:
+    """Report the ``solve`` output shape without running the eigensolve.
+
+    ``apply_tesseract`` traces every call through this endpoint to size the
+    outputs, so it must answer for the differentiated ``solve`` operation. That
+    operation's only array output is the scalar ``neff_sq``; the read-only
+    inspection operations produce their variable-shape geometry and field arrays
+    through the plain ``apply`` path, not through autodiff, so they are not sized
+    here.
+    """
+    if abstract_inputs.operation != "solve":
+        raise ValueError(
+            f"abstract_eval is defined only for the 'solve' operation, "
+            f"not {abstract_inputs.operation!r}"
+        )
+    return {"neff_sq": ShapeDType(shape=(), dtype="float64")}
 
 
 #

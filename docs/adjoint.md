@@ -22,10 +22,12 @@ flowchart TB
   style r2 fill:none,stroke:none
 ```
 
-`jax.grad(J)` walks this chain backwards. Each Tesseract call is a
-`jax.custom_vjp` whose forward is the component's `apply` (reached through
-`jax.pure_callback`) and whose backward is its `vector_jacobian_product`
-endpoint; everything between the two solvers is ordinary JAX autodiff.
+`jax.grad(J)` walks this chain backwards. Each Tesseract call enters the JAX
+program through [tesseract-jax](https://github.com/pasteurlabs/tesseract-jax)'s
+`apply_tesseract`: its forward is the component's `apply` endpoint and its
+backward is the component's `vector_jacobian_product`, with `abstract_eval`
+reporting the output shapes at trace time; everything between the two solvers is
+ordinary JAX autodiff.
 
 ## Discrete adjoint of the drift-diffusion solve
 

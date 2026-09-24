@@ -11,8 +11,10 @@ license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = [
     # Host-side pipeline: talks to the two solver containers over HTTP and
-    # composes their adjoints in JAX. The solvers themselves live in the images.
-    "tesseract-core==1.12.0",
+    # composes their adjoints in JAX via tesseract-jax's apply_tesseract. The
+    # solvers themselves live in the images.
+    "tesseract-core>=1.13.0",
+    "tesseract-jax>=0.4.1",
     "prismo_shared",
     "jax>=0.4.30",
     "numpy>=1.26",
@@ -26,9 +28,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    # In-process runs and the test-suite load the components' tesseract_api
-    # modules, which import tesseract_core.runtime (not in the bare wheel).
-    "tesseract-core[runtime]==1.12.0",
+    # In-process runs and the test-suite serve the components' tesseract_api
+    # modules via Tesseract.from_tesseract_api, which imports
+    # tesseract_core.runtime (not in the bare wheel).
+    "tesseract-core[runtime]>=1.13.0",
     "pytest>=7.0",
     "tomli>=2.0; python_version < '3.11'",
     "pre-commit",
@@ -57,11 +60,13 @@ prismo_shared = { path = "../components/shared_code", editable = true }
 # plus commit distance. `raw-options.root` points at the repository root one
 # level up, since this package lives in the `app/` subdirectory of the monorepo.
 # `fallback-version` keeps builds working when git metadata is unavailable
-# (e.g. building from an sdist or outside a checkout).
+# (e.g. building from an sdist or outside a checkout). `tag_regex` widens the
+# setuptools-scm default so a tag carrying a suffix (`v0.1.0-submission`) still
+# yields a PEP 440 version instead of failing the build.
 [tool.hatch.version]
 source = "vcs"
 fallback-version = "0.0.0+unknown"
-raw-options = { root = ".." }
+raw-options = { root = "..", tag_regex = "^(?:[\\w-]+-)?(?P<version>[vV]?\\d+(?:\\.\\d+){0,2})(?:[-.][^+]*)?(?:\\+.*)?$" }
 
 [tool.hatch.build.hooks.vcs]
 version-file = "prismo/_version.py"

@@ -3,8 +3,7 @@
 ```text
 app/prismo/                     host pipeline (JAX), optimizer, figures, CLI
   main.py                       `prismo run | validate-gradient | probe-objective | animate`
-  pipeline.py                   θ → objective, composed adjoint; container start-up; mesh authoring
-  differentiable_component.py   Tesseract apply/VJP → jax.custom_vjp adapter
+  pipeline.py                   θ → objective, composed adjoint (tesseract-jax); container start-up; mesh authoring
   optimizer.py                  move-limited NLopt MMA that survives a failed solve
   density_filter.py             Andreassen density filter (H matrix)
   soref_bennett.py              carriers → Δε, Δα

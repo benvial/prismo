@@ -16,9 +16,6 @@ API Reference
 .. automodule:: prismo.mesh_transfer
    :members:
 
-.. automodule:: prismo.differentiable_component
-   :members:
-
 .. automodule:: prismo.waveguide_mesh
    :members:
 

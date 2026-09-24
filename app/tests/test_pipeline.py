@@ -6,6 +6,11 @@ import pytest
 jax = pytest.importorskip("jax")
 import jax.numpy as jnp  # noqa: E402
 from _doubles import stub_components  # noqa: E402
+from _tesseract_doubles import (  # noqa: E402
+    serve_chargetransport,
+    serve_gyptis_mean,
+    serve_gyptis_sumsq,
+)
 from prismo.density_filter import assemble_filter_matrix  # noqa: E402
 from prismo.mesh_transfer import build_mesh_transfer_operator  # noqa: E402
 from prismo.pipeline import (  # noqa: E402
@@ -298,9 +303,9 @@ class TestPipelineStub:
         """``build_default_components`` builds, but a call without a live solver raises."""
         import prismo.pipeline as pl
 
-        # Hermetic: pretend neither component's tesseract_api is importable, so
+        # Hermetic: pretend neither component's tesseract_api can be served, so
         # the outcome does not depend on a Julia or gyptis install on the host.
-        monkeypatch.setattr(pl, "_load_tesseract_api", lambda name: None)
+        monkeypatch.setattr(pl, "_serve_local_tesseract", lambda name: None)
         components = build_default_components()
         with pytest.raises(Exception, match="backend"):
             pipeline(rho, components=components)
@@ -543,7 +548,7 @@ class TestContainerPipeline:
                 return {"design_cell_centroids": [[-0.1, 0.2], [0.1, 0.2]]}
 
         gyptis = FakeGyptis()
-        centroids = read_gyptis_design_cell_centroids(container=gyptis)
+        centroids = read_gyptis_design_cell_centroids(tesseract=gyptis)
 
         assert gyptis.inputs == {"operation": "design_cell_centroids"}
         np.testing.assert_allclose(centroids, [[-0.1, 0.2], [0.1, 0.2]])
@@ -562,7 +567,7 @@ class TestContainerPipeline:
 
         gyptis = FakeGyptis()
         abs_e, coords = read_gyptis_mode_field(
-            np.array([12.0, 12.1]), 11.5, container=gyptis
+            np.array([12.0, 12.1]), 11.5, tesseract=gyptis
         )
 
         assert gyptis.inputs["operation"] == "mode_field"
@@ -583,45 +588,34 @@ class TestContainerPipeline:
                 return {"mode_abs_e": [1.0], "mode_coordinates": [[0.0, 0.0]]}
 
         gyptis = FakeGyptis()
-        read_gyptis_mode_field(np.array([12.0]), container=gyptis, mode_index=2)
+        read_gyptis_mode_field(np.array([12.0]), tesseract=gyptis, mode_index=2)
         assert gyptis.inputs["mode_index"] == 2
 
-        read_gyptis_mode_field(np.array([12.0]), container=gyptis)
+        read_gyptis_mode_field(np.array([12.0]), tesseract=gyptis)
         # The fundamental is the component default: the key stays out so the
         # payload is what an image predating the field accepts.
         assert "mode_index" not in gyptis.inputs
 
     def test_gyptis_components_target_one_mode_for_solve_and_vjp(self):
-        class FakeGyptis:
-            def __init__(self):
-                self.apply_inputs: list[dict] = []
-                self.vjp_inputs: list[dict] = []
+        tesseract, module = serve_gyptis_mean()
+        perturbed, background = build_gyptis_components(tesseract, mode_index=1)
+        eps = jnp.array([12.0, 12.1])
+        # A forward and its VJP on the perturbed solve, plus a background forward.
+        _, vjp_fn = jax.vjp(lambda e: perturbed(e, 12.08), eps)
+        vjp_fn(jnp.asarray(1.0))
+        background(eps, 12.08)
+        assert all(index == 1 for index in module.APPLY_MODE_INDICES)
+        assert module.VJP_MODE_INDICES[0] == 1
 
-            def apply(self, inputs):
-                self.apply_inputs.append(inputs)
-                return {"neff_sq": 6.0}
-
-            def vector_jacobian_product(self, inputs, vjp_inputs, vjp_outputs, cot):
-                self.vjp_inputs.append(inputs)
-                return {"design_epsilon": [0.0] * len(inputs["design_epsilon"])}
-
-        gyptis = FakeGyptis()
-        perturbed, background = build_gyptis_components(container=gyptis, mode_index=1)
-        eps = np.array([12.0, 12.1])
-        perturbed.forward(eps, 12.08)
-        background.forward(eps, 12.08)
-        perturbed.vjp(eps, np.asarray(1.0), 12.08)
-        assert all(call["mode_index"] == 1 for call in gyptis.apply_inputs)
-        assert gyptis.vjp_inputs[0]["mode_index"] == 1
-
-        default_gyptis = FakeGyptis()
-        perturbed, _background = build_gyptis_components(container=default_gyptis)
-        perturbed.forward(eps, 12.08)
-        assert "mode_index" not in default_gyptis.apply_inputs[0]
+        default_tesseract, default_module = serve_gyptis_mean()
+        default_perturbed, _ = build_gyptis_components(default_tesseract)
+        default_perturbed(eps, 12.08)
+        # The fundamental is the default: mode_index stays at 0.
+        assert default_module.APPLY_MODE_INDICES == [0]
 
     def test_gyptis_components_reject_a_negative_mode_index(self):
         with pytest.raises(ValueError, match="non-negative"):
-            build_gyptis_components(container=object(), mode_index=-1)
+            build_gyptis_components(object(), mode_index=-1)
 
     def test_mode_field_rejects_mismatched_payload(self):
         class FakeGyptis:
@@ -632,7 +626,7 @@ class TestContainerPipeline:
                 }
 
         with pytest.raises(ValueError, match="one magnitude per mesh vertex"):
-            read_gyptis_mode_field(np.array([12.0]), container=FakeGyptis())
+            read_gyptis_mode_field(np.array([12.0]), tesseract=FakeGyptis())
 
     def test_mode_field_rejects_an_empty_payload(self):
         class FakeGyptis:
@@ -640,59 +634,38 @@ class TestContainerPipeline:
                 return {}
 
         with pytest.raises(RuntimeError, match="no field payload"):
-            read_gyptis_mode_field(np.array([12.0]), container=FakeGyptis())
+            read_gyptis_mode_field(np.array([12.0]), tesseract=FakeGyptis())
 
     def test_background_eigenmode_is_cached_across_pipeline_calls(self):
         """Only the rho-independent background solve survives a callback."""
 
-        class FakeChargeTransport:
-            def apply(self, inputs):
-                doping = np.asarray(inputs["doping"], dtype=float)
-                carrier = np.full_like(
-                    doping,
-                    1e18 if inputs["bias_voltage"] == 0.0 else 0.0,
-                )
-                return {"electrons": carrier, "holes": carrier}
-
-        class FakeGyptis:
-            def __init__(self):
-                self.epsilon_calls: list[np.ndarray] = []
-
-            def apply(self, inputs):
-                epsilon = np.asarray(inputs["design_epsilon"], dtype=float)
-                self.epsilon_calls.append(epsilon)
-                return {"neff_sq": float(np.mean(epsilon))}
-
-        gyptis = FakeGyptis()
-
-        def build_components() -> PipelineComponents:
-            chargetransport = build_chargetransport_component(
-                container=FakeChargeTransport()
-            )
-            perturbed, background = build_gyptis_components(container=gyptis)
-            return PipelineComponents(
-                chargetransport=chargetransport,
+        def build_components() -> tuple[PipelineComponents, object]:
+            ct_tesseract, _ = serve_chargetransport()
+            gyptis_tesseract, gyptis_module = serve_gyptis_mean()
+            perturbed, background = build_gyptis_components(gyptis_tesseract)
+            components = PipelineComponents(
+                chargetransport=build_chargetransport_component(ct_tesseract),
                 gyptis=perturbed,
                 gyptis_background=background,
             )
+            return components, gyptis_module
 
-        components = build_components()
+        components, gyptis_module = build_components()
         rho = jnp.full((4,), 0.25)
         pipeline(rho, components=components)
         pipeline(rho, components=components)
 
         # Two perturbed solves plus one reused rho-independent background solve.
-        assert len(gyptis.epsilon_calls) == 3
+        assert len(gyptis_module.FIELDS) == 3
 
-        # A fresh bundle starts a new lifecycle: its background cache is empty.
-        pipeline(rho, components=build_components())
-        assert len(gyptis.epsilon_calls) == 5
+        # A fresh bundle starts a new lifecycle: its background cache is empty, so
+        # it runs its own perturbed + background solves.
+        fresh_components, fresh_module = build_components()
+        pipeline(rho, components=fresh_components)
+        assert len(fresh_module.FIELDS) == 2
 
     def test_container_startup_failure_raises(self, monkeypatch):
         """Container mode must not continue through a local stub."""
-        import sys
-        import types
-
         import prismo.pipeline as pl
 
         class FailingTesseract:
@@ -700,33 +673,26 @@ class TestContainerPipeline:
             def from_image(cls, image, **kwargs):
                 raise RuntimeError(f"image unavailable: {image}")
 
-        monkeypatch.setitem(
-            sys.modules,
-            "tesseract_core",
-            types.SimpleNamespace(Tesseract=FailingTesseract),
-        )
+        monkeypatch.setattr("prismo.pipeline.Tesseract", FailingTesseract)
 
         with pytest.raises(RuntimeError, match="ChargeTransport container"):
             pl.init_tesseract_containers()
 
-    def test_gyptis_container_failure_does_not_use_local_stub(self):
-        """A failed container request must abort rather than fall to a stub."""
+    def test_gyptis_container_failure_does_not_use_local_stub(self, monkeypatch):
+        """A failed backend request must abort rather than fall to a stub."""
+        tesseract, module = serve_gyptis_mean()
 
-        class FailingTesseract:
-            def apply(self, inputs):
-                raise RuntimeError("HTTP 500")
+        def failing_apply(inputs):
+            raise RuntimeError("HTTP 500")
 
-        perturbed, _ = build_gyptis_components(container=FailingTesseract())
+        monkeypatch.setattr(module, "apply", failing_apply)
+        perturbed, _ = build_gyptis_components(tesseract)
 
         with pytest.raises(RuntimeError, match="HTTP 500"):
-            perturbed.forward(np.array([12.0, 12.0]))
+            perturbed(jnp.array([12.0, 12.0]))
 
     def test_two_configured_pipelines_coexist_without_interfering(self):
         """Differently-configured bundles run in one process independently."""
-
-        class FakeGyptis:
-            def apply(self, inputs):
-                return {"neff_sq": float(np.mean(inputs["design_epsilon"]))}
 
         def make_bundle(carriers_0v: float) -> PipelineComponents:
             def fake_ct(doping, bias_voltage, mesh_ref=None):
@@ -734,7 +700,8 @@ class TestContainerPipeline:
                 filled = jnp.full_like(doping, value)
                 return filled, filled
 
-            perturbed, background = build_gyptis_components(container=FakeGyptis())
+            gyptis_tesseract, _ = serve_gyptis_mean()
+            perturbed, background = build_gyptis_components(gyptis_tesseract)
             return PipelineComponents(
                 chargetransport=fake_ct,
                 gyptis=perturbed,
@@ -757,16 +724,16 @@ class TestContainerPipeline:
         )
 
     def test_wired_design_transfer_drives_spatial_gradient_through_gyptis(self):
-        """Ticket 08 payoff, exercised through the container gyptis path.
+        """Ticket 08 payoff, exercised through the served gyptis path.
 
         The ``design_transfer`` matrix built by ``build_mesh_transfer_operator``
         carries a spatially varying, fixed-mean perturbation onto the gyptis
-        design cells, so a real (container-routed) eigenmode solve yields a
+        design cells, so a real (Tesseract-routed) eigenmode solve yields a
         spatially non-constant design gradient while the background solve still
         sees a uniform field. Unlike ``test_pipeline_gradient_is_spatially_
-        resolved`` -- which uses the JAX gyptis stub -- this drives the container
-        forward/VJP built by ``build_gyptis_components`` and the transfer wiring
-        of the container setup.
+        resolved`` -- which uses the JAX gyptis stub -- this drives the served
+        forward/VJP composed by ``build_gyptis_components`` through
+        ``apply_tesseract`` and the transfer wiring of the container setup.
         """
         # Shared mesh: a unit square split into two silicon triangles. Each design
         # cell is one of those triangles, its vertices are shared-mesh nodes.
@@ -778,32 +745,15 @@ class TestContainerPipeline:
         )
         assert design_transfer.shape == (2, 4)  # design cells <- shared-mesh nodes
 
-        applied_fields: list[np.ndarray] = []
-
-        class StructureSensitiveGyptis:
-            """A gyptis backend whose neff_sq responds to spatial structure."""
-
-            def apply(self, inputs):
-                eps = np.asarray(inputs["design_epsilon"], dtype=float)
-                applied_fields.append(eps)
-                return {"neff_sq": float(np.sum(eps**2))}
-
-            def vector_jacobian_product(
-                self, inputs, inputs_to_diff, outputs, cotangents
-            ):
-                eps = np.asarray(inputs["design_epsilon"], dtype=float)
-                cot = float(cotangents["neff_sq"])
-                return {"design_epsilon": (2.0 * cot * eps).tolist()}
-
         def fake_ct(doping, bias_voltage, mesh_ref=None):
             # Carriers deplete under bias in proportion to the local doping, so a
             # spatially varying rho makes a spatially varying permittivity field.
             carriers = jnp.where(bias_voltage == 0.0, doping, jnp.zeros_like(doping))
             return carriers, carriers
 
-        perturbed, background = build_gyptis_components(
-            container=StructureSensitiveGyptis()
-        )
+        # A structure-sensitive gyptis double: neff_sq = sum(eps**2).
+        gyptis_tesseract, gyptis_module = serve_gyptis_sumsq()
+        perturbed, background = build_gyptis_components(gyptis_tesseract)
         components = PipelineComponents(
             chargetransport=fake_ct, gyptis=perturbed, gyptis_background=background
         )
@@ -820,6 +770,7 @@ class TestContainerPipeline:
 
         # Every solve saw a field of exactly the design-cell count (not the node
         # count) -- the length the real forward's size guard enforces.
+        applied_fields = gyptis_module.FIELDS
         assert applied_fields
         assert all(eps.shape == (2,) for eps in applied_fields)
         # The perturbed solve saw a structured field; the background a uniform one.
@@ -828,8 +779,8 @@ class TestContainerPipeline:
 
         # The background component contributes an exact zero design gradient
         # regardless of its field, preserving the rho-independence argument.
-        bg_cotangent = background.vjp(np.full(2, 12.0), np.asarray(1.0))
-        np.testing.assert_array_equal(bg_cotangent, np.zeros(2))
+        bg_grad = jax.grad(lambda e: background(e, 12.0))(jnp.full(2, 12.0))
+        np.testing.assert_array_equal(np.asarray(bg_grad), np.zeros(2))
 
         # Payoff: a fixed-mean redistribution (a permutation of rho) moves neff --
         # the retired mean-collapse path could not have distinguished them.
@@ -877,48 +828,28 @@ class TestBuildDesignTransfer:
 class TestPipelineComponentCalls:
     """The pipeline drives each component exactly once per solve it needs."""
 
-    def _fake_ct(self, biases: list[float] | None = None):
-        recorded = biases if biases is not None else []
-
-        class FakeChargeTransport:
-            def apply(self, inputs):
-                recorded.append(inputs["bias_voltage"])
-                doping = np.asarray(inputs["doping"], dtype=float)
-                carrier = np.full_like(
-                    doping, 1e18 if inputs["bias_voltage"] == 0.0 else 0.0
-                )
-                return {"electrons": carrier, "holes": carrier}
-
-        return build_chargetransport_component(container=FakeChargeTransport())
-
     def test_solves_charge_transport_at_both_bias_points(self):
-        biases: list[float] = []
-        ct = self._fake_ct(biases)
+        tesseract, module = serve_chargetransport()
+        ct = build_chargetransport_component(tesseract)
         ct(jnp.full((4,), 0.25), 0.0)
         ct(jnp.full((4,), 0.25), -5.0)
 
-        assert biases == [0.0, -5.0]
+        assert module.FORWARD_BIASES == [0.0, -5.0]
 
     def test_one_pipeline_call_drives_both_backends_once_each(self):
-        biases: list[float] = []
-        gyptis_calls = []
-
-        class FakeGyptis:
-            def apply(self, inputs):
-                gyptis_calls.append(np.asarray(inputs["design_epsilon"], dtype=float))
-                return {"neff_sq": float(np.mean(inputs["design_epsilon"]))}
-
-        perturbed, background = build_gyptis_components(container=FakeGyptis())
+        ct_tesseract, ct_module = serve_chargetransport()
+        gyptis_tesseract, gyptis_module = serve_gyptis_mean()
+        perturbed, background = build_gyptis_components(gyptis_tesseract)
         components = PipelineComponents(
-            chargetransport=self._fake_ct(biases),
+            chargetransport=build_chargetransport_component(ct_tesseract),
             gyptis=perturbed,
             gyptis_background=background,
         )
         pipeline(jnp.full((4,), 0.25), components=components)
 
-        assert sorted(biases) == [-5.0, 0.0]
+        assert sorted(ct_module.FORWARD_BIASES) == [-5.0, 0.0]
         # One background solve and one perturbed solve.
-        assert len(gyptis_calls) == 2
+        assert len(gyptis_module.FIELDS) == 2
 
 
 class TestPipelineWithFilter:
@@ -1135,9 +1066,6 @@ def _fake_container_env(monkeypatch) -> dict[str, object]:
     environment each image was started with, which is how the mesh-size and
     Julia-deadline knobs reach the containers.
     """
-    import sys
-    import types
-
     captured: dict[str, object] = {}
 
     class FakeTesseract:
@@ -1162,22 +1090,20 @@ def _fake_container_env(monkeypatch) -> dict[str, object]:
         def teardown(self):
             return None
 
-    monkeypatch.setitem(
-        sys.modules,
-        "tesseract_core",
-        types.SimpleNamespace(Tesseract=FakeTesseract),
-    )
+    # ``Tesseract`` is imported into the pipeline module at import time, so patch
+    # the name the pipeline actually calls rather than ``sys.modules``.
+    monkeypatch.setattr("prismo.pipeline.Tesseract", FakeTesseract)
     # The dev-mount switch is a host-environment knob; tests opt in explicitly.
     monkeypatch.delenv("PRISMO_DEV_MOUNTS", raising=False)
     monkeypatch.delenv("PRISMO_CT_SOLVE_BUDGET_S", raising=False)
     # Keep the component builders from touching the fake containers further.
     monkeypatch.setattr(
         "prismo.pipeline.build_chargetransport_component",
-        lambda container=None, local_api=None: lambda *a, **k: None,
+        lambda tesseract=None, *, rewrite_mesh_path=False: lambda *a, **k: None,
     )
     monkeypatch.setattr(
         "prismo.pipeline.build_gyptis_components",
-        lambda container=None, local_api=None, mode_index=0: (
+        lambda tesseract=None, mode_index=0: (
             (lambda *a, **k: None),
             (lambda *a, **k: None),
         ),
@@ -1206,7 +1132,7 @@ class TestChargeTransportMeshDelivery:
                 }
 
         mesh_path = tmp_path / "waveguide.msh"
-        vertices = write_gyptis_mesh(mesh_path, container=MeshAuthor())
+        vertices = write_gyptis_mesh(mesh_path, tesseract=MeshAuthor())
 
         assert mesh_path.read_text() == "$MeshFormat\n2.2 0 8\n$EndMeshFormat\n"
         assert vertices.shape == (1, 3, 2)
@@ -1226,23 +1152,13 @@ class TestChargeTransportMeshDelivery:
 
     def test_container_forward_sends_mount_path_not_host_path(self):
         """The apply() request must carry the in-container mesh path."""
-
-        class RecordingTesseract:
-            def __init__(self):
-                self.inputs = None
-
-            def apply(self, inputs):
-                self.inputs = inputs
-                doping = np.asarray(inputs["doping"], dtype=float)
-                return {"electrons": doping, "holes": doping}
-
-        recorder = RecordingTesseract()
-        component = build_chargetransport_component(container=recorder)
+        tesseract, module = serve_chargetransport()
+        component = build_chargetransport_component(tesseract, rewrite_mesh_path=True)
         host_ref = MeshRef(path="/host/outputs/waveguide.msh", n_nodes=3)
 
-        component.forward(np.array([1.0, 2.0, 3.0]), 0.0, host_ref)
+        component(jnp.array([1.0, 2.0, 3.0]), 0.0, host_ref)
 
-        assert recorder.inputs["mesh_ref"]["path"] == f"{_CT_MESH_MOUNT}/waveguide.msh"
+        assert module.FORWARD_MESH_PATHS == [f"{_CT_MESH_MOUNT}/waveguide.msh"]
 
     def test_init_bind_mounts_mesh_dir_into_ct_container(self, monkeypatch, tmp_path):
         """init_tesseract_containers mounts the mesh dir read-only into CT."""
@@ -1370,7 +1286,7 @@ class TestChargeTransportMeshDelivery:
                 return {"electrons": [], "holes": []}
 
         recorder = RecordingTesseract()
-        reset_chargetransport_worker(container=recorder)
+        reset_chargetransport_worker(tesseract=recorder)
         assert recorder.inputs == {"operation": "reset"}
 
 

@@ -51,9 +51,11 @@ both solvers, so the carrier field lands on the optical design cells by an
 exact restriction, not an interpolation. Per iteration: two drift-diffusion
 solves (0 V, −5 V), one eigensolve, two adjoint solves, one eigen-adjoint.
 
-Each solver is a standalone Tesseract exposing `apply` and
-`vector_jacobian_product`. The host app (`app/prismo`) wraps each endpoint
-pair in a `jax.custom_vjp`, so the whole chain — filter, doping map, carriers,
+Each solver is a standalone Tesseract exposing `apply`,
+`vector_jacobian_product`, and `abstract_eval`. The host app (`app/prismo`)
+composes each into the JAX program with
+[tesseract-jax](https://github.com/pasteurlabs/tesseract-jax)'s
+`apply_tesseract`, so the whole chain — filter, doping map, carriers,
 Soref–Bennett, eigenmode — is a single differentiable JAX function and
 `jax.grad` of the objective is the composed adjoint.
 

@@ -8,7 +8,6 @@ free-carrier loss.
 
 from __future__ import annotations
 
-import importlib.util
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -21,11 +20,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from prismo_shared.schemas import MeshRef, SorefBennettCoefficients
-
-from prismo.differentiable_component import (
-    DifferentiableComponent,
-    invoke_tesseract,
-)
+from tesseract_core import Tesseract
+from tesseract_jax import apply_tesseract
 
 jax.config.update("jax_enable_x64", True)
 
@@ -230,23 +226,22 @@ def seed_design_field(coords: np.ndarray, kind: str = "lateral") -> jax.Array:
     return jnp.where(n_type, _JUNCTION_SEED_THETA, -_JUNCTION_SEED_THETA)
 
 
-def _load_tesseract_api(name: str) -> Any | None:
+def _serve_local_tesseract(name: str) -> Tesseract | None:
+    """Serve a component's ``tesseract_api`` in-process, or ``None`` if it can't.
+
+    ``Tesseract.from_tesseract_api`` imports the module directly (no container)
+    and returns a client the pipeline drives exactly like a served image through
+    :func:`tesseract_jax.apply_tesseract`. A component whose module cannot import
+    -- its runtime deps (``tesseract-core[runtime]``, gyptis/FEniCS) are absent
+    -- yields ``None`` rather than taking the host down; calling the resulting
+    component then raises loudly instead of fabricating a value.
+    """
     api_path = _COMPONENTS_DIR / name / "tesseract_api.py"
     if not api_path.exists():
         return None
     try:
-        spec = importlib.util.spec_from_file_location(
-            f"_{name}_tesseract_api", api_path
-        )
-        if spec is None or spec.loader is None:
-            return None
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
+        return Tesseract.from_tesseract_api(api_path)
     except (Exception, SystemExit):
-        # ``tesseract_core.runtime`` calls ``sys.exit`` when its optional
-        # dependencies (``tesseract-core[runtime]``) are missing; a missing
-        # in-process solver must never take the host down with it.
         return None
 
 
@@ -320,13 +315,6 @@ def init_tesseract_containers(
             outside), passed as ``PRISMO_GYPTIS_WIDTH``. ``None`` keeps the
             default (2.0 µm).
     """
-    try:
-        from tesseract_core import Tesseract  # type: ignore[import-untyped]
-    except ImportError as exc:
-        raise RuntimeError(
-            "tesseract_core is required for container pipeline runs"
-        ) from exc
-
     ct_volumes: list[str] = []
     if mesh_dir is not None:
         host_mesh_dir = Path(mesh_dir).resolve()
@@ -397,26 +385,28 @@ def init_tesseract_containers(
         _close_all(closers)
         raise RuntimeError("Failed to start gyptis container") from exc
 
-    chargetransport = build_chargetransport_component(container=ct_tesseract)
+    chargetransport = build_chargetransport_component(
+        ct_tesseract, rewrite_mesh_path=True
+    )
     gyptis, gyptis_background = build_gyptis_components(
-        container=gyptis_tesseract, mode_index=mode_index
+        gyptis_tesseract, mode_index=mode_index
     )
     return PipelineComponents(
         chargetransport=chargetransport,
         gyptis=gyptis,
         gyptis_background=gyptis_background,
         design_cell_centroids=partial(
-            read_gyptis_design_cell_centroids, container=gyptis_tesseract
+            read_gyptis_design_cell_centroids, tesseract=gyptis_tesseract
         ),
         design_cell_vertices=partial(
-            read_gyptis_design_cell_vertices, container=gyptis_tesseract
+            read_gyptis_design_cell_vertices, tesseract=gyptis_tesseract
         ),
-        write_mesh=partial(write_gyptis_mesh, container=gyptis_tesseract),
+        write_mesh=partial(write_gyptis_mesh, tesseract=gyptis_tesseract),
         mode_field=partial(
-            read_gyptis_mode_field, container=gyptis_tesseract, mode_index=mode_index
+            read_gyptis_mode_field, tesseract=gyptis_tesseract, mode_index=mode_index
         ),
         reset_chargetransport=partial(
-            reset_chargetransport_worker, container=ct_tesseract
+            reset_chargetransport_worker, tesseract=ct_tesseract
         ),
         closers=tuple(closers),
     )
@@ -468,9 +458,7 @@ def _dev_mount_volumes(component: str) -> tuple[list[str], dict[str, str]]:
     return volumes, {"PYTHONPATH": _DEV_PYTHONPATH_ROOT}
 
 
-def reset_chargetransport_worker(
-    *, container: Any | None = None, local_api: Any | None = None
-) -> None:
+def reset_chargetransport_worker(*, tesseract: Tesseract | None = None) -> None:
     """Drop the ChargeTransport worker's warm solutions.
 
     The next solve is then a function of the doping alone -- the cold
@@ -478,52 +466,31 @@ def reset_chargetransport_worker(
     than of the Newton starting points the previous designs left behind.
     Carried as the ``reset`` operation of the component's ``apply`` endpoint.
     """
-
-    def from_container(tess: Any) -> None:
-        tess.apply({"operation": "reset"})
-
-    def from_local(api: Any) -> None:
-        api.apply(api.InputSchema(operation="reset"))
-
-    invoke_tesseract(
-        container,
-        local_api,
-        container_call=from_container,
-        local_call=from_local,
-    )
+    if tesseract is None:
+        raise RuntimeError("no ChargeTransport backend available for reset")
+    tesseract.apply({"operation": "reset"})
 
 
 def _gyptis_query(
     payload: dict[str, Any],
     outputs: tuple[str, ...],
     *,
-    container: Any | None,
-    local_api: Any | None,
+    tesseract: Tesseract | None,
 ) -> tuple[Any, ...]:
-    """Run one read-only gyptis ``apply()`` against whichever backend is bound.
+    """Run one read-only gyptis ``apply()`` against the served backend.
 
     The Tesseract API's fixed endpoint set carries these static geometry and
     field queries as ``operation`` values on ``apply``. Returns the named
     outputs in order, ``None`` for any the backend omitted, so each caller
     validates the payload it needs. A live gyptis/FEniCS backend is required:
     unlike a solve, there is no meaningful local stub for its mesh-dependent
-    cells.
+    cells. These queries are read-only and never enter autodiff, so they ride
+    the ``apply`` endpoint directly rather than ``apply_tesseract``.
     """
-
-    def from_container(tess: Any) -> tuple[Any, ...]:
-        result = tess.apply(payload)
-        return tuple(result.get(name) for name in outputs)
-
-    def from_local(api: Any) -> tuple[Any, ...]:
-        result = api.apply(api.InputSchema(**payload))
-        return tuple(getattr(result, name, None) for name in outputs)
-
-    return invoke_tesseract(
-        container,
-        local_api,
-        container_call=from_container,
-        local_call=from_local,
-    )
+    if tesseract is None:
+        raise RuntimeError("no gyptis backend available for this query")
+    result = tesseract.apply(payload)
+    return tuple(result.get(name) for name in outputs)
 
 
 def _as_design_cell_vertices(raw: Any) -> np.ndarray:
@@ -535,14 +502,13 @@ def _as_design_cell_vertices(raw: Any) -> np.ndarray:
 
 
 def read_gyptis_design_cell_centroids(
-    *, container: Any | None = None, local_api: Any | None = None
+    *, tesseract: Tesseract | None = None
 ) -> np.ndarray:
     """Read gyptis design-cell centroids in ``design_epsilon`` field order."""
     (raw,) = _gyptis_query(
         {"operation": "design_cell_centroids"},
         ("design_cell_centroids",),
-        container=container,
-        local_api=local_api,
+        tesseract=tesseract,
     )
     if raw is None:
         raise RuntimeError("gyptis design_cell_centroids returned no centroids")
@@ -553,7 +519,7 @@ def read_gyptis_design_cell_centroids(
 
 
 def read_gyptis_design_cell_vertices(
-    *, container: Any | None = None, local_api: Any | None = None
+    *, tesseract: Tesseract | None = None
 ) -> np.ndarray:
     """Read the ``(n_design, 3, 2)`` design-cell vertex coordinates.
 
@@ -565,8 +531,7 @@ def read_gyptis_design_cell_vertices(
     (raw,) = _gyptis_query(
         {"operation": "write_mesh"},
         ("design_cell_vertices",),
-        container=container,
-        local_api=local_api,
+        tesseract=tesseract,
     )
     if raw is None:
         raise RuntimeError("gyptis write_mesh returned no design-cell vertices")
@@ -590,8 +555,7 @@ def read_gyptis_mode_field(
     design_epsilon: np.ndarray,
     core_epsilon: float = DEFAULT_BACKGROUND_EPSILON,
     *,
-    container: Any | None = None,
-    local_api: Any | None = None,
+    tesseract: Tesseract | None = None,
     mode_index: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Read the tracked mode's ``|E|`` profile at the gyptis mesh vertices.
@@ -617,8 +581,7 @@ def read_gyptis_mode_field(
             **_gyptis_mode_payload(mode_index),
         },
         ("mode_abs_e", "mode_coordinates"),
-        container=container,
-        local_api=local_api,
+        tesseract=tesseract,
     )
     if abs_e_raw is None or coords_raw is None:
         raise RuntimeError("gyptis mode_field returned no field payload")
@@ -635,14 +598,13 @@ def read_gyptis_mode_field(
 
 
 def write_gyptis_mesh(
-    mesh_path: str | Path, *, container: Any | None = None, local_api: Any | None = None
+    mesh_path: str | Path, *, tesseract: Tesseract | None = None
 ) -> np.ndarray:
     """Persist gyptis' unified mesh on host and return its design-cell vertices."""
     mesh_text, vertices_raw = _gyptis_query(
         {"operation": "write_mesh"},
         ("mesh_text", "design_cell_vertices"),
-        container=container,
-        local_api=local_api,
+        tesseract=tesseract,
     )
     if mesh_text is None or vertices_raw is None:
         raise RuntimeError("gyptis write_mesh returned no mesh payload")
@@ -684,10 +646,6 @@ def build_design_transfer(
     )
     operator = build_mesh_transfer_operator(node_coords, vertices)
     return jnp.asarray(operator.dense())
-
-
-def _shaped_like(arr: jax.Array) -> jax.ShapeDtypeStruct:
-    return jax.ShapeDtypeStruct(arr.shape, arr.dtype)
 
 
 def _scalar_like(arr: jax.Array) -> jax.ShapeDtypeStruct:
@@ -739,13 +697,20 @@ def _container_mesh_ref(mesh_ref: MeshRef | None) -> MeshRef | None:
     return mesh_ref.model_copy(update={"path": container_path})
 
 
-def _ct_container_inputs(
-    doping_np: np.ndarray,
+def _ct_solve_inputs(
+    doping: jax.Array,
     bias_voltage: float,
     mesh_ref: MeshRef | None,
 ) -> dict[str, Any]:
+    """Assemble the ChargeTransport ``solve`` payload for ``apply_tesseract``.
+
+    ``doping`` stays a JAX array (the one differentiated operand); ``bias_voltage``
+    and the flattened ``mesh_ref`` are non-array leaves, which ``apply_tesseract``
+    holds static.
+    """
     inputs: dict[str, Any] = {
-        "doping": doping_np.tolist(),
+        "operation": "solve",
+        "doping": doping,
         "bias_voltage": float(bias_voltage),
     }
     if mesh_ref is not None:
@@ -753,102 +718,40 @@ def _ct_container_inputs(
     return inputs
 
 
-def _ct_out_struct(
-    doping: jax.Array,
-    bias_voltage: float,
-    mesh_ref: MeshRef | None = None,
-) -> tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct]:
-    return _shaped_like(doping), _shaped_like(doping)
-
-
 def build_chargetransport_component(
-    container: Any | None = None,
-    local_api: Any | None = None,
-) -> DifferentiableComponent:
-    """Build the ChargeTransport component bound to one backend.
+    tesseract: Tesseract | None = None,
+    *,
+    rewrite_mesh_path: bool = False,
+) -> Callable[..., tuple[jax.Array, jax.Array]]:
+    """Build the ChargeTransport component bound to a served Tesseract.
 
-    ``container`` is a running Tesseract handle; ``local_api`` an in-process
-    ``tesseract_api`` module. With neither, calling the component raises -- there
-    is no physics-free identity fallback. The backend is captured here, not read
-    from module globals.
+    ``tesseract`` is a served handle -- a container image or an in-process
+    ``tesseract_api`` served via :meth:`Tesseract.from_tesseract_api`.
+    :func:`tesseract_jax.apply_tesseract` composes its ``apply`` /
+    ``vector_jacobian_product`` endpoints into the JAX program, so the returned
+    callable differentiates straight through the drift-diffusion solve. With no
+    handle, calling it raises -- there is no physics-free identity fallback.
+
+    ``rewrite_mesh_path`` rewrites a host ``mesh_ref`` path to the container's
+    read-only mount (see :data:`_CT_MESH_MOUNT`); the in-process handle reads the
+    host path directly, so it leaves the path alone.
     """
 
-    def forward(
-        doping_np: np.ndarray,
+    def chargetransport(
+        doping: jax.Array,
         bias_voltage: float,
         mesh_ref: MeshRef | None = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        def from_container(tess: Any) -> tuple[np.ndarray, np.ndarray]:
-            result = tess.apply(
-                _ct_container_inputs(
-                    doping_np, bias_voltage, _container_mesh_ref(mesh_ref)
-                )
-            )
-            return (
-                np.asarray(result["electrons"], dtype=doping_np.dtype),
-                np.asarray(result["holes"], dtype=doping_np.dtype),
-            )
-
-        def from_local(api: Any) -> tuple[np.ndarray, np.ndarray]:
-            outputs = api.apply(
-                api.InputSchema(
-                    doping=doping_np, bias_voltage=bias_voltage, mesh_ref=mesh_ref
-                )
-            )
-            return (
-                np.asarray(outputs.electrons, dtype=doping_np.dtype),
-                np.asarray(outputs.holes, dtype=doping_np.dtype),
-            )
-
-        return invoke_tesseract(
-            container,
-            local_api,
-            container_call=from_container,
-            local_call=from_local,
+    ) -> tuple[jax.Array, jax.Array]:
+        if tesseract is None:
+            raise RuntimeError("no ChargeTransport backend available for this call")
+        if rewrite_mesh_path:
+            mesh_ref = _container_mesh_ref(mesh_ref)
+        outputs = apply_tesseract(
+            tesseract, _ct_solve_inputs(doping, bias_voltage, mesh_ref)
         )
+        return outputs["electrons"], outputs["holes"]
 
-    def vjp(
-        doping_np: np.ndarray,
-        cotangent: tuple[np.ndarray, np.ndarray],
-        bias_voltage: float,
-        mesh_ref: MeshRef | None = None,
-    ) -> np.ndarray:
-        cot_n, cot_p = cotangent
-
-        def from_container(tess: Any) -> np.ndarray:
-            vjp_result = tess.vector_jacobian_product(
-                _ct_container_inputs(
-                    doping_np, bias_voltage, _container_mesh_ref(mesh_ref)
-                ),
-                ["doping"],
-                ["electrons", "holes"],
-                {"electrons": cot_n.tolist(), "holes": cot_p.tolist()},
-            )
-            return np.asarray(vjp_result["doping"], dtype=doping_np.dtype)
-
-        def from_local(api: Any) -> np.ndarray:
-            vjp_result = api.vector_jacobian_product(
-                api.InputSchema(
-                    doping=doping_np, bias_voltage=bias_voltage, mesh_ref=mesh_ref
-                ),
-                {"doping"},
-                {"electrons", "holes"},
-                {"electrons": cot_n, "holes": cot_p},
-            )
-            return np.asarray(vjp_result["doping"], dtype=doping_np.dtype)
-
-        return invoke_tesseract(
-            container,
-            local_api,
-            container_call=from_container,
-            local_call=from_local,
-        )
-
-    return DifferentiableComponent(
-        forward=forward,
-        vjp=vjp,
-        out_struct=_ct_out_struct,
-    )
+    return chargetransport
 
 
 # -- gyptis component ------------------------------------------------------------
@@ -859,31 +762,28 @@ def build_chargetransport_component(
 # (so non-design core cells match the pipeline's background_epsilon).
 
 
-def _gyptis_out_struct(
-    design_epsilon: jax.Array, core_epsilon: float = DEFAULT_BACKGROUND_EPSILON
-) -> jax.ShapeDtypeStruct:
-    return _scalar_like(design_epsilon)
-
-
-def _gyptis_background_vjp_impl(
-    design_epsilon_np: np.ndarray,
-    cot_neff_sq: np.ndarray,
-    core_epsilon: float = DEFAULT_BACKGROUND_EPSILON,
-) -> np.ndarray:
-    """Background permittivity is rho-independent: its cotangent is zero."""
-    return np.zeros_like(design_epsilon_np)
-
-
 def build_gyptis_components(
-    container: Any | None = None,
-    local_api: Any | None = None,
+    tesseract: Tesseract | None = None,
     mode_index: int = 0,
-) -> tuple[DifferentiableComponent, DifferentiableComponent]:
-    """Build the perturbed and background gyptis components for one backend.
+) -> tuple[
+    Callable[..., jax.Array],
+    Callable[..., jax.Array],
+]:
+    """Build the perturbed and background gyptis components for a served handle.
 
-    Both share a background eigenmode cache owned by this call, so the
-    rho-independent background solve runs once per component lifecycle. The
-    backend is captured here, not read from module globals.
+    ``tesseract`` is a served handle -- a container image or an in-process
+    ``tesseract_api`` served via :meth:`Tesseract.from_tesseract_api`. The
+    perturbed component composes its ``apply`` / ``vector_jacobian_product``
+    endpoints through :func:`tesseract_jax.apply_tesseract`, so ``neff_sq``
+    differentiates straight through the eigensolve. With no handle, calling
+    either component raises -- there is no physics-free fallback.
+
+    The background solve is rho-independent (its field is a uniform ``background``
+    of the design length), so it must contribute an exact zero design gradient
+    and run only once per geometry. It therefore runs forward-only behind a
+    ``pure_callback`` guarded by ``stop_gradient`` and a per-lifecycle cache,
+    rather than through ``apply_tesseract`` -- no eigen-adjoint is ever assembled
+    for it.
 
     ``mode_index`` selects the guided mode every solve of this bundle targets:
     ``0`` the fundamental (largest neff in the guided window), ``k`` the
@@ -899,43 +799,27 @@ def build_gyptis_components(
     cache_lock = RLock()
     mode_payload = _gyptis_mode_payload(mode_index)
 
-    def forward(
-        design_epsilon_np: np.ndarray,
+    def gyptis(
+        design_epsilon: jax.Array,
         core_epsilon: float = DEFAULT_BACKGROUND_EPSILON,
+    ) -> jax.Array:
+        if tesseract is None:
+            raise RuntimeError("no gyptis backend available for this call")
+        outputs = apply_tesseract(
+            tesseract,
+            {
+                "operation": "solve",
+                "design_epsilon": design_epsilon,
+                "core_epsilon": float(core_epsilon),
+                **mode_payload,
+            },
+        )
+        return outputs["neff_sq"]
+
+    def _background_solve_np(
+        design_epsilon_np: np.ndarray, core_epsilon: float
     ) -> np.ndarray:
         out_dtype = design_epsilon_np.dtype
-
-        def from_container(tess: Any) -> np.ndarray:
-            result = tess.apply(
-                {
-                    "design_epsilon": design_epsilon_np.tolist(),
-                    "core_epsilon": float(core_epsilon),
-                    **mode_payload,
-                }
-            )
-            return np.asarray(result["neff_sq"], dtype=out_dtype)
-
-        def from_local(api: Any) -> np.ndarray:
-            outputs = api.apply(
-                api.InputSchema(
-                    design_epsilon=design_epsilon_np,
-                    core_epsilon=float(core_epsilon),
-                    **mode_payload,
-                )
-            )
-            return np.asarray(outputs.neff_sq, dtype=out_dtype)
-
-        return invoke_tesseract(
-            container,
-            local_api,
-            container_call=from_container,
-            local_call=from_local,
-        )
-
-    def background_forward(
-        design_epsilon_np: np.ndarray,
-        core_epsilon: float = DEFAULT_BACKGROUND_EPSILON,
-    ) -> np.ndarray:
         key = (
             design_epsilon_np.shape,
             design_epsilon_np.dtype.str,
@@ -948,63 +832,50 @@ def build_gyptis_components(
         if cached is not None:
             return cached.copy()
 
-        result = forward(design_epsilon_np, core_epsilon)
+        if tesseract is None:
+            raise RuntimeError("no gyptis backend available for this call")
+        result = tesseract.apply(
+            {
+                "operation": "solve",
+                "design_epsilon": design_epsilon_np,
+                "core_epsilon": float(core_epsilon),
+                **mode_payload,
+            }
+        )
+        neff_sq = np.asarray(result["neff_sq"], dtype=out_dtype)
         with cache_lock:
-            background_cache[key] = result.copy()
-        return result
+            background_cache[key] = neff_sq.copy()
+        return neff_sq
 
-    def vjp(
-        design_epsilon_np: np.ndarray,
-        cot_neff_sq: np.ndarray,
+    # The background solve is rho-independent, so its design cotangent is exactly
+    # zero. It runs forward-only behind a ``custom_vjp`` -- forward is the cached
+    # ``pure_callback`` solve, backward returns a zero design gradient -- so no
+    # eigen-adjoint is ever assembled for it. (``apply_tesseract`` is for the
+    # differentiated perturbed solve; this deliberately opts out of that path.)
+    @partial(jax.custom_vjp, nondiff_argnums=(1,))
+    def gyptis_background(
+        design_epsilon: jax.Array,
         core_epsilon: float = DEFAULT_BACKGROUND_EPSILON,
-    ) -> np.ndarray:
-        out_dtype = design_epsilon_np.dtype
-
-        def from_container(tess: Any) -> np.ndarray:
-            vjp_result = tess.vector_jacobian_product(
-                {
-                    "design_epsilon": design_epsilon_np.tolist(),
-                    "core_epsilon": float(core_epsilon),
-                    **mode_payload,
-                },
-                ["design_epsilon"],
-                ["neff_sq"],
-                {"neff_sq": float(cot_neff_sq)},
-            )
-            return np.asarray(vjp_result["design_epsilon"], dtype=out_dtype)
-
-        def from_local(api: Any) -> np.ndarray:
-            vjp_result = api.vector_jacobian_product(
-                api.InputSchema(
-                    design_epsilon=design_epsilon_np,
-                    core_epsilon=float(core_epsilon),
-                    **mode_payload,
-                ),
-                {"design_epsilon"},
-                {"neff_sq"},
-                {"neff_sq": np.asarray(cot_neff_sq)},
-            )
-            return np.asarray(vjp_result["design_epsilon"], dtype=out_dtype)
-
-        return invoke_tesseract(
-            container,
-            local_api,
-            container_call=from_container,
-            local_call=from_local,
+    ) -> jax.Array:
+        return jax.pure_callback(
+            partial(_background_solve_np, core_epsilon=float(core_epsilon)),
+            _scalar_like(design_epsilon),
+            design_epsilon,
         )
 
-    perturbed = DifferentiableComponent(
-        forward=forward,
-        vjp=vjp,
-        out_struct=_gyptis_out_struct,
-    )
-    # Background solve: rho-independent, so it contributes a zero cotangent.
-    background = DifferentiableComponent(
-        forward=background_forward,
-        vjp=_gyptis_background_vjp_impl,
-        out_struct=_gyptis_out_struct,
-    )
-    return perturbed, background
+    def _gyptis_background_fwd(
+        design_epsilon: jax.Array, core_epsilon: float
+    ) -> tuple[jax.Array, jax.Array]:
+        return gyptis_background(design_epsilon, core_epsilon), design_epsilon
+
+    def _gyptis_background_bwd(
+        core_epsilon: float, design_epsilon: jax.Array, cot_neff_sq: jax.Array
+    ) -> tuple[jax.Array]:
+        return (jnp.zeros_like(design_epsilon),)
+
+    gyptis_background.defvjp(_gyptis_background_fwd, _gyptis_background_bwd)
+
+    return gyptis, gyptis_background
 
 
 def _build_design_epsilon(
@@ -1086,7 +957,8 @@ class PipelineComponents:
 def build_default_components(mode_index: int = 0) -> PipelineComponents:
     """Build the default in-process components from the local tesseract apis.
 
-    Loads each component's ``tesseract_api`` module if importable. There is no
+    Serves each component's ``tesseract_api`` in-process via
+    :meth:`Tesseract.from_tesseract_api` when its module imports. There is no
     physics-free stub: a component whose tesseract_api has no live solver (no
     Julia, no gyptis/FEniCS) raises when called rather than fabricating carriers
     or an effective index. Used when ``pipeline()`` is called without an explicit
@@ -1094,25 +966,26 @@ def build_default_components(mode_index: int = 0) -> PipelineComponents:
     gyptis solves target (see :func:`build_gyptis_components`); the shared
     module-level bundle is built for the fundamental.
     """
-    ct_api = _load_tesseract_api("chargetransport")
-    gyptis_api = _load_tesseract_api("gyptis")
-    chargetransport = build_chargetransport_component(local_api=ct_api)
+    ct_tesseract = _serve_local_tesseract("chargetransport")
+    gyptis_tesseract = _serve_local_tesseract("gyptis")
+    chargetransport = build_chargetransport_component(ct_tesseract)
     gyptis, gyptis_background = build_gyptis_components(
-        local_api=gyptis_api, mode_index=mode_index
+        gyptis_tesseract, mode_index=mode_index
     )
 
+    # An in-process ``from_tesseract_api`` handle imports the module rather than
+    # serving a process, so it has nothing to tear down: the ChargeTransport
+    # module registers its own ``atexit`` worker shutdown, and gyptis holds no
+    # process. So the default bundle owns no closers.
     closers: list[Callable[[], None]] = []
-    shutdown_worker = getattr(ct_api, "shutdown", None)
-    if callable(shutdown_worker):
-        closers.append(shutdown_worker)
     design_cell_centroids = (
-        partial(read_gyptis_design_cell_centroids, local_api=gyptis_api)
-        if gyptis_api is not None
+        partial(read_gyptis_design_cell_centroids, tesseract=gyptis_tesseract)
+        if gyptis_tesseract is not None
         else None
     )
     design_cell_vertices = (
-        partial(read_gyptis_design_cell_vertices, local_api=gyptis_api)
-        if gyptis_api is not None
+        partial(read_gyptis_design_cell_vertices, tesseract=gyptis_tesseract)
+        if gyptis_tesseract is not None
         else None
     )
     return PipelineComponents(
@@ -1122,18 +995,22 @@ def build_default_components(mode_index: int = 0) -> PipelineComponents:
         design_cell_centroids=design_cell_centroids,
         design_cell_vertices=design_cell_vertices,
         write_mesh=(
-            partial(write_gyptis_mesh, local_api=gyptis_api)
-            if gyptis_api is not None
+            partial(write_gyptis_mesh, tesseract=gyptis_tesseract)
+            if gyptis_tesseract is not None
             else None
         ),
         mode_field=(
-            partial(read_gyptis_mode_field, local_api=gyptis_api, mode_index=mode_index)
-            if gyptis_api is not None
+            partial(
+                read_gyptis_mode_field,
+                tesseract=gyptis_tesseract,
+                mode_index=mode_index,
+            )
+            if gyptis_tesseract is not None
             else None
         ),
         reset_chargetransport=(
-            partial(reset_chargetransport_worker, local_api=ct_api)
-            if ct_api is not None
+            partial(reset_chargetransport_worker, tesseract=ct_tesseract)
+            if ct_tesseract is not None
             else None
         ),
         closers=tuple(closers),

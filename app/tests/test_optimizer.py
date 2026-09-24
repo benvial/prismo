@@ -187,64 +187,18 @@ class TestOptimizeDopingAnalytical:
 
     def test_combined_callback_uses_public_component_calls_once(self, rho_initial):
         """One callback makes two bias forwards and their matching VJPs."""
+        from _tesseract_doubles import serve_chargetransport, serve_gyptis_mean
         from prismo.pipeline import (
             PipelineComponents,
             build_chargetransport_component,
             build_gyptis_components,
         )
 
-        class FakeChargeTransport:
-            def __init__(self):
-                self.forward_biases: list[float] = []
-                self.vjp_biases: list[float] = []
-
-            def apply(self, inputs):
-                self.forward_biases.append(inputs["bias_voltage"])
-                doping = np.asarray(inputs["doping"], dtype=float)
-                carrier = np.full_like(
-                    doping,
-                    1e18 if inputs["bias_voltage"] == 0.0 else 0.0,
-                )
-                return {"electrons": carrier, "holes": carrier}
-
-            def vector_jacobian_product(
-                self,
-                inputs,
-                input_names,
-                output_names,
-                cotangent,
-            ):
-                self.vjp_biases.append(inputs["bias_voltage"])
-                return {"doping": np.zeros_like(inputs["doping"], dtype=float)}
-
-        class FakeGyptis:
-            def __init__(self):
-                self.vjp_calls = 0
-
-            def apply(self, inputs):
-                return {"neff_sq": float(np.mean(inputs["design_epsilon"]))}
-
-            def vector_jacobian_product(
-                self,
-                inputs,
-                input_names,
-                output_names,
-                cotangent,
-            ):
-                self.vjp_calls += 1
-                design_epsilon = np.asarray(inputs["design_epsilon"], dtype=float)
-                return {
-                    "design_epsilon": np.full(
-                        design_epsilon.shape,
-                        cotangent["neff_sq"] / len(design_epsilon),
-                    )
-                }
-
-        ct = FakeChargeTransport()
-        gyptis = FakeGyptis()
-        perturbed, background = build_gyptis_components(container=gyptis)
+        ct_tesseract, ct_module = serve_chargetransport()
+        gyptis_tesseract, gyptis_module = serve_gyptis_mean()
+        perturbed, background = build_gyptis_components(gyptis_tesseract)
         components = PipelineComponents(
-            chargetransport=build_chargetransport_component(container=ct),
+            chargetransport=build_chargetransport_component(ct_tesseract),
             gyptis=perturbed,
             gyptis_background=background,
         )
@@ -256,11 +210,13 @@ class TestOptimizeDopingAnalytical:
             components=components,
         )
 
-        assert ct.forward_biases.count(0.0) == len(history)
-        assert ct.forward_biases.count(-5.0) == len(history)
-        assert ct.vjp_biases.count(0.0) == len(history)
-        assert ct.vjp_biases.count(-5.0) == len(history)
-        assert gyptis.vjp_calls == len(history)
+        assert ct_module.FORWARD_BIASES.count(0.0) == len(history)
+        assert ct_module.FORWARD_BIASES.count(-5.0) == len(history)
+        assert ct_module.VJP_BIASES.count(0.0) == len(history)
+        assert ct_module.VJP_BIASES.count(-5.0) == len(history)
+        # One perturbed eigen-adjoint per callback (the background solve is
+        # forward-only and contributes no VJP).
+        assert len(gyptis_module.VJP_MODE_INDICES) == len(history)
 
 
 class TestOptimizeDopingWithFilter:
@@ -327,6 +283,7 @@ class TestOptimizeDopingThreadsMeshRef:
     """
 
     def test_mesh_ref_reaches_chargetransport_component(self):
+        from _tesseract_doubles import serve_chargetransport, serve_gyptis_mean
         from prismo.pipeline import (
             _CT_MESH_MOUNT,
             PipelineComponents,
@@ -335,31 +292,15 @@ class TestOptimizeDopingThreadsMeshRef:
         )
         from prismo_shared.schemas import MeshRef
 
-        class RecordingChargeTransport:
-            def __init__(self):
-                self.mesh_paths: list[str | None] = []
-
-            def apply(self, inputs):
-                ref = inputs.get("mesh_ref")
-                self.mesh_paths.append(None if ref is None else ref["path"])
-                doping = np.asarray(inputs["doping"], dtype=float)
-                return {"electrons": doping, "holes": doping}
-
-            def vector_jacobian_product(self, inputs, *_args):
-                return {"doping": np.zeros_like(inputs["doping"], dtype=float)}
-
-        class FakeGyptis:
-            def apply(self, inputs):
-                return {"neff_sq": float(np.mean(inputs["design_epsilon"]))}
-
-            def vector_jacobian_product(self, inputs, *_args, cotangent=None):
-                design_epsilon = np.asarray(inputs["design_epsilon"], dtype=float)
-                return {"design_epsilon": np.zeros_like(design_epsilon)}
-
-        ct = RecordingChargeTransport()
-        perturbed, background = build_gyptis_components(container=FakeGyptis())
+        ct_tesseract, ct_module = serve_chargetransport()
+        gyptis_tesseract, _ = serve_gyptis_mean()
+        perturbed, background = build_gyptis_components(gyptis_tesseract)
         components = PipelineComponents(
-            chargetransport=build_chargetransport_component(container=ct),
+            # The container path rewrites the host mesh path to the read-only
+            # mount, so drive the double as a container would.
+            chargetransport=build_chargetransport_component(
+                ct_tesseract, rewrite_mesh_path=True
+            ),
             gyptis=perturbed,
             gyptis_background=background,
         )
@@ -375,8 +316,10 @@ class TestOptimizeDopingThreadsMeshRef:
 
         # Every CT forward received the mesh (rewritten to the container mount),
         # never None.
-        assert ct.mesh_paths, "ChargeTransport was never called"
-        assert all(p == f"{_CT_MESH_MOUNT}/waveguide.msh" for p in ct.mesh_paths)
+        assert ct_module.FORWARD_MESH_PATHS, "ChargeTransport was never called"
+        assert all(
+            p == f"{_CT_MESH_MOUNT}/waveguide.msh" for p in ct_module.FORWARD_MESH_PATHS
+        )
 
 
 class TestOptimizeDopingSurvivesSolverFailure:

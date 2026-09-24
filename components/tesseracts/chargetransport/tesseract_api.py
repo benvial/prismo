@@ -26,7 +26,7 @@ import numpy.typing as npt
 from prismo_shared.schemas import MeshRef
 from prismo_shared.session import SolveSessionRegistry, array_identity
 from pydantic import BaseModel, Field
-from tesseract_core.runtime import Array, Differentiable, Float64
+from tesseract_core.runtime import Array, Differentiable, Float64, ShapeDType
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
 
@@ -468,6 +468,29 @@ def apply(inputs: InputSchema) -> OutputSchema:
     _session_registry.open(identity, scope=(profile, generation))
 
     return OutputSchema(electrons=electrons, holes=holes)
+
+
+def abstract_eval(abstract_inputs: InputSchema) -> dict[str, ShapeDType]:
+    """Report the ``solve`` output shapes from the doping shape alone.
+
+    ``apply_tesseract`` traces every call through this endpoint to size the
+    outputs before dispatching the real solve. The drift-diffusion solve returns
+    one electron and one hole concentration per mesh node, so both carry the
+    doping's own ``(n_nodes,)`` shape. ``reset`` runs no solve and is never
+    routed through autodiff, so it is rejected here.
+    """
+    if abstract_inputs.operation != "solve":
+        raise ValueError(
+            f"abstract_eval is defined only for the 'solve' operation, "
+            f"not {abstract_inputs.operation!r}"
+        )
+    if abstract_inputs.doping is None:
+        raise ValueError("ChargeTransport solve requires a doping array")
+    shape = tuple(abstract_inputs.doping.shape)
+    return {
+        "electrons": ShapeDType(shape=shape, dtype="float64"),
+        "holes": ShapeDType(shape=shape, dtype="float64"),
+    }
 
 
 #
