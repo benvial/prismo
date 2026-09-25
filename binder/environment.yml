@@ -8,6 +8,15 @@ channels:
   - conda-forge
 dependencies:
   # tesseract-jax>=0.4.1 (pinned in app/pyproject.toml) needs Python>=3.12.
+  # binder/runtime.txt pins the same version: repo2docker picks
+  # JuliaProjectTomlBuildPack for this repo (binder/Project.toml present),
+  # which inherits its python_version detection from PythonBuildPack, not
+  # CondaBuildPack -- it reads runtime.txt, not this file's python= pin.
+  # Without runtime.txt it silently builds the base notebook env on Python
+  # 3.10, then has to upgrade the whole pre-built Jupyter stack in place to
+  # reach the version pinned here, a large enough transaction to trip a
+  # libmamba package-cache bug ("Cannot find a valid extracted directory
+  # cache") and fail the build.
   - python=3.12
   - gyptis
   # Unconstrained, the solver pairs fenics with a 2022 jax; the app needs >=0.4.30.
