@@ -41,10 +41,16 @@ build_config:
 
   custom_build_steps:
     - |
+      # PKG_CONFIG_PATH: the fenics-dolfin conda package ships no activate.d
+      # hook, so pkg-config never sees its dolfin.pc otherwise -- `import
+      # dolfin` (pulled in by gyptis) fails with "Could not find DOLFIN
+      # pkg-config file". The conda provider always installs the env at
+      # /python-env (see Dockerfile.base).
       ENV XDG_CACHE_HOME=/opt/gyptis-cache \
           DIJITSO_CACHE_DIR=/opt/gyptis-cache/dijitso \
           INSTANT_CACHE_DIR=/opt/gyptis-cache/instant \
-          MPLCONFIGDIR=/tmp/matplotlib
+          MPLCONFIGDIR=/tmp/matplotlib \
+          PKG_CONFIG_PATH=/python-env/lib/pkgconfig
       RUN mkdir -p /opt/gyptis-cache/dijitso /opt/gyptis-cache/instant \
           /tmp/matplotlib && \
           python /tmp/gyptis-warmup.py && \

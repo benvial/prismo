@@ -1,12 +1,16 @@
 #!/bin/bash
 # repo2docker installs this as the container ENTRYPOINT, so it runs once at the
-# start of every session. It only re-exports the FEniCS JIT cache paths that
-# binder/postBuild warmed at build time; without them dolfin falls back to
-# $HOME/.cache and recompiles every form on the first eigensolve.
+# start of every session. It re-exports the FEniCS JIT cache paths that
+# binder/postBuild warmed at build time (without them dolfin falls back to
+# $HOME/.cache and recompiles every form on the first eigensolve) and the
+# pkg-config path dolfin needs to import at all (fenics-dolfin ships no
+# activate.d hook for it, and env vars exported during the image build don't
+# persist into the running container's shell).
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export DIJITSO_CACHE_DIR="${repo_root}/.gyptis-cache/dijitso"
 export INSTANT_CACHE_DIR="${repo_root}/.gyptis-cache/instant"
+export PKG_CONFIG_PATH="${CONDA_PREFIX}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
 
 exec "$@"

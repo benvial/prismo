@@ -21,6 +21,11 @@ python -m pip install --no-cache-dir "tesseract-core[runtime]>=1.13.0"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export DIJITSO_CACHE_DIR="${repo_root}/.gyptis-cache/dijitso"
 export INSTANT_CACHE_DIR="${repo_root}/.gyptis-cache/instant"
+# The fenics-dolfin conda package ships no activate.d hook, so pkg-config
+# never sees its dolfin.pc without this: `import dolfin` (pulled in by
+# gyptis) fails at import time with "Could not find DOLFIN pkg-config file"
+# otherwise. binder/start re-exports the same variable at container start.
+export PKG_CONFIG_PATH="${CONDA_PREFIX}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
 mkdir -p "${DIJITSO_CACHE_DIR}" "${INSTANT_CACHE_DIR}"
 python components/tesseracts/gyptis/warmup.py
 chmod -R a+rwX "${repo_root}/.gyptis-cache"
