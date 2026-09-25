@@ -25,7 +25,10 @@ export INSTANT_CACHE_DIR="${repo_root}/.gyptis-cache/instant"
 # never sees its dolfin.pc without this: `import dolfin` (pulled in by
 # gyptis) fails at import time with "Could not find DOLFIN pkg-config file"
 # otherwise. binder/start re-exports the same variable at container start.
-export PKG_CONFIG_PATH="${CONDA_PREFIX}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+# CONDA_PREFIX itself is only set by conda's interactive activation hook, which
+# this non-login build shell never runs, so use NB_PYTHON_PREFIX (the env
+# environment.yml is installed into, set as a persistent Docker ENV) instead.
+export PKG_CONFIG_PATH="${NB_PYTHON_PREFIX}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
 mkdir -p "${DIJITSO_CACHE_DIR}" "${INSTANT_CACHE_DIR}"
 python components/tesseracts/gyptis/warmup.py
 chmod -R a+rwX "${repo_root}/.gyptis-cache"

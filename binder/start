@@ -11,6 +11,9 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export DIJITSO_CACHE_DIR="${repo_root}/.gyptis-cache/dijitso"
 export INSTANT_CACHE_DIR="${repo_root}/.gyptis-cache/instant"
-export PKG_CONFIG_PATH="${CONDA_PREFIX}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+# CONDA_PREFIX is only set by conda's interactive activation hook, which this
+# entrypoint shell never runs, so use NB_PYTHON_PREFIX (persistent Docker ENV
+# pointing at the same conda env) instead.
+export PKG_CONFIG_PATH="${NB_PYTHON_PREFIX}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
 
 exec "$@"
