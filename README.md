@@ -2,9 +2,13 @@
 
 **P**hotonic **R**econfigurable **I**ntegrated **S**emiconductor **M**ultiphysics **O**ptimization
 
-PRISMO uses gradient-based optimization to find better doping layouts for
-silicon PN-junction phase shifters, the device that sets the phase of light in
-most silicon photonic transmitters.
+Silicon photonic chips move data as light instead of electricity, and a
+PN-junction phase shifter, the device that sets the phase of that light, is
+what lets most of them modulate an optical signal. How well it does that
+depends on its doping layout: the pattern of positively and negatively
+charged regions built into the silicon. PRISMO uses gradient-based
+optimization to search for doping layouts that make these phase shifters
+faster and more power-efficient.
 
 Instead of choosing from a few textbook junction shapes, it treats the doping
 across the whole silicon cross-section as a design field and lets the optimizer
