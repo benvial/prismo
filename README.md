@@ -491,8 +491,9 @@ PN-junction phase shifter. https://github.com/benvial/prismo
 PRISMO started as an entry to the
 [Tesseract Hackathon 2026](https://pasteurlabs.ai/tesseract-hackathon-2026/),
 held from August 3 to 31, in the inverse design and multi-physics tracks. Most
-of it was written in those four weeks. The organisers' write-up will be linked
-here once it is published.
+of it was written in those four weeks, and it went on to win the Grand Prize.
+See the organisers'
+[write-up](https://docs.pasteurlabs.ai/projects/tesseract-core/latest/blog/2026-09-30-tesseract-hackathon-winners/).
 
 ## License
 
