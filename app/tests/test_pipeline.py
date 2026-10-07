@@ -290,12 +290,20 @@ class TestPipelineStub:
     def rho(self) -> jax.Array:
         return jnp.asarray(RNG.random(self.N_NODES), dtype=jnp.float64)
 
-    def test_no_backend_is_a_hard_error(self, rho):
+    def test_no_backend_is_a_hard_error(self, rho, monkeypatch):
         """Ticket 04: the default (backend-less) pipeline never fabricates -- it raises.
 
         ``make run`` without a container gets a clear error rather than an
         effective-medium neff or identity carriers.
         """
+        import prismo.pipeline as pl
+
+        # Hermetic: pretend neither component's tesseract_api can be served, and
+        # drop any cached default bundle, so the outcome does not depend on a
+        # Julia or gyptis install -- or an already-resolved singleton -- on the
+        # host.
+        monkeypatch.setattr(pl, "_serve_local_tesseract", lambda name: None)
+        monkeypatch.setattr(pl, "_DEFAULT_COMPONENTS", None)
         with pytest.raises(Exception, match="backend"):
             pipeline(rho)
 
